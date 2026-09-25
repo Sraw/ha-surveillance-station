@@ -164,7 +164,12 @@ async def test_removing_one_of_several_entries_keeps_the_card(hass: HomeAssistan
 async def test_removing_the_last_entry_in_yaml_mode_lovelace(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:
-    """No storage resources to clean up: async_remove_entry just returns."""
-    with patch.object(ss, "_storage_resources", return_value=None):
+    """No storage resources to clean up: async_remove_entry checks for them
+    and returns, leaving the (YAML-mode) card resource it set up alone."""
+    resources = hass.data[LOVELACE_DATA].resources
+    before = resources.async_items()
+    with patch.object(ss, "_storage_resources", return_value=None) as storage_resources:
         assert await hass.config_entries.async_remove(setup_integration.entry_id)
         await hass.async_block_till_done()
+    storage_resources.assert_called_once_with(hass)
+    assert resources.async_items() == before
