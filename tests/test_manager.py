@@ -426,3 +426,136 @@ async def test_large_image(
     assert widths == [1280, 320]
     await manager.disk_large.settle()
     assert manager.stats()["disk_images"] == 1 and manager.stats()["disk_thumbnails"] == 1
+
+
+async def test_client_is_none_for_an_unloaded_entry(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    assert manager.client("not-a-real-entry-id") is None
+    assert await hass.config_entries.async_unload(setup_integration.entry_id)
+    assert manager.client(setup_integration.entry_id) is None
+
+
+async def test_thumbnail_fails_when_the_entry_is_not_loaded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    with pytest.raises(SSError, match="not loaded"):
+        await manager.thumbnail("not-a-real-entry-id", 6, T0)
+
+
+async def test_fetch_fails_when_the_entry_is_not_loaded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    session = _session(setup_integration)
+    session.entry_id = "not-a-real-entry-id"
+    with pytest.raises(SSError, match="not loaded"):
+        await manager.fetch(session, session.segments[0])
+
+
+async def test_drop_entry_forgets_its_live_tokens(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    manager.create_live_token(entry_id, 6)
+    assert manager._live_tokens
+    manager.drop_entry(entry_id)
+    assert not manager._live_tokens
+
+
+async def test_expired_live_tokens_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    with patch.object(views.time, "time", return_value=1_000_000.0):
+        old = manager.create_live_token(entry_id, 6)
+    with patch.object(views.time, "time", return_value=1_000_000.0 + views.LIVE_TOKEN_TTL_SECONDS + 1):
+        manager.create_live_token(entry_id, 7)
+    assert old not in manager._live_tokens
+    assert len(manager._live_tokens) == 1
+
+
+async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    old = _session(setup_integration)
+    old.expires = T0  # long expired
+    old_token = manager.create_session(old)
+    with patch.object(views.time, "time", return_value=T0 + 10):
+        manager.create_session(_session(setup_integration))
+    assert manager.get_session(old_token) is None
+    assert old_token not in manager._sessions
+
+
+async def test_sessions_are_bounded_by_count(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views, "VOD_MAX_SESSIONS", 2), patch.object(views.time, "time", return_value=T0):
+        first = manager.create_session(_session(setup_integration))
+        manager.create_session(_session(setup_integration))
+        manager.create_session(_session(setup_integration))  # evicts the first (LRU)
+        assert manager.stats()["sessions"] == 2
+        assert manager.get_session(first) is None
+
+
+def _live_session(entry: MockConfigEntry, planned_end: float, max_end: float) -> VodSession:
+    return VodSession(
+        entry.entry_id, 6, T0, [_seg(i) for i in range(2)], expires=T0 + 3600,
+        live=True, max_end=max_end, planned_end=planned_end,
+    )
+
+
+async def test_extend_appends_segments_recorded_since_the_last_plan(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
+    mock_client.recordings.return_value = [
+        RecordingInfo(id=100, camera_id=6, start=T0, end=T0 + 40, mount_id=1, live=True, hevc=True)
+    ]
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views.time, "time", return_value=T0 + 35):
+        await manager.extend(session)
+    assert session.planned_end > T0 + 20
+    assert len(session.segments) > 2
+    assert session.live  # short of max_end: still growing
+
+
+async def test_extend_stops_growing_at_max_end(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 30)
+    mock_client.recordings.return_value = [
+        RecordingInfo(id=100, camera_id=6, start=T0, end=T0 + 40, mount_id=1, live=True, hevc=True)
+    ]
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views.time, "time", return_value=T0 + 3600):
+        await manager.extend(session)
+    assert session.planned_end == T0 + 30
+    assert session.live is False
+
+
+async def test_extend_does_nothing_before_the_next_grid_line(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views.time, "time", return_value=T0 + 21):  # live_edge still <= planned_end
+        await manager.extend(session)
+    assert session.planned_end == T0 + 20
+    mock_client.recordings.assert_not_awaited()
+
+
+async def test_extend_does_nothing_if_the_entry_is_not_loaded(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
+    session.entry_id = "not-a-real-entry-id"
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views.time, "time", return_value=T0 + 35):
+        await manager.extend(session)  # no exception, nothing changes
+    assert session.planned_end == T0 + 20
+
+
+async def test_extend_leaves_the_playlist_unchanged_when_ss_is_unreachable(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG, logger=views.__name__)
+    session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
+    mock_client.recordings.side_effect = SSConnectionError("SYNO.SurveillanceStation.Event", "List", None)
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(views.time, "time", return_value=T0 + 35):
+        await manager.extend(session)
+    assert session.planned_end == T0 + 20
+    assert "not extended" in caplog.text
