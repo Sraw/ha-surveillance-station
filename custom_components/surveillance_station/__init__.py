@@ -130,11 +130,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
     try:
         await client.login()
         info = await client.info()
-    except SSAuthError as err:
-        raise ConfigEntryAuthFailed(
-            translation_domain=DOMAIN, translation_key="invalid_auth"
-        ) from err
     except SSError as err:
+        # Don't leave a DSM session behind for every setup retry.
+        await client.logout()
+        if isinstance(err, SSAuthError):
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN, translation_key="invalid_auth"
+            ) from err
         raise ConfigEntryNotReady(
             translation_domain=DOMAIN,
             translation_key="cannot_connect",

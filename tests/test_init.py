@@ -83,6 +83,8 @@ async def test_incomplete_info_retries(
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()
     assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    # Logged out, so retries don't pile up DSM sessions.
+    mock_client.logout.assert_awaited()
 
 
 async def test_unique_id_migrated_to_serial(hass: HomeAssistant, mock_client: MagicMock) -> None:

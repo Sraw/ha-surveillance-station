@@ -1,6 +1,7 @@
 """SS Info: an incomplete answer is an SSError (retryable), not a KeyError."""
 
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -24,3 +25,18 @@ async def test_info() -> None:
 async def test_info_without_serial() -> None:
     with pytest.raises(SSError, match="without a serial"):
         await _client({"hostname": "nas"}).info()
+
+
+async def test_info_with_empty_serial() -> None:
+    with pytest.raises(SSError, match="without a serial"):
+        await _client({"serial": ""}).info()
+
+
+async def test_missing_time_zone_is_not_cached() -> None:
+    """UTC for now, but asked again next time: it may have been a partial answer."""
+    client = _client({"serial": 1})
+    assert await client._timezone() == ZoneInfo("UTC")
+    client._call.return_value = {"serial": 1, "timezoneTZDB": "America/Los_Angeles"}
+    assert await client._timezone() == ZoneInfo("America/Los_Angeles")
+    assert await client._timezone() == ZoneInfo("America/Los_Angeles")
+    assert client._call.await_count == 2

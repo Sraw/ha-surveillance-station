@@ -294,7 +294,7 @@ class SurveillanceStationClient:
 
     async def info(self) -> SSInfo:
         data = await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)
-        if "serial" not in data:
+        if not data.get("serial"):
             # Seen once (2026-09-25) right after an HA restart: a success
             # answer without the serial, fine again moments later. An SSError
             # makes setup retry rather than fail for good.
@@ -310,7 +310,11 @@ class SurveillanceStationClient:
             timezone=str(data.get("timezoneTZDB") or "UTC"),
         )
         if not data.get("timezoneTZDB"):
+            # Could be the same kind of partial answer, so UTC is not cached:
+            # the next _timezone() asks again.
             _LOGGER.warning("Surveillance Station reports no time zone; reading its local times as UTC")
+            self._tz = None
+            return info
         try:
             self._tz = ZoneInfo(info.timezone)
         except ZoneInfoNotFoundError:
@@ -321,8 +325,7 @@ class SurveillanceStationClient:
     async def _timezone(self) -> ZoneInfo:
         if self._tz is None:
             await self.info()
-        assert self._tz is not None
-        return self._tz
+        return self._tz or ZoneInfo("UTC")
 
     async def cameras(self) -> list[Camera]:
         data = await self._call("SYNO.SurveillanceStation.Camera", "List", 9)
