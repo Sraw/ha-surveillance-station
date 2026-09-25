@@ -88,20 +88,52 @@ class LivePlanning(unittest.TestCase):
         self.assertEqual(vod.live_edge(1005.0), 1000.0)
         self.assertEqual(vod.live_edge(1004.9), 990.0)
 
-    def test_replanning_a_live_window_keeps_published_segments(self):
-        """A later, longer plan must start with the earlier plan unchanged,
-        across a recording rollover that happens in between."""
-        start = 903.0
-        first_now = 1000.0
-        early = [Recording(id=1, start=0.0, end=first_now, live=True)]
-        old = vod.plan_segments(early, start, vod.live_edge(first_now), first_now)
-        later_now = 1100.0
-        # Recording 1 closed at 1003.7 (off-grid), recording 2 is live since.
-        late = [Recording(id=1, start=0.0, end=1003.7), Recording(id=2, start=1003.7, end=later_now, live=True)]
-        new = vod.plan_segments(late, start, vod.live_edge(later_now), later_now)
+    def extend(self, old, recordings, now):
+        """What VodManager.extend does: append after the last published segment."""
+        last = old[-1]
+        return old + vod.plan_segments(recordings, last.wall_start, vod.live_edge(now), now, after=last)
+
+    def assert_well_formed(self, segs):
+        self.assertEqual([s.index for s in segs], list(range(len(segs))))
+        for a, b in zip(segs, segs[1:]):
+            self.assertAlmostEqual(b.media_start, a.media_start + a.duration)
+            self.assertGreaterEqual(b.wall_start, a.wall_start + a.duration - 1e-9)
+            self.assertEqual(b.discontinuity, b.wall_start - (a.wall_start + a.duration) > vod.GAP_TOLERANCE_SECONDS)
+            self.assertEqual(b.new_map, b.discontinuity or b.recording_id != a.recording_id)
+
+    def test_extension_continues_across_a_rollover(self):
+        start, now1, now2 = 903.0, 1000.0, 1100.0
+        old = vod.plan_segments([Recording(1, 0.0, now1, live=True)], start, vod.live_edge(now1), now1)
+        late = [Recording(1, 0.0, 1003.7), Recording(2, 1003.7, now2, live=True)]
+        new = self.extend(old, late, now2)
         self.assertEqual(new[: len(old)], old)
-        self.assertGreater(len(new), len(old))
-        self.assertTrue(all(s.duration >= vod.MIN_SEGMENT_SECONDS for s in new))
+        self.assertEqual(new[-1].wall_start + new[-1].duration, vod.live_edge(now2))
+        self.assert_well_formed(new)
+        self.assertEqual(vod.plan_segments(late, start, vod.live_edge(now2), now2), new)
+
+    def test_late_reported_rollover_never_rewrites_or_replays(self):
+        # SS still called file 1 live at 1000, but it had really closed at 985.
+        start, now1, now2 = 903.0, 1000.0, 1100.0
+        old = vod.plan_segments([Recording(1, 0.0, now1, live=True)], start, vod.live_edge(now1), now1)
+        published_end = old[-1].wall_start + old[-1].duration  # 990
+        truth = [Recording(1, 0.0, 985.0), Recording(2, 985.0, now2, live=True)]
+        new = self.extend(old, truth, now2)
+        self.assertEqual(new[: len(old)], old)
+        self.assertEqual(new[len(old)].wall_start, published_end)  # file 2 picks up at 990, no replay
+        self.assertEqual(new[len(old)].recording_id, 2)
+        self.assertTrue(new[len(old)].new_map)
+        self.assert_well_formed(new)
+
+    def test_extension_across_a_gap_is_a_discontinuity(self):
+        start, now1, now2 = 903.0, 1000.0, 1100.0
+        old = vod.plan_segments([Recording(1, 0.0, now1, live=True)], start, vod.live_edge(now1), now1)
+        gap = [Recording(1, 0.0, 990.0), Recording(2, 1031.0, now2, live=True)]
+        new = self.extend(old, gap, now2)
+        added = new[len(old)]
+        self.assertEqual(added.wall_start, 1031.0)
+        self.assertTrue(added.discontinuity)
+        self.assertEqual(len(vod.runs_from_segments(new)), 2)
+        self.assert_well_formed(new)
 
 
 class Playlist(unittest.TestCase):

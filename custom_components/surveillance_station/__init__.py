@@ -62,6 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryAuthFailed(str(err)) from err
     except SSError as err:
         raise ConfigEntryNotReady(str(err)) from err
+    client.on_auth_failed = lambda: entry.async_start_reauth(hass)
     hass.data[DOMAIN].clients[entry.entry_id] = client
     return True
 

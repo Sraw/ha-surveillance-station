@@ -112,18 +112,15 @@ class VodManager:
             if client is None:
                 return
             try:
-                infos = await client.recordings(session.camera_id, int(session.window_start), int(new_end) + 1)
+                infos = await client.recordings(session.camera_id, int(session.planned_end) - 60, int(new_end) + 1)
             except SSError as err:
                 _LOGGER.debug("Live playlist not extended: %s", err)
                 return
-            segments = plan_segments(to_recordings(infos), session.window_start, new_end, now)
-            old = session.segments
-            if segments[: len(old)] != old:
-                # Should not happen (see vod.live_edge); never rewrite what a
-                # player may already have fetched.
-                _LOGGER.warning("Live re-plan changed published segments; keeping the old playlist")
-                return
-            session.segments = segments
+            # Append-only: whatever was published stays exactly as it was,
+            # even if SS reports a file boundary late.
+            last = session.segments[-1]
+            added = plan_segments(to_recordings(infos), last.wall_start, new_end, now, after=last)
+            session.segments = session.segments + added
             session.planned_end = new_end
             if new_end >= session.max_end:
                 session.live = False

@@ -15,7 +15,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.1";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -571,6 +571,19 @@ class SSTimelineCard extends HTMLElement {
       if (autoplay) v.play().catch(() => {});
       else this._setStatus("");
     });
+    // A live playlist grows on every reload, and may gain a gap; refresh the
+    // wall-clock mapping with it.
+    const token = res.url.split("/").at(-2);
+    hls.on(Hls.Events.LEVEL_UPDATED, async () => {
+      const s = this._session;
+      if (hls !== this._hls || !s?.live) return;
+      try {
+        const upd = await this._ws({ type: "surveillance_station/vod_runs", token });
+        if (hls === this._hls && this._session === s) Object.assign(s, upd);
+      } catch (e) {
+        /* the next reload retries */
+      }
+    });
     hls.on(Hls.Events.ERROR, (_, d) => {
       if (!d.fatal || hls !== this._hls) return;
       if (d.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
@@ -579,12 +592,13 @@ class SSTimelineCard extends HTMLElement {
         return;
       }
       const wall = this._currentWall();
+      const playing = !v.paused || autoplay;
       this._destroyPlayer();
       this._session = null;
       // 404: the session expired or was evicted; start a fresh one once.
       if (d.response?.code === 404 && !this._expiredRetry) {
         this._expiredRetry = true;
-        this._loadWindow(wall, !v.paused || autoplay);
+        this._loadWindow(wall, playing);
         return;
       }
       const codec = /codec/i.test(d.details) || d.details === "manifestIncompatibleCodecsError";
@@ -597,10 +611,12 @@ class SSTimelineCard extends HTMLElement {
     hls.attachMedia(v);
   }
 
-  /** At the end of a (non-live) window, carry on into whatever was recorded next. */
+  /** At the end of a window, carry on into whatever was recorded next. */
   async _continue() {
+    // "ended" means the playlist is closed: an old window, or a live one that
+    // hit the server's window cap.
     const s = this._session;
-    if (!s || s.live) return;
+    if (!s) return;
     const seq = this._playSeq;
     const next = s.end;
     this._setStatus("Looking for the next recording…");
@@ -618,7 +634,8 @@ class SSTimelineCard extends HTMLElement {
       if (seq === this._playSeq) this._setStatus(`Playback failed: ${errText(e)}`, true);
       return;
     }
-    if (seq !== this._playSeq) return;
+    // A seek inside the window while we were asking also cancels this.
+    if (seq !== this._playSeq || !this._video.ended) return;
     const rec = recs.find((r) => (r.live ? nowS() : r.end) > next + 1);
     if (!rec) {
       this._setStatus("No later recording", true);

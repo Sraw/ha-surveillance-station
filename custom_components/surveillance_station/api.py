@@ -18,6 +18,7 @@ API notes (verified against SS 9.x, see the repo README):
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import logging
@@ -105,11 +106,17 @@ class SurveillanceStationClient:
         self._password = password
         self._sid: str | None = None
         self._login_lock = asyncio.Lock()
+        # Called when a re-login is refused at runtime (password changed).
+        self.on_auth_failed: Callable[[], None] | None = None
 
     async def login(self, stale_sid: str | None = None) -> None:
-        """Log in. With ``stale_sid``, skip if another caller already replaced it."""
+        """Get a session unless another caller already replaced ``stale_sid``.
+
+        Concurrent callers that all saw the same (missing or expired) sid end
+        up with one login between them.
+        """
         async with self._login_lock:
-            if stale_sid is not None and self._sid not in (None, stale_sid):
+            if self._sid is not None and self._sid != stale_sid:
                 return
             # POST so the password never sits in a URL (URLs end up in
             # exception text and logs).
@@ -128,8 +135,11 @@ class SurveillanceStationClient:
             )
             if not data.get("success"):
                 code = data.get("error", {}).get("code")
-                cls = SSAuthError if code in AUTH_FAILED_ERRORS else SSError
-                raise cls("SYNO.API.Auth", "login", code)
+                if code in AUTH_FAILED_ERRORS:
+                    if self.on_auth_failed is not None:
+                        self.on_auth_failed()
+                    raise SSAuthError("SYNO.API.Auth", "login", code)
+                raise SSError("SYNO.API.Auth", "login", code)
             self._sid = data["data"]["sid"]
 
     async def logout(self) -> None:
@@ -171,7 +181,7 @@ class SurveillanceStationClient:
         """entry.cgi call with one transparent re-login on session errors."""
         for attempt in (1, 2):
             if self._sid is None:
-                await self.login()
+                await self.login(stale_sid=None)
             sid = self._sid
             data = await self._raw_json(
                 "entry.cgi",
@@ -273,7 +283,7 @@ class SurveillanceStationClient:
         """Cut [offset, offset+duration) out of one recording as MP4 bytes."""
         for attempt in (1, 2):
             if self._sid is None:
-                await self.login()
+                await self.login(stale_sid=None)
             sid = self._sid
             params = {
                 "api": "SYNO.SurveillanceStation.Recording", "method": "Download", "version": 6,

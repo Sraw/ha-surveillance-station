@@ -71,8 +71,13 @@ def plan_segments(
     end: float,
     now: float,
     segment_seconds: int = SEGMENT_SECONDS,
+    after: Segment | None = None,
 ) -> list[Segment]:
     """Cover [start, end) with segments cut from the given recordings.
+
+    ``after``: continue an existing plan whose last segment this is (live
+    playlists only ever append). Planning then starts where it ended, and
+    index, media time and the discontinuity/new-map flags carry on from it.
 
     Segment boundaries sit on a fixed wall-clock grid (multiples of
     ``segment_seconds``) so that the same moment always maps to the same
@@ -81,9 +86,16 @@ def plan_segments(
     come from one recording file.
     """
     segments: list[Segment] = []
+    first_index = 0
     media_pos = 0.0
     prev_end: float | None = None
     prev_rec: int | None = None
+    if after is not None:
+        first_index = after.index + 1
+        media_pos = after.media_start + after.duration
+        prev_end = after.wall_start + after.duration
+        prev_rec = after.recording_id
+        start = max(start, prev_end)
     for rec in sorted(recordings, key=lambda r: r.start):
         rec_end = min(rec.end, now - LIVE_MARGIN_SECONDS) if rec.live else rec.end
         lo = max(start, rec.start)
@@ -103,7 +115,7 @@ def plan_segments(
             gap = prev_end is not None and abs(t - prev_end) > GAP_TOLERANCE_SECONDS
             segments.append(
                 Segment(
-                    index=len(segments),
+                    index=first_index + len(segments),
                     recording_id=rec.id,
                     mount_id=rec.mount_id,
                     wall_start=t,

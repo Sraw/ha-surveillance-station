@@ -23,7 +23,7 @@ ERR_SS = "surveillance_station_error"
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_vod):
+    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_vod, ws_vod_runs):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -72,6 +72,19 @@ async def ws_cameras(hass: HomeAssistant, connection: websocket_api.ActiveConnec
         }
 
     await _run(connection, msg, go())
+
+
+def _describe(session: VodSession) -> dict[str, Any]:
+    segments = session.segments
+    return {
+        "live": session.live,
+        "start": segments[0].wall_start,
+        "end": segments[-1].wall_start + segments[-1].duration,
+        "runs": [
+            {"wall_start": r.wall_start, "media_start": r.media_start, "duration": r.duration}
+            for r in runs_from_segments(segments)
+        ],
+    }
 
 
 _RANGE_SCHEMA = {
@@ -147,15 +160,22 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
             live=live, max_end=max_end, planned_end=end,
         )
         token = _manager(hass).create_session(session)
-        return {
-            "url": f"{VOD_URL}/{token}/index.m3u8",
-            "live": live,
-            "start": segments[0].wall_start,
-            "end": segments[-1].wall_start + segments[-1].duration,
-            "runs": [
-                {"wall_start": r.wall_start, "media_start": r.media_start, "duration": r.duration}
-                for r in runs_from_segments(segments)
-            ],
-        }
+        return {"url": f"{VOD_URL}/{token}/index.m3u8", **_describe(session)}
+
+    await _run(connection, msg, go())
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "surveillance_station/vod_runs", vol.Required("token"): str}
+)
+@websocket_api.async_response
+async def ws_vod_runs(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """Current mapping of a session; a live one grows (and may gain gaps)."""
+
+    async def go():
+        session = _manager(hass).get_session(msg["token"])
+        if session is None:
+            raise KeyError("playback session expired")
+        return _describe(session)
 
     await _run(connection, msg, go())
