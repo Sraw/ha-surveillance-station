@@ -18,7 +18,7 @@ Advanced Camera Card engine and notification deep links.
 | `vod.py` | Pure logic: plans 10 s wall-clock-aligned HLS segments over a window, renders the playlist, splits ffmpeg output into init/media parts |
 | `views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` with on-demand fetch, in-flight dedupe and a small LRU |
 | `websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks`, `/vod` |
-| `frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, auto-loaded by the integration. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
+| `frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
 
 ## Install
 
@@ -84,11 +84,14 @@ neither the password nor the SS session id reaches logs or browsers.
   its app bundle loads. An `add_extra_js_url` module can run first, and a card
   defined then is invisible ("Custom element doesn't exist"). The card
   therefore waits for `<home-assistant>` to be defined, then registers.
-- **"Configuration error" in the HA app right after installing.** HA's
-  service worker serves the app page stale-while-revalidate. The first open
-  after installing shows the cached page from before the integration existed,
-  which has no card import, while the new page downloads in the background.
-  Close and reopen the app (swipe it away), and the card is there.
+- **Load the card as a Lovelace resource, not via `add_extra_js_url`.** The
+  extra-JS import is baked into index.html. HA's service worker serves that
+  page stale-while-revalidate, and in the Android app it kept serving a copy
+  from before the integration was installed, even after reopening. The result
+  was "Configuration error". The integration therefore registers (and
+  version-bumps) its own Lovelace resource, because the resource list comes
+  over the WebSocket on every dashboard load. It uses `add_extra_js_url` only
+  when resources are in YAML mode.
 - The browser must decode HEVC itself. Chrome/Edge with hardware decode,
   Safari and the HA Android/iOS apps generally can. Firefox and headless
   Chromium cannot. The card says so when `MediaSource` reports no `hvc1`.

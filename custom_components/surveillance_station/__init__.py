@@ -8,6 +8,8 @@ from pathlib import Path
 
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.lovelace.const import LOVELACE_DATA
+from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
 from homeassistant.core import HomeAssistant
@@ -42,8 +44,32 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     )
     version = await hass.async_add_executor_job(_version)
     # Cache-bust on every release so browsers pick up a new card.
-    add_extra_js_url(hass, f"{STATIC_URL}/{CARD_FILENAME}?v={version}")
+    await _register_card(hass, f"{STATIC_URL}/{CARD_FILENAME}?v={version}")
     return True
+
+
+async def _register_card(hass: HomeAssistant, url: str) -> None:
+    """Load the card through a Lovelace resource, kept at the current version.
+
+    Not add_extra_js_url: that bakes the import into index.html, and HA's
+    service worker serves index.html stale-while-revalidate, so the mobile app
+    can keep showing a page from before the integration was installed
+    ("Custom element doesn't exist"). The resource list is fetched over the
+    WebSocket every time a dashboard loads. YAML-mode resources can't be
+    edited from here, so they fall back to add_extra_js_url.
+    """
+    resources = getattr(hass.data.get(LOVELACE_DATA), "resources", None)
+    if not isinstance(resources, ResourceStorageCollection):
+        add_extra_js_url(hass, url)
+        return
+    await resources.async_get_info()  # loads the collection
+    base = url.split("?")[0]
+    for item in resources.async_items():
+        if item["url"].split("?")[0] == base:
+            if item["url"] != url:
+                await resources.async_update_item(item["id"], {"res_type": "module", "url": url})
+            return
+    await resources.async_create_item({"res_type": "module", "url": url})
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
