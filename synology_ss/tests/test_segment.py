@@ -8,6 +8,7 @@ not ffmpeg's own behaviour.
 import asyncio
 import glob
 import os
+from pathlib import Path
 import struct
 import tempfile
 import time
@@ -116,9 +117,9 @@ async def test_fetch_snapshot_uses_now_as_the_end_of_a_live_recording() -> None:
 async def test_fetch_snapshot_nothing_recorded() -> None:
     client = MagicMock()
     client.recordings = AsyncMock(return_value=[])
+    client.download = AsyncMock()
     result = await seg_mod.fetch_snapshot(client, 6, time.time(), "ffmpeg")
     assert result is None
-    client.download = AsyncMock()
     client.download.assert_not_called()
 
 
@@ -134,19 +135,18 @@ async def test_fetch_snapshot_empty_frame_is_none() -> None:
         assert await seg_mod.fetch_snapshot(client, 6, now - 50, "ffmpeg") is None
 
 
-def test_remove_stale_temp_files() -> None:
+def test_remove_stale_temp_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # remove_stale_temp_files() sweeps tempfile.gettempdir() itself; point it
+    # at an empty scratch dir so this can't touch a real leftover scratch
+    # file (the crash-recovery case this feature exists for) elsewhere on disk.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     paths = []
     for _ in range(2):
         fd, path = tempfile.mkstemp(prefix=seg_mod.TEMP_PREFIX, suffix=".mp4")
         os.close(fd)
         paths.append(path)
-    try:
-        assert seg_mod.remove_stale_temp_files() >= 2
-        assert not any(os.path.exists(p) for p in paths)
-    finally:
-        for p in paths:
-            if os.path.exists(p):
-                os.unlink(p)
+    assert seg_mod.remove_stale_temp_files() >= 2
+    assert not any(os.path.exists(p) for p in paths)
 
 
 def test_remove_stale_temp_files_ignores_a_file_already_gone() -> None:
