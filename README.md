@@ -227,11 +227,13 @@ broker down, NAS unreachable at runtime and during HA's start):
   looking first for a bookmark the failed try may have made (only its
   answer lost). While SS is known to be failing, not: the next reviews
   shouldn't wait behind timeouts.
-- What still fails is kept (one message per review, at most 1000), and the
-  oldest is tried again every minute; once one goes through, all the others
-  follow: an outage loses no bookmark (and, past 2 minutes, sends no stale
-  notification). Only a bookmark actually made counts as SS being back, not
-  reads that work.
+- What failed because SS was unreachable is kept (one message per review,
+  at most 1000, across restarts, for a day), and the oldest is tried again
+  every minute; once one goes through, the others are replayed (after
+  anything fresh, and back to waiting if SS fails again): an outage loses
+  no bookmark (and, past 2 minutes, sends no stale notification). Only a
+  bookmark made or found counts as SS being back, not reads that work. An
+  error code SS gives for a request is not kept: it would only come again.
 - Messages waiting for SS are one per review (a later one replaces the
   earlier: it says everything that one did), at most 1000 reviews.
 - The SS camera list is read again every 10 minutes and after any failure:

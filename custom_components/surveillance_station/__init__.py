@@ -136,19 +136,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
     except SSAuthError as err:
         await _logout(client)
         raise ConfigEntryAuthFailed(translation_domain=DOMAIN, translation_key="invalid_auth") from err
-    except Exception as err:
-        # Unreachable, a malformed answer (2026-09-25), or a bug. Never a
-        # setup_error that stays until someone reloads by hand; and no DSM
-        # session left behind.
+    except SSError as err:
+        # Unreachable (a NAS rebooting), or an odd answer (2026-09-25).
         await _logout(client)
-        unexpected = not isinstance(err, SSError)
         if not _knows_its_nas(entry):
             # The NAS's serial is needed first (the entry's unique ID).
-            _LOGGER.log(logging.ERROR if unexpected else logging.DEBUG, "Setup failed", exc_info=unexpected)
             raise ConfigEntryNotReady(
                 translation_domain=DOMAIN,
                 translation_key="cannot_connect",
-                translation_placeholders={"error": str(err) if not unexpected else type(err).__name__},
+                translation_placeholders={"error": str(err)},
             ) from err
         # Start anyway: the client logs in on first use, so bookmarks and
         # playback work the moment SS answers, rather than after HA's setup
@@ -156,8 +152,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         # even Frigate's reviews would be received.
         _LOGGER.warning(
             "Surveillance Station at %s not usable yet (%s); starting anyway, it is used once it answers",
-            data[CONF_HOST], err if not unexpected else type(err).__name__, exc_info=unexpected,
+            data[CONF_HOST], err,
         )
+    except Exception as err:
+        # A bug: retried, visibly (not started as if all were well); never a
+        # setup_error that stays until someone reloads by hand.
+        await _logout(client)
+        _LOGGER.exception("Unexpected error setting up Surveillance Station; retrying")
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"error": type(err).__name__},
+        ) from err
     if info is not None and entry.unique_id != info.serial:
         # Entries from before 0.5 were keyed by host:port.
         hass.config_entries.async_update_entry(entry, unique_id=info.serial)
@@ -206,7 +212,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
     # state written now, before a reload reads it (or a removal deletes it).
     if (bridge := hass.data.get(DATA_FRIGATE, {}).pop(entry.entry_id, None)) is not None:
         bridge.stop()
-        await bridge.async_flush()
+        try:
+            await bridge.async_flush()
+        except Exception:  # noqa: BLE001 - never a failed unload for it
+            _LOGGER.warning("Could not save the Frigate bridge's state", exc_info=True)
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     await entry.runtime_data.logout()
     return True

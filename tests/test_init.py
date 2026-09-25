@@ -75,13 +75,12 @@ LEGACY_ID = "192.0.2.10:5000"  # entries from before 0.5: the serial isn't known
     [
         SSConnectionError("SYNO.API.Auth", "login", None, "TimeoutError"),
         SSError("SYNO.SurveillanceStation.Info", "GetInfo", None, "answer without a serial"),
-        AttributeError("'list' object has no attribute 'get'"),
     ],
 )
 async def test_known_nas_not_usable_starts_anyway(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock, error: Exception
 ) -> None:
-    """NAS rebooting, a malformed answer, a bug: loaded all the same, and used once SS answers.
+    """NAS rebooting, a malformed answer: loaded all the same, and used once SS answers.
 
     Not HA's setup retry: its backoff reaches 10 minutes, and meanwhile not
     even Frigate's reviews would be received.
@@ -107,6 +106,18 @@ async def test_unknown_nas_not_usable_retries(hass: HomeAssistant, mock_client: 
     await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.SETUP_RETRY
+    mock_client.logout.assert_awaited()
+
+
+async def test_a_bug_in_setup_retries_visibly(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """Not started as if all were well (every later call would hit it silently): retried."""
+    mock_client.info.side_effect = AttributeError("'list' object has no attribute 'get'")
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
     mock_client.logout.assert_awaited()
 
 

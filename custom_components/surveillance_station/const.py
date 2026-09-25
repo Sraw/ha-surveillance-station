@@ -95,6 +95,7 @@ FRIGATE_RETRY_SECONDS = 5
 FRIGATE_MQTT_RETRY_SECONDS = 60  # waiting for HA's MQTT to come up
 FRIGATE_CAMERAS_TTL = 600  # SS camera list refreshed at least this often
 FRIGATE_DECIDED_MAX = 512  # reviews remembered (across restarts) as announced or not
+FRIGATE_DEFERRED_MAX_AGE = 86400  # a review SS didn't take for a day is given up on
 # Health: a problem that lasts this long becomes a Repairs issue (cleared on
 # recovery); checked every FRIGATE_HEALTH_INTERVAL.
 FRIGATE_ISSUE_AFTER_SECONDS = 600

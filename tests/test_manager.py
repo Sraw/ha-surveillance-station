@@ -164,7 +164,7 @@ async def test_thumbnail_miss_expires(hass: HomeAssistant, setup_integration: Mo
     entry_id = setup_integration.entry_id
     snap = AsyncMock(side_effect=[None, b"j"])
     now = views.time.monotonic()
-    with patch.object(views, "fetch_snapshot", snap), patch.object(views.time, "monotonic") as clock:
+    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic") as clock:
         clock.return_value = now
         assert await manager.thumbnail(entry_id, 6, T0) is None
         assert await manager.thumbnail(entry_id, 6, T0) is None
@@ -396,7 +396,7 @@ async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integ
     clock = iter(range(0, 1000, 3))
     with (
         patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
-        patch.object(views, "time", MagicMock(monotonic=lambda: next(clock))),
+        patch.object(views, "_monotonic", lambda: next(clock)),
     ):
         assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
     assert 3 <= mock_client.recordings.await_count <= 8

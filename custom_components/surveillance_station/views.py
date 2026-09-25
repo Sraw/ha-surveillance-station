@@ -81,6 +81,9 @@ from .thumbnail_store import ThumbnailStore
 
 _LOGGER = logging.getLogger(__name__)
 
+# Patchable in tests (time.monotonic itself is the event loop's clock).
+_monotonic = time.monotonic
+
 # How often thumbnail_when_recorded asks SS whether the moment is written yet.
 THUMBNAIL_POLL_SECONDS = 2
 
@@ -253,9 +256,9 @@ class VodManager:
         if (hit := self._bookmarks.get(entry_id)) is not None:
             at, found = hit
             if isinstance(found, SSError):
-                if time.monotonic() - at < BOOKMARK_ERROR_SECONDS:
+                if _monotonic() - at < BOOKMARK_ERROR_SECONDS:
                     raise found.with_traceback(None)
-            elif time.monotonic() - at < BOOKMARK_CACHE_SECONDS:
+            elif _monotonic() - at < BOOKMARK_CACHE_SECONDS:
                 return found
         task = self._bookmark_tasks.get(entry_id)
         if task is None:
@@ -272,12 +275,12 @@ class VodManager:
             cameras = await client.cameras()
             found = await client.list_bookmarks([c.id for c in cameras])
         except SSError as err:
-            self._bookmarks[entry_id] = (time.monotonic(), err)
+            self._bookmarks[entry_id] = (_monotonic(), err)
             raise
         finally:
             if self._bookmark_tasks.get(entry_id) is me:
                 del self._bookmark_tasks[entry_id]
-        self._bookmarks[entry_id] = (time.monotonic(), found)
+        self._bookmarks[entry_id] = (_monotonic(), found)
         return found
 
     def forget_bookmarks(self, entry_id: str) -> None:
@@ -293,7 +296,7 @@ class VodManager:
         has written: until that passes ts, a cut there could come out short
         (an earlier keyframe) or empty, and that would be kept.
         """
-        deadline = time.monotonic() + wait
+        deadline = _monotonic() + wait
         while True:
             client = self.client(entry_id)
             try:
@@ -303,7 +306,7 @@ class VodManager:
                     return await self.thumbnail(entry_id, camera_id, ts, width)
             except SSError:
                 pass
-            if time.monotonic() + THUMBNAIL_POLL_SECONDS > deadline:
+            if _monotonic() + THUMBNAIL_POLL_SECONDS > deadline:
                 return None
             await asyncio.sleep(THUMBNAIL_POLL_SECONDS)
 
@@ -347,7 +350,7 @@ class VodManager:
             at, data = hit
             # A miss is only remembered briefly: the recording may just not
             # have been listed yet.
-            if data or time.monotonic() - at < THUMBNAIL_MISS_SECONDS:
+            if data or _monotonic() - at < THUMBNAIL_MISS_SECONDS:
                 self._thumbs.move_to_end(key)
                 return data or None
             self._drop_thumbnail(key)
@@ -393,7 +396,7 @@ class VodManager:
                 del self._thumb_tasks[key]
         self._drop_thumbnail(key)
         data = jpg or b""
-        self._thumbs[key] = (time.monotonic(), data)
+        self._thumbs[key] = (_monotonic(), data)
         self._thumbs_bytes += len(data) + THUMBNAIL_ENTRY_BYTES
         while self._thumbs_bytes > THUMBNAIL_CACHE_BYTES and len(self._thumbs) > 1:
             self._drop_thumbnail(next(iter(self._thumbs)))
