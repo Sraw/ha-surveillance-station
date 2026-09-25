@@ -158,7 +158,7 @@ async def test_keep_alive_pings_surveillance_station(
     )
     url = await _live_url(hass, hass_ws_client)
     client = await hass_client_no_auth()
-    with patch.object(views, "LIVE_KEEP_ALIVE_SECONDS", 0):  # the real 10 s wait, sped up
+    with patch.object(views, "LIVE_KEEP_ALIVE_SECONDS", 0.01):  # the real 10 s wait, sped up (not 0: no busy spin)
         async with client.ws_connect(url) as ws:
             await ws.receive_bytes()
             await asyncio.sleep(0.05)
