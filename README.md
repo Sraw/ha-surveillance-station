@@ -2,14 +2,14 @@
 
 Play back **Synology Surveillance Station** recordings inside Home Assistant,
 with a scrubbable wall-clock timeline and SS bookmarks drawn on it. SS keeps
-recording, archiving and doing timelapse. This integration only reads from it.
+recording, archiving and doing timelapse. This integration only reads from it,
+except for one optional write: Frigate detections become SS bookmarks.
 Video is never transcoded: SS cuts the requested range out of its own
 recording, HA stream-copies it into fragmented MP4, and the browser decodes the
 original H.265/H.264.
 
-Status: step 1 of a larger plan (integration + test card). Next come an
-Advanced Camera Card engine, notification deep links, and Frigate detections
-written as SS bookmarks through the documented `ThirdParty.Bookmark.Create`.
+Status: playback, the card, notification links, and Frigate detections as SS
+bookmarks (with an event to notify from).
 
 ## Pieces
 
@@ -18,6 +18,7 @@ written as SS bookmarks through the documented `ThirdParty.Bookmark.Create`.
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics |
 | `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
+| `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*) |
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 
@@ -159,6 +160,72 @@ arrived as 8 + 2 or 3 + 7 s) and the few seconds buffered ran out. Before 0.8
 recordings were HLS everywhere, played by hls.js: a seek waited for a 10 s
 segment to be downloaded from SS and remuxed by HA (1-3 s), grid followers
 were kept in step by seeking into those segments.
+
+## Frigate detections
+
+Optional (the integration's options): with Frigate as the detector and SS as
+the recorder, each Frigate **review item** with an object of interest
+(person, car, dog, cat by default; alert or detection alike) becomes one SS
+bookmark on the same camera, so it is on the card's timeline and in its
+event list, and in DS cam / the SS client. Every animal is called "Animal".
+
+- Read from `<prefix>/reviews` on MQTT (HA's MQTT integration, connected to
+  Frigate's broker). Frigate cameras are matched to SS cameras by name,
+  ignoring case, spaces and punctuation (`drive_way` = "Drive Way"); an
+  unmatched one is logged once.
+- `new`: bookmark from the review's start, named after its objects
+  ("Person, Car", "Animal"); its end is open (30 s, or up to now) until `end`
+  sets it. `update`: renamed as objects or zones are added; a review that
+  only now has an object of interest (a bicycle, then a person) is bookmarked
+  then. The comment ("Frigate alert in porch
+  [frigate <review id>]") names the review, so one that ends after a
+  restart still finds its bookmark.
+- Written with the documented `ThirdParty.Bookmark.Create` / `Edit` (epoch
+  times). The DSM account needs no more than playback rights for it.
+- Each new bookmark fires **`surveillance_station_detection`** once, with
+  `camera`, `camera_id`, `objects` (as named: `["Person", "Animal"]`),
+  `labels` (Frigate's: `["person", "dog"]`), `zones`, `severity`, `start`,
+  `review_id`, `bookmark_id`, `image` (a signed frame of the moment, from SS)
+  and `url` (the card at that moment, if a dashboard path is set). It waits
+  for SS to have recorded the moment (SS lists recordings 0-10 s behind; at
+  most 20 s), so the frame is there when a phone fetches it. The frame is
+  the one Frigate picked as showing the object best (`thumb_time`), and it
+  is also the bookmark's thumbnail in the card (kept up to date as Frigate
+  picks a better one); the link still starts at the review's beginning.
+- One event per review, when it first qualifies, with the objects seen by
+  then: a car that a person later gets out of was announced as "Car". A
+  review bookmarked more than 2 minutes after it began (SS was unreachable,
+  HA restarted mid-review), or only heard of at its end, gets its bookmark
+  but no event: the notification would be old news.
+- Anyone who can publish to Frigate's topic on the broker can make
+  bookmarks (and pick the moment whose frame is signed into the event); the
+  broker is expected to require a login, as Frigate's does.
+
+A notification is an automation on that event, e.g.:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: surveillance_station_detection
+    event_data: {camera: Front Door}
+actions:
+  - action: notify.mobile_app_phone
+    data:
+      title: "{{ trigger.event.data.objects | join(', ') }} at {{ trigger.event.data.camera }}"
+      message: "{{ trigger.event.data.start | timestamp_custom('%H:%M:%S') }}"
+      data:
+        image: "{{ trigger.event.data.image }}"
+        clickAction: "{{ trigger.event.data.url }}"  # Android
+        url: "{{ trigger.event.data.url }}"          # iOS
+        tag: "{{ trigger.event.data.review_id }}"
+```
+
+The card follows such a link also when it is already on screen (HA navigates
+in place, without reloading): `?ss_camera=&ss_time=` selects the camera and
+plays from 3 s before the detection. Once followed, the link is taken out of
+the address, so going back or closing a dialog doesn't return to it; a
+camera it adds to the grid is added for now, not to the grid saved for next
+time.
 
 ## Resource use
 

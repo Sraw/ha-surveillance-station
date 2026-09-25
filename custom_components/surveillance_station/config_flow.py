@@ -1,4 +1,5 @@
 """Config flow: host + a dedicated DSM account, with reauth and reconfigure.
+Options: Frigate detections as bookmarks.
 
 The entry's unique ID is the NAS serial number, so it survives an IP or port
 change and a reconfigure can't point an entry at a different NAS.
@@ -19,11 +20,23 @@ from synology_ss_playback import (
 )
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
+from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
 
-from .const import CONF_VERIFY_SSL, DEFAULT_PORT, DOMAIN
+from .const import (
+    CONF_FRIGATE,
+    CONF_FRIGATE_OBJECTS,
+    CONF_FRIGATE_LINK,
+    CONF_FRIGATE_TOPIC,
+    CONF_VERIFY_SSL,
+    DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_TOPIC,
+    DEFAULT_PORT,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,12 +51,31 @@ SCHEMA = vol.Schema(
     }
 )
 REAUTH_SCHEMA = vol.Schema({vol.Required(CONF_PASSWORD): str})
+OPTIONS_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_FRIGATE, default=False): bool,
+        vol.Required(CONF_FRIGATE_TOPIC, default=DEFAULT_FRIGATE_TOPIC): str,
+        vol.Required(CONF_FRIGATE_OBJECTS, default=DEFAULT_FRIGATE_OBJECTS): SelectSelector(
+            SelectSelectorConfig(
+                options=["person", "car", "dog", "cat", "bicycle", "motorcycle", "bird", "horse", "package"],
+                multiple=True,
+                custom_value=True,
+            )
+        ),
+        vol.Optional(CONF_FRIGATE_LINK): str,
+    }
+)
 
 
 class SurveillanceStationConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow."""
 
     VERSION = 1
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlowWithReload:
+        return SurveillanceStationOptionsFlow()
 
     async def _validate(self, data: Mapping[str, Any]) -> tuple[SSInfo | None, str | None]:
         """Log in, identify the NAS and list cameras; (info, None) or (None, error key)."""
@@ -126,5 +158,31 @@ class SurveillanceStationConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=self.add_suggested_values_to_schema(SCHEMA, suggested),
+            errors=errors,
+        )
+
+
+class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
+    """Frigate detections as bookmarks (saving reloads the entry)."""
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            topic = user_input[CONF_FRIGATE_TOPIC].strip().strip("/")
+            link = (user_input.get(CONF_FRIGATE_LINK) or "").strip()
+            objects = sorted({o.strip().lower() for o in user_input[CONF_FRIGATE_OBJECTS] if o.strip()})
+            if not topic or any(c in topic for c in "#+"):
+                errors[CONF_FRIGATE_TOPIC] = "invalid_topic"
+            elif not objects:
+                errors[CONF_FRIGATE_OBJECTS] = "no_objects"
+            elif link and (not link.startswith("/") or link.startswith("//") or "\\" in link):
+                errors[CONF_FRIGATE_LINK] = "invalid_link"
+            else:
+                return self.async_create_entry(
+                    data={**user_input, CONF_FRIGATE_TOPIC: topic, CONF_FRIGATE_OBJECTS: objects, CONF_FRIGATE_LINK: link}
+                )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(OPTIONS_SCHEMA, user_input or self.config_entry.options),
             errors=errors,
         )

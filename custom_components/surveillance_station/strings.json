@@ -53,5 +53,29 @@
     "cannot_connect": {
       "message": "Cannot reach Surveillance Station: {error}"
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Frigate detections",
+        "description": "Turn Frigate's review items into Surveillance Station bookmarks (needs the MQTT integration, connected to Frigate's broker). Frigate cameras are matched to Surveillance Station cameras by name. Each new bookmark also fires a surveillance_station_detection event, for an automation to send a notification.",
+        "data": {
+          "frigate": "Bookmark Frigate detections",
+          "frigate_topic": "Frigate MQTT topic prefix",
+          "frigate_objects": "Objects to bookmark",
+          "frigate_link": "Dashboard path of the timeline card"
+        },
+        "data_description": {
+          "frigate_topic": "Frigate's mqtt.topic_prefix; reviews are read from <prefix>/reviews.",
+          "frigate_link": "For example /ss-playback/playback. The event then carries a link that opens the card at the detection.",
+          "frigate_objects": "Frigate labels. A review with any of them is bookmarked, alert or detection. Animals (dog, cat, bird, …) are all named Animal."
+        }
+      }
+    },
+    "error": {
+      "invalid_topic": "Enter a topic prefix without wildcards.",
+      "invalid_link": "Enter a path starting with /, such as /ss-playback/playback.",
+      "no_objects": "Choose at least one object."
+    }
   }
 }

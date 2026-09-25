@@ -57,3 +57,29 @@ MAX_QUERY_WINDOW_SECONDS = 8 * 86400
 # end is older than this has stopped, whatever its flag still says. (NAS and
 # HA clocks agree to within a second, both on NTP.)
 LIVE_END_STALE_SECONDS = 15
+
+# Frigate detections as bookmarks (options).
+CONF_FRIGATE = "frigate"
+CONF_FRIGATE_TOPIC = "frigate_topic"
+CONF_FRIGATE_OBJECTS = "frigate_objects"  # Frigate labels bookmarked, whatever the review's severity
+CONF_FRIGATE_LINK = "frigate_link"  # dashboard path of the card, for the event's url
+DEFAULT_FRIGATE_TOPIC = "frigate"
+DEFAULT_FRIGATE_OBJECTS = ["person", "car", "dog", "cat"]
+# Named "Animal" in bookmarks and events, one kind for all of them.
+FRIGATE_ANIMALS = frozenset(
+    {"bear", "bird", "cat", "cow", "deer", "dog", "fox", "goat", "horse", "kangaroo", "rabbit", "raccoon",
+     "sheep", "skunk", "squirrel", "zebra", "elephant", "giraffe"}
+)
+DETECTION_EVENT = f"{DOMAIN}_detection"
+# A review still going on gets a bookmark this long (or up to now) until its end arrives.
+FRIGATE_OPEN_BOOKMARK_SECONDS = 30
+# The event waits at most this long for SS to have recorded the moment (its frame).
+FRIGATE_EVENT_WAIT_SECONDS = 20
+FRIGATE_TRACKED_MAX = 256  # reviews in progress remembered
+FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyond
+# A review bookmarked later than this after it began (SS was unreachable, HA
+# restarted mid-review) fires no event: a notification would be old news.
+FRIGATE_ANNOUNCE_MAX_AGE = 120
+# Bookmarks whose thumbnail is another moment than their start (the frame a
+# detector picked, where the object shows best), remembered across restarts.
+BOOKMARK_FRAMES_MAX = 20_000

@@ -26,7 +26,19 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
 from . import websocket
-from .const import CARD_FILENAME, CONF_VERIFY_SSL, DOMAIN, STATIC_URL
+from .const import (
+    CARD_FILENAME,
+    CONF_FRIGATE,
+    CONF_FRIGATE_OBJECTS,
+    CONF_FRIGATE_LINK,
+    CONF_FRIGATE_TOPIC,
+    CONF_VERIFY_SSL,
+    DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_TOPIC,
+    DOMAIN,
+    STATIC_URL,
+)
+from .frigate import DATA_FRIGATE, FrigateBridge
 from .views import (
     DATA_MANAGER,
     LiveStreamView,
@@ -131,10 +143,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
     # Per entry rather than in async_setup, so that removing the last entry
     # and adding one back (no restart in between) brings the card back.
     await _register_card(hass, await _card_url(hass))
+    if entry.options.get(CONF_FRIGATE):
+        options = entry.options
+        bridge = FrigateBridge(
+            hass,
+            entry.entry_id,
+            client,
+            hass.data[DATA_MANAGER],
+            options.get(CONF_FRIGATE_TOPIC) or DEFAULT_FRIGATE_TOPIC,
+            set(options.get(CONF_FRIGATE_OBJECTS) or DEFAULT_FRIGATE_OBJECTS),
+            options.get(CONF_FRIGATE_LINK) or "",
+        )
+        hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
+        # In the background: MQTT may still be starting.
+        entry.async_create_background_task(hass, bridge.start(), "surveillance_station frigate setup")
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
+    # First, so that no bookmark is being made while the client logs out.
+    if (bridge := hass.data.get(DATA_FRIGATE, {}).pop(entry.entry_id, None)) is not None:
+        bridge.stop()
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     await entry.runtime_data.logout()
     return True

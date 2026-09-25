@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.8.3";
+const CARD_VERSION = "0.9.0";
 
 const SPANS = [
   [900, "15m"],
@@ -90,6 +90,15 @@ const ZOOM_MAX = 8;
 const FS_IDLE_MS = 3000; // fullscreen controls hide after this
 
 const nowS = () => Date.now() / 1000;
+// The link parameters out of the address, without a navigation.
+const consumeLink = () => {
+  const params = new URLSearchParams(location.search);
+  if (!params.has("ss_time") && !params.has("ss_camera")) return;
+  params.delete("ss_time");
+  params.delete("ss_camera");
+  const q = params.toString();
+  history.replaceState(history.state, "", location.pathname + (q ? "?" + q : "") + location.hash);
+};
 const pad = (n) => String(n).padStart(2, "0");
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 // Asking for "now" (the Live button, opening the card, a tap past the
@@ -1933,6 +1942,13 @@ class SSTimelineCard extends HTMLElement {
       this._fit();
     };
     this._resizeObs = new ResizeObserver(() => requestAnimationFrame(() => this._fit()));
+    // A notification link opened while the card is already on screen: HA
+    // navigates in place (no reload), so the card isn't set up again.
+    // (A link is taken out of the address once followed, so going back or
+    // closing a dialog later doesn't return to it.)
+    this._onLocation = () => {
+      if (this._inited && this._master && this.isConnected) this._followLink();
+    };
     // HA came back (e.g. restarted): its playback sessions and thumbnail
     // links are gone, and events may have been missed meanwhile. HA's own
     // dashboards usually rebuild their cards on reconnect (this one is then
@@ -2000,6 +2016,7 @@ class SSTimelineCard extends HTMLElement {
 
   connectedCallback() {
     if (this._hass && !this._inited) this._init();
+    else if (this._inited && this._master && this._followLink()) this._resume = null;
     else if (this._inited && this._resume && this._master) {
       // Back on the view: live again if it was live, else where it was.
       const { t, playing, live } = this._resume;
@@ -2015,6 +2032,7 @@ class SSTimelineCard extends HTMLElement {
     document.addEventListener("fullscreenchange", this._onFullscreen);
     document.addEventListener("pointerdown", this._onDocDown);
     window.addEventListener("resize", this._onResize);
+    window.addEventListener("location-changed", this._onLocation);
     this._resizeObs?.observe(this);
     this._hass?.connection?.addEventListener?.("ready", this._onReconnect);
   }
@@ -2028,6 +2046,7 @@ class SSTimelineCard extends HTMLElement {
     this._wasFs = false;
     this._stage?.classList.remove("idle");
     window.removeEventListener("resize", this._onResize);
+    window.removeEventListener("location-changed", this._onLocation);
     document.removeEventListener("pointerdown", this._onDocDown);
     this._resizeObs?.disconnect();
     this._hass?.connection?.removeEventListener?.("ready", this._onReconnect);
@@ -2077,6 +2096,7 @@ class SSTimelineCard extends HTMLElement {
       asked ?? (last && (!this._grid || this._gridSet.includes(last.id)) ? last : this._findCamera(this._gridSet[0]));
     this._shown = this._grid ? [...this._gridSet] : [cam.id];
     const t = Number(params.get("ss_time"));
+    consumeLink();
     this._renderCameras();
     this._cameraId = cam.id;
     this._buildPlayers();
@@ -2420,7 +2440,7 @@ class SSTimelineCard extends HTMLElement {
    * Show exactly these cameras (plus the master), keeping everyone at the
    * master's time. The timeline and the event list follow the shown set.
    */
-  _setShown(ids, master = this._cameraId, at = null, autoplay = null) {
+  _setShown(ids, master = this._cameraId, at = null, autoplay = null, keep = true) {
     const m = this._master;
     if (!m) return;
     const wall = at ?? m.wall();
@@ -2429,7 +2449,7 @@ class SSTimelineCard extends HTMLElement {
     this._shown = [...new Set([...ids, master])];
     this._cameraId = master;
     const added = this._buildPlayers();
-    if (this._grid) {
+    if (this._grid && keep) {
       this._gridSet = this._shown;
       prefs.set("cameras", this._shown);
     }
@@ -2471,13 +2491,30 @@ class SSTimelineCard extends HTMLElement {
   }
 
   /** Make a camera the master (showing it if needed) and go to t. */
-  _selectCamera(id, t, autoplay) {
+  _selectCamera(id, t, autoplay, keep = true) {
     if (this._shown.includes(id)) this._setMaster(id);
     // _seekAll then finds it loading there.
-    else this._setShown(this._grid ? [...this._shown, id] : [id], id, t, autoplay);
+    else this._setShown(this._grid ? [...this._shown, id] : [id], id, t, autoplay, keep);
     this._centerOn(t);
     this._loadTimeline();
     this._seekAll(t, autoplay);
+  }
+
+  // ?ss_camera=&ss_time= in the address: that camera at that moment (live
+  // without a time), then out of the address. Another tap on the same
+  // notification puts it back, and is followed again.
+  _followLink() {
+    const params = new URLSearchParams(location.search);
+    if (!params.has("ss_time") && !params.has("ss_camera")) return false;
+    consumeLink();
+    const cam = this._findCamera(params.get("ss_camera")) ?? this._findCamera(this._cameraId);
+    const t = Number(params.get("ss_time"));
+    if (!cam) return false;
+    this._followPausedUntil = 0;
+    // Into the grid for now, not into the grid saved for next time.
+    this._selectCamera(cam.id, t > 0 ? t : nowS(), true, false);
+    this._refreshEvents();
+    return true;
   }
 
   _seekAll(t, autoplay) {

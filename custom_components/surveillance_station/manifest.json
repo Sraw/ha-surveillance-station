@@ -1,6 +1,9 @@
 {
   "domain": "surveillance_station",
   "name": "Surveillance Station Playback",
+  "after_dependencies": [
+    "mqtt"
+  ],
   "codeowners": [],
   "config_flow": true,
   "dependencies": [
@@ -16,7 +19,7 @@
     "synology_ss_playback"
   ],
   "requirements": [
-    "synology-ss-playback==0.3.0"
+    "synology-ss-playback==0.4.0"
   ],
-  "version": "0.8.3"
+  "version": "0.9.0"
 }

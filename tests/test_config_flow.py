@@ -111,3 +111,17 @@ async def test_reconfigure_other_nas(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "wrong_device"
     assert mock_config_entry.data[CONF_HOST] == USER_INPUT[CONF_HOST]
+
+
+async def test_reauth_of_a_loaded_entry_reloads_once(
+    hass: HomeAssistant, mock_client: MagicMock, setup_integration: MockConfigEntry, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No update listener next to async_update_reload_and_abort (HA warns, and reloads twice)."""
+    result = await setup_integration.start_reauth_flow(hass)
+    logins = mock_client.login.await_count
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {CONF_PASSWORD: "new"})
+    await hass.async_block_till_done()
+    assert result["reason"] == "reauth_successful"
+    # One login to check the password, one for the reload.
+    assert mock_client.login.await_count == logins + 2
+    assert "update listener" not in caplog.text

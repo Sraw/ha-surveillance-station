@@ -4,11 +4,11 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-from synology_ss_playback import Segment, SSConnectionError, SSError
+from synology_ss_playback import RecordingInfo, Segment, SSConnectionError, SSError
 
 from custom_components.surveillance_station import views
 from custom_components.surveillance_station.thumbnail_store import ThumbnailStore
@@ -369,3 +369,34 @@ async def test_dropping_an_entry_waits_for_its_writes(hass: HomeAssistant, tmp_p
     await store.settle()
     assert not (tmp_path / "E").exists()
     assert len(store) == 0
+
+
+async def test_thumbnail_when_recorded(hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client) -> None:
+    """Waits until SS reports the moment written, then makes the frame once."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    written = [
+        [RecordingInfo(id=1, camera_id=6, start=T0, end=T0 + 5, mount_id=1, live=True, hevc=True)],
+        [RecordingInfo(id=1, camera_id=6, start=T0, end=T0 + 11, mount_id=1, live=True, hevc=True)],
+    ]
+    mock_client.recordings = AsyncMock(side_effect=[SSConnectionError("x", "List", None), *written])
+    snap = AsyncMock(return_value=b"jpg")
+    with (
+        patch.object(views, "fetch_snapshot", snap),
+        patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
+    ):
+        assert await manager.thumbnail_when_recorded(entry_id, 6, T0 + 10, 20) == b"jpg"
+    assert mock_client.recordings.await_count == 3
+    snap.assert_awaited_once()
+
+
+async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client) -> None:
+    manager = hass.data[DATA_MANAGER]
+    mock_client.recordings = AsyncMock(return_value=[])
+    clock = iter(range(0, 1000, 3))
+    with (
+        patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
+        patch.object(views, "time", MagicMock(monotonic=lambda: next(clock))),
+    ):
+        assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
+    assert 3 <= mock_client.recordings.await_count <= 8

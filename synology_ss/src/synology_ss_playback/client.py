@@ -1,7 +1,8 @@
 """Minimal async client for the Synology Surveillance Station Web API.
 
 Only what playback needs: login, cameras, recordings (with start/stop times),
-bookmarks, and cutting a time range out of a recording.
+bookmarks (listed, and created/edited/deleted for detections from elsewhere),
+and cutting a time range out of a recording.
 
 API notes (verified against SS 9.x, see the repo README):
 * ``SYNO.SurveillanceStation.Event`` ``List`` v5 is the call that returns
@@ -18,6 +19,10 @@ API notes (verified against SS 9.x, see the repo README):
   Info's ``timezoneTZDB``). Its ``startTime``/``endTime`` filters only work
   at day granularity and misplace the boundaries, so they are not used: the
   caller filters the full list.
+* ``ThirdParty.Bookmark.Create``/``Edit`` take ``startTime``/``endTime`` as
+  epoch seconds and are exact to the second. A NAS-local time without an
+  offset is read an hour late in summer time (the same bug as SnapShot);
+  one with an offset, or unquoted, is taken as 1970.
 """
 
 from __future__ import annotations
@@ -383,6 +388,51 @@ class SurveillanceStationClient:
         out.sort(key=lambda b: (b.start, b.id), reverse=True)
         return out
 
+    async def create_bookmark(
+        self, camera_id: int, name: str, start: float, end: float, comment: str = ""
+    ) -> Bookmark:
+        """A bookmark on a camera's timeline from start to end (epoch seconds)."""
+        data = await self._call(
+            "SYNO.SurveillanceStation.ThirdParty.Bookmark", "Create", 1,
+            camId=int(camera_id), name=_quoted(name), comment=_quoted(comment),
+            startTime=int(start), endTime=int(max(end, start)),
+        )
+        return self._bookmark(data, camera_id, await self._timezone(), "Create")
+
+    async def edit_bookmark(
+        self, bookmark_id: int, camera_id: int, name: str, start: float, end: float, comment: str = ""
+    ) -> Bookmark:
+        """Replace a bookmark's name, comment and times (all of them)."""
+        data = await self._call(
+            "SYNO.SurveillanceStation.ThirdParty.Bookmark", "Edit", 1,
+            bookmarkId=int(bookmark_id), name=_quoted(name), comment=_quoted(comment),
+            startTime=int(start), endTime=int(max(end, start)),
+        )
+        return self._bookmark(data, camera_id, await self._timezone(), "Edit")
+
+    async def delete_bookmarks(self, bookmark_ids: list[int]) -> None:
+        if bookmark_ids:
+            await self._call(
+                "SYNO.SurveillanceStation.ThirdParty.Bookmark", "Delete", 1,
+                bookmarkIds=",".join(str(int(i)) for i in bookmark_ids),
+            )
+
+    @staticmethod
+    def _bookmark(data: dict[str, Any], camera_id: int, tz: ZoneInfo, method: str) -> Bookmark:
+        # Create/Edit answer with the bookmark as SS stored it (local times).
+        b = (data.get("bookmark") or [None])[0]
+        if not b or "bookmarkId" not in b:
+            raise SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", method, None, data)
+        start = _local_ts(b["startTime"], tz)
+        return Bookmark(
+            id=int(b["bookmarkId"]),
+            camera_id=int(camera_id),
+            name=b.get("name") or "",
+            comment=b.get("comment") or "",
+            start=start,
+            end=_local_ts(b["endTime"], tz) if b.get("endTime") else start,
+        )
+
     async def download(self, recording_id: int, mount_id: int, offset_ms: int, duration_ms: int) -> bytes:
         """Cut [offset, offset+duration) out of one recording as MP4 bytes."""
         for attempt in (1, 2):
@@ -408,6 +458,11 @@ class SurveillanceStationClient:
                 continue
             raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
         raise AssertionError("unreachable")
+
+
+def _quoted(text: str) -> str:
+    """A string parameter as SS wants it: JSON-quoted (it strips the quotes)."""
+    return json.dumps(text, ensure_ascii=False)
 
 
 def _local_ts(value: str, tz: ZoneInfo) -> int:

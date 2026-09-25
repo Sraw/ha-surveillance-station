@@ -53,6 +53,7 @@ from homeassistant.util.hass_dict import HassKey
 
 from .const import (
     BOOKMARK_CACHE_SECONDS,
+    BOOKMARK_FRAMES_MAX,
     BOOKMARK_ERROR_SECONDS,
     DOMAIN,
     LIVE_IDLE_SECONDS,
@@ -75,6 +76,9 @@ from .const import (
 from .thumbnail_store import ThumbnailStore
 
 _LOGGER = logging.getLogger(__name__)
+
+# How often thumbnail_when_recorded asks SS whether the moment is written yet.
+THUMBNAIL_POLL_SECONDS = 2
 
 
 @dataclass(slots=True)
@@ -131,6 +135,9 @@ class VodManager:
         # cached copies, stay good.
         self._thumb_key = secrets.token_bytes(32)
         self._key_store: Store[dict[str, str]] = Store(hass, 1, f"{DOMAIN}.thumbnail_key", private=True)
+        # "entry_id/bookmark_id" -> the moment its thumbnail shows (see set_frame), oldest first.
+        self._frames: OrderedDict[str, int] = OrderedDict()
+        self._frame_store: Store[dict[str, int]] = Store(hass, 1, f"{DOMAIN}.bookmark_frames")
         # entry_id -> (fetched at, every bookmark newest first, or the error),
         # and the one fetch per entry that every request waits on.
         self._bookmarks: dict[str, tuple[float, list[Bookmark] | SSError]] = {}
@@ -152,6 +159,24 @@ class VodManager:
         else:  # none yet, or not one of ours
             await self._key_store.async_save({"key": self._thumb_key.hex()})
         await self.disk.load()
+        frames = await self._frame_store.async_load()
+        if isinstance(frames, dict):
+            self._frames.update((k, v) for k, v in frames.items() if isinstance(v, int))
+
+    def set_frame(self, entry_id: str, bookmark_id: int, ts: int) -> None:
+        """Show the bookmark as the moment ts (where a detector saw it best), not its start."""
+        key = f"{entry_id}/{bookmark_id}"
+        if self._frames.get(key) == ts:
+            return
+        self._frames[key] = ts
+        self._frames.move_to_end(key)
+        while len(self._frames) > BOOKMARK_FRAMES_MAX:
+            self._frames.popitem(last=False)
+        self._frame_store.async_delay_save(lambda: dict(self._frames), 10)
+
+    def frame(self, entry_id: str, bookmark: Bookmark) -> int:
+        """The moment a bookmark's thumbnail shows: a second in, unless a detector picked one."""
+        return self._frames.get(f"{entry_id}/{bookmark.id}", bookmark.start + 1)
 
     def client(self, entry_id: str) -> SurveillanceStationClient | None:
         """The logged-in client of a loaded entry."""
@@ -242,6 +267,31 @@ class VodManager:
                 del self._bookmark_tasks[entry_id]
         self._bookmarks[entry_id] = (time.monotonic(), found)
         return found
+
+    def forget_bookmarks(self, entry_id: str) -> None:
+        """Changed in SS by us: list them afresh on the next request."""
+        self._bookmarks.pop(entry_id, None)
+
+    async def thumbnail_when_recorded(self, entry_id: str, camera_id: int, ts: int, wait: float) -> bytes | None:
+        """The frame at ts once SS has written it, waiting at most wait seconds.
+
+        SS moves a recording's reported end forward every ~10 s, to what it
+        has written: until that passes ts, a cut there could come out short
+        (an earlier keyframe) or empty, and that would be kept.
+        """
+        deadline = time.monotonic() + wait
+        while True:
+            client = self.client(entry_id)
+            try:
+                if client is not None and any(
+                    r.start <= ts and r.end >= ts + 1 for r in await client.recordings(camera_id, ts - 1, ts + 1)
+                ):
+                    return await self.thumbnail(entry_id, camera_id, ts)
+            except SSError:
+                pass
+            if time.monotonic() + THUMBNAIL_POLL_SECONDS > deadline:
+                return None
+            await asyncio.sleep(THUMBNAIL_POLL_SECONDS)
 
     def sign_thumbnail(self, entry_id: str, camera_id: int, ts: int) -> str:
         """A URL for the frame of camera_id at ts, valid for one to two days.

@@ -219,8 +219,7 @@ async def ws_bookmark_page(
             "total": len(matching),
             "more": len(rest) > len(page),
             "bookmarks": [
-                # A second in: the moment the bookmark is about, not the keyframe before it.
-                _bookmark(b, _manager(hass).sign_thumbnail(entry_id, b.camera_id, b.start + 1))
+                _bookmark(b, _manager(hass).sign_thumbnail(entry_id, b.camera_id, _manager(hass).frame(entry_id, b)))
                 for b in page
             ],
         }
