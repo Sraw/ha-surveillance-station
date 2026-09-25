@@ -2,7 +2,7 @@
 
 import asyncio
 from http import HTTPStatus
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
@@ -83,6 +83,85 @@ async def test_relay(
     await asyncio.sleep(0.05)
     assert hass.data[DATA_MANAGER].stats()["live_streams"] == 0
     assert (await client.get(url)).status == HTTPStatus.NOT_FOUND  # used up
+
+
+async def test_entry_unloaded_between_token_and_connect(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """The token is still valid, but the entry no longer is (client() is None)."""
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    manager = hass.data[DATA_MANAGER]
+    with patch.object(manager, "client", return_value=None):
+        with pytest.raises(aiohttp.WSServerHandshakeError) as err:
+            await client.ws_connect(url)
+    assert err.value.status == HTTPStatus.NOT_FOUND
+
+
+async def test_live_stream_cap(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    from custom_components.surveillance_station import views
+
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    with patch.object(views, "MAX_LIVE_STREAMS", 0):
+        with pytest.raises(aiohttp.WSServerHandshakeError) as err:
+            await client.ws_connect(url)
+    assert err.value.status == HTTPStatus.SERVICE_UNAVAILABLE
+    mock_client.open_live.assert_not_called()
+
+
+async def test_relay_ends_when_upstream_sends_a_non_binary_message(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """SS closing its end mid-stream (rather than the socket) also ends the relay."""
+    upstream = FakeUpstream([])
+    upstream.queue.put_nowait(aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, 1000, None))
+    mock_client.open_live = AsyncMock(
+        return_value=(upstream, aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, _msg("vdoCodec=H265"), None))
+    )
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    async with client.ws_connect(url) as ws:
+        await ws.receive_bytes()
+        assert (await ws.receive()).type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
+    await asyncio.sleep(0.05)
+    assert hass.data[DATA_MANAGER].stats()["live_streams"] == 0
+
+
+async def test_keep_alive_pings_surveillance_station(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    from custom_components.surveillance_station import views
+
+    upstream = FakeUpstream([])
+    mock_client.open_live = AsyncMock(
+        return_value=(upstream, aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, _msg("vdoCodec=H265"), None))
+    )
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    with patch.object(views, "LIVE_KEEP_ALIVE_SECONDS", 0):  # the real 10 s wait, sped up
+        async with client.ws_connect(url) as ws:
+            await ws.receive_bytes()
+            await asyncio.sleep(0.05)
+            await upstream.close()
+    assert "keepAlive" in upstream.sent
 
 
 async def test_bad_token_and_unreachable(
