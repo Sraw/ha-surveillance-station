@@ -84,6 +84,11 @@ neither the password nor the SS session id reaches logs or browsers.
   its app bundle loads. An `add_extra_js_url` module can run first, and a card
   defined then is invisible ("Custom element doesn't exist"). The card
   therefore waits for `<home-assistant>` to be defined, then registers.
+- **"Configuration error" in the HA app right after installing.** HA's
+  service worker serves the app page stale-while-revalidate. The first open
+  after installing shows the cached page from before the integration existed,
+  which has no card import, while the new page downloads in the background.
+  Close and reopen the app (swipe it away), and the card is there.
 - The browser must decode HEVC itself. Chrome/Edge with hardware decode,
   Safari and the HA Android/iOS apps generally can. Firefox and headless
   Chromium cannot. The card says so when `MediaSource` reports no `hvc1`.
