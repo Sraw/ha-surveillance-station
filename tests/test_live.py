@@ -126,6 +126,18 @@ async def test_entry_reloaded_while_connecting(
     assert manager.stats()["live_streams"] == 0
 
 
+async def test_unload_leaves_a_connecting_stream_alone(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """Not prepared yet (still connecting to SS): close() would raise; it notices the unload itself."""
+    manager = hass.data[DATA_MANAGER]
+    connecting = MagicMock(prepared=False)
+    connecting.close = AsyncMock()
+    manager.live_streams.add((setup_integration.entry_id, connecting))
+    manager.drop_entry(setup_integration.entry_id)
+    await hass.async_block_till_done()
+    connecting.close.assert_not_called()
+    manager.live_streams.clear()
+
+
 async def test_live_stream_cap(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,

@@ -67,39 +67,57 @@ async def test_auth_failure_starts_reauth(
     assert [f["context"]["source"] for f in flows] == [SOURCE_REAUTH]
 
 
-async def test_unreachable_retries(
-    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
+LEGACY_ID = "192.0.2.10:5000"  # entries from before 0.5: the serial isn't known yet
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        SSConnectionError("SYNO.API.Auth", "login", None, "TimeoutError"),
+        SSError("SYNO.SurveillanceStation.Info", "GetInfo", None, "answer without a serial"),
+        AttributeError("'list' object has no attribute 'get'"),
+    ],
+)
+async def test_known_nas_not_usable_starts_anyway(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock, error: Exception
 ) -> None:
+    """NAS rebooting, a malformed answer, a bug: loaded all the same, and used once SS answers.
+
+    Not HA's setup retry: its backoff reaches 10 minutes, and meanwhile not
+    even Frigate's reviews would be received.
+    """
+    mock_client.info.side_effect = error
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state is ConfigEntryState.LOADED
+    assert mock_config_entry.unique_id == SERIAL
+    # Logged out: the client logs in again on first use.
+    mock_client.logout.assert_awaited()
+
+
+@pytest.mark.parametrize(
+    "error", [SSConnectionError("SYNO.API.Auth", "login", None), AttributeError("bug")]
+)
+async def test_unknown_nas_not_usable_retries(hass: HomeAssistant, mock_client: MagicMock, error: Exception) -> None:
+    """The serial is needed first: HA retries setup (never a setup_error that waits for a person)."""
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=LEGACY_ID, data=USER_INPUT)
+    entry.add_to_hass(hass)
+    mock_client.login.side_effect = error
+    await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    mock_client.logout.assert_awaited()
+
+
+async def test_logout_failure_doesnt_hide_the_setup_error(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=LEGACY_ID, data=USER_INPUT)
+    entry.add_to_hass(hass)
     mock_client.login.side_effect = SSConnectionError("SYNO.API.Auth", "login", None)
-    mock_config_entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    mock_client.logout.side_effect = RuntimeError("logout")
+    await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
-
-
-async def test_incomplete_info_retries(
-    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
-) -> None:
-    """An SS answer without the serial is retried, not a permanent setup error."""
-    mock_client.info.side_effect = SSError("SYNO.SurveillanceStation.Info", "GetInfo", None, "answer without a serial")
-    mock_config_entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
-    # Logged out, so retries don't pile up DSM sessions.
-    mock_client.logout.assert_awaited()
-
-
-async def test_unexpected_error_retries(
-    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
-) -> None:
-    """Whatever goes wrong in setup is retried: never a setup_error that waits for a person."""
-    mock_client.info.side_effect = AttributeError("'list' object has no attribute 'get'")
-    mock_config_entry.add_to_hass(hass)
-    await hass.config_entries.async_setup(mock_config_entry.entry_id)
-    await hass.async_block_till_done()
-    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
-    mock_client.logout.assert_awaited()
+    assert entry.state is ConfigEntryState.SETUP_RETRY
 
 
 async def test_card_registration_failure_doesnt_stop_setup(
@@ -114,7 +132,7 @@ async def test_card_registration_failure_doesnt_stop_setup(
 
 async def test_unique_id_migrated_to_serial(hass: HomeAssistant, mock_client: MagicMock) -> None:
     """Entries created before 0.5 were keyed by host:port."""
-    entry = MockConfigEntry(domain=DOMAIN, unique_id="192.0.2.10:5000", data=USER_INPUT)
+    entry = MockConfigEntry(domain=DOMAIN, unique_id=LEGACY_ID, data=USER_INPUT)
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
     assert entry.unique_id == SERIAL

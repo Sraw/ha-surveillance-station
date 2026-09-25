@@ -43,8 +43,11 @@ _LOGGER = logging.getLogger(__name__)
 
 # Error codes that mean "log in again and retry" (common DSM Web API codes).
 SESSION_ERRORS = {105, 106, 107, 119}
-# Not 407 ("IP blocked"): DSM's auto-block expires, the password is fine.
+# Not 407 ("IP blocked"): DSM's auto-block expires, the password is fine;
+# but no login is tried for BLOCKED_SECONDS after it.
 AUTH_FAILED_ERRORS = {400, 401, 402, 403, 404, 406, 408, 409, 410}
+BLOCKED_ERROR = 407
+BLOCKED_SECONDS = 60
 # After refused credentials, one login is let through this often: often
 # enough to recover from a refusal that was not about the password, far
 # below DSM's auto-block threshold (10 failures in 5 minutes by default).
@@ -59,7 +62,10 @@ LIVE_CONNECT_TIMEOUT_SECONDS = 15
 
 
 # What a malformed list entry raises while being read.
-_BAD_ITEM = (KeyError, TypeError, ValueError, AttributeError)
+_BAD_ITEM = (KeyError, TypeError, ValueError, AttributeError, OverflowError)
+
+# Patchable in tests (time.monotonic itself is the event loop's clock).
+_monotonic = time.monotonic
 
 
 def _items(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -157,6 +163,7 @@ class SurveillanceStationClient:
         self._login_lock = asyncio.Lock()
         self._auth_failed: int | None = None
         self._auth_failed_at = 0.0
+        self._blocked_until = -1.0
         self._tz: ZoneInfo | None = None
         self._live_relogin_at = -LIVE_RELOGIN_SECONDS
         # Called when a re-login is refused at runtime (password changed).
@@ -169,13 +176,15 @@ class SurveillanceStationClient:
         up with one login between them.
         """
         async with self._login_lock:
-            if self._auth_failed is not None and time.monotonic() - self._auth_failed_at < AUTH_RETRY_SECONDS:
+            if self._auth_failed is not None and _monotonic() - self._auth_failed_at < AUTH_RETRY_SECONDS:
                 # Credentials were refused; retrying on every call would trip
                 # DSM's auto-block for this host within minutes. A successful
                 # reauth reloads the entry with a new client.
                 raise SSAuthError("SYNO.API.Auth", "login", self._auth_failed)
             if self._sid is not None and self._sid != stale_sid:
                 return
+            if _monotonic() < self._blocked_until:
+                raise SSError("SYNO.API.Auth", "login", BLOCKED_ERROR, "this host is blocked by DSM for now")
             # POST so the password never sits in a URL (URLs end up in
             # exception text and logs).
             data = await self._raw_json(
@@ -195,11 +204,13 @@ class SurveillanceStationClient:
                 code = _error_code(data)
                 if code in AUTH_FAILED_ERRORS:
                     self._auth_failed = code
-                    self._auth_failed_at = time.monotonic()
+                    self._auth_failed_at = _monotonic()
                     self._sid = None
                     if self.on_auth_failed is not None:
                         self.on_auth_failed()
                     raise SSAuthError("SYNO.API.Auth", "login", code)
+                if code == BLOCKED_ERROR:
+                    self._blocked_until = _monotonic() + BLOCKED_SECONDS
                 raise SSError("SYNO.API.Auth", "login", code)
             result = data.get("data")
             sid = result.get("sid") if isinstance(result, dict) else None
@@ -276,7 +287,7 @@ class SurveillanceStationClient:
             # Closed before any data: an expired sid, or a camera SS won't
             # stream (offline, disabled). Log in again at most once a minute,
             # so a camera that stays refused doesn't mean a DSM login per try.
-            now = time.monotonic()
+            now = _monotonic()
             if attempt == 2 or now - self._live_relogin_at < LIVE_RELOGIN_SECONDS:
                 break
             self._live_relogin_at = now

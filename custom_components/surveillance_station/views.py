@@ -579,7 +579,9 @@ class LiveStreamView(HomeAssistantView):
                 raise web.HTTPBadGateway() from None
             self.manager.track(entry_id, None)
             if self.manager.client(entry_id) is not client:
-                # The entry unloaded (or reloaded) while SS was connecting.
+                # The entry unloaded (or reloaded) while SS was connecting;
+                # its client may have logged in again meanwhile.
+                await client.logout()
                 raise web.HTTPServiceUnavailable()
             await browser.prepare(request)
             await browser.send_bytes(first.data)

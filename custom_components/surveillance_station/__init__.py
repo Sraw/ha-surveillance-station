@@ -9,6 +9,7 @@ from pathlib import Path
 from synology_ss_playback import (
     SSAuthError,
     SSError,
+    SSInfo,
     SurveillanceStationClient,
     remove_stale_temp_files,
 )
@@ -128,32 +129,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         data[CONF_USERNAME],
         data[CONF_PASSWORD],
     )
+    info: SSInfo | None = None
     try:
         await client.login()
         info = await client.info()
-    except SSError as err:
-        # Don't leave a DSM session behind for every setup retry.
-        await client.logout()
-        if isinstance(err, SSAuthError):
-            raise ConfigEntryAuthFailed(
-                translation_domain=DOMAIN, translation_key="invalid_auth"
-            ) from err
-        raise ConfigEntryNotReady(
-            translation_domain=DOMAIN,
-            translation_key="cannot_connect",
-            translation_placeholders={"error": str(err)},
-        ) from err
+    except SSAuthError as err:
+        await _logout(client)
+        raise ConfigEntryAuthFailed(translation_domain=DOMAIN, translation_key="invalid_auth") from err
     except Exception as err:
-        # A bug or an answer nobody foresaw: retried rather than a setup_error
-        # that stays until someone reloads by hand (2026-09-25).
-        _LOGGER.exception("Unexpected error setting up Surveillance Station; retrying")
-        await client.logout()
-        raise ConfigEntryNotReady(
-            translation_domain=DOMAIN,
-            translation_key="cannot_connect",
-            translation_placeholders={"error": type(err).__name__},
-        ) from err
-    if entry.unique_id != info.serial:
+        # Unreachable, a malformed answer (2026-09-25), or a bug. Never a
+        # setup_error that stays until someone reloads by hand; and no DSM
+        # session left behind.
+        await _logout(client)
+        unexpected = not isinstance(err, SSError)
+        if not _knows_its_nas(entry):
+            # The NAS's serial is needed first (the entry's unique ID).
+            _LOGGER.log(logging.ERROR if unexpected else logging.DEBUG, "Setup failed", exc_info=unexpected)
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+                translation_placeholders={"error": str(err) if not unexpected else type(err).__name__},
+            ) from err
+        # Start anyway: the client logs in on first use, so bookmarks and
+        # playback work the moment SS answers, rather than after HA's setup
+        # backoff (up to 10 minutes after a NAS reboot), during which not
+        # even Frigate's reviews would be received.
+        _LOGGER.warning(
+            "Surveillance Station at %s not usable yet (%s); starting anyway, it is used once it answers",
+            data[CONF_HOST], err if not unexpected else type(err).__name__, exc_info=unexpected,
+        )
+    if info is not None and entry.unique_id != info.serial:
         # Entries from before 0.5 were keyed by host:port.
         hass.config_entries.async_update_entry(entry, unique_id=info.serial)
     client.on_auth_failed = lambda: entry.async_start_reauth(hass)
@@ -184,10 +189,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
     return True
 
 
+def _knows_its_nas(entry: SurveillanceStationConfigEntry) -> bool:
+    """Set up before, with the NAS's serial as its ID (before 0.5: host:port)."""
+    return bool(entry.unique_id) and ":" not in entry.unique_id
+
+
+async def _logout(client: SurveillanceStationClient) -> None:
+    try:
+        await client.logout()
+    except Exception:  # noqa: BLE001 - best effort, never instead of the real error
+        _LOGGER.debug("Logout failed", exc_info=True)
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
-    # First, so that no bookmark is being made while the client logs out.
+    # First, so that no bookmark is being made while the client logs out; its
+    # state written now, before a reload reads it (or a removal deletes it).
     if (bridge := hass.data.get(DATA_FRIGATE, {}).pop(entry.entry_id, None)) is not None:
         bridge.stop()
+        await bridge.async_flush()
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     await entry.runtime_data.logout()
     return True

@@ -223,21 +223,39 @@ these was tested live: MQTT reload, broker restart, HA restarted with the
 broker down, NAS unreachable at runtime and during HA's start):
 
 - A message that fails with a transient SS error is tried twice more, 5 s
-  apart, taking the review's newer message if one came meanwhile. While SS
-  is known to be failing, not: the next reviews shouldn't wait behind
-  timeouts.
+  apart, taking the review's newer message if one came meanwhile, and
+  looking first for a bookmark the failed try may have made (only its
+  answer lost). While SS is known to be failing, not: the next reviews
+  shouldn't wait behind timeouts.
+- What still fails is kept (one message per review, at most 1000), and the
+  oldest is tried again every minute; once one goes through, all the others
+  follow: an outage loses no bookmark (and, past 2 minutes, sends no stale
+  notification). Only a bookmark actually made counts as SS being back, not
+  reads that work.
 - Messages waiting for SS are one per review (a later one replaces the
   earlier: it says everything that one did), at most 1000 reviews.
 - The SS camera list is read again every 10 minutes and after any failure:
   a camera replaced in SS under the same name gets a new id.
 - HA's MQTT is waited for as long as it takes (it may be starting,
   reloading or retrying its broker), checking every minute.
-- Setup: any failure (a malformed answer included) is retried by HA, never
-  a `setup_error` that waits for someone; answers that aren't what SS
-  should send are `SSError`s in the library.
+- Setup with the NAS unreachable (rebooting), or answering oddly: an entry
+  that has been set up before (its NAS serial known) starts anyway, and
+  the client logs in on first use, so everything works the moment SS
+  answers, rather than after HA's setup backoff (up to 10 minutes, during
+  which not even Frigate's reviews would be received). A new entry needs
+  the serial first: HA retries it. Never a `setup_error` that waits for
+  someone; answers that aren't what SS should send are `SSError`s in the
+  library.
+- Refused logins: a wrong password asks for reauth and is not tried again
+  for 30 minutes (DSM's auto-block); DSM blocking the host (407) is not a
+  wrong password: no login for a minute, then again.
 - A problem lasting 10 minutes becomes an issue in **Settings → Repairs**,
-  gone by itself once it clears: MQTT not available, bookmarks failing,
-  Frigate offline (its `<prefix>/available`).
+  gone by itself once it clears: MQTT not available, bookmarks failing
+  (checked again every minute), Frigate offline (its `<prefix>/available`).
+- A notification cut short (unload, restart while waiting for the frame)
+  isn't counted as sent: the review's next message sends it, within the
+  2 minutes. The bridge's state is written on unload, before a reload
+  reads it.
 - Diagnostics show the bridge: subscribed, Frigate online, and every review
   message's fate (ignored and why, coalesced, dropped, retried, failed,
   bookmarked, announced or not), plus the last error.

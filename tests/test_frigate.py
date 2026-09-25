@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import timedelta
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,6 +14,7 @@ from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_capture_events,
     async_fire_mqtt_message,
+    async_fire_time_changed,
     flush_store,
 )
 from synology_ss_playback import Bookmark, Camera, SSAuthError, SSConnectionError, SSError
@@ -31,7 +33,9 @@ from custom_components.surveillance_station.frigate import DATA_FRIGATE, Frigate
 from custom_components.surveillance_station.views import DATA_MANAGER, VodManager
 from homeassistant.components import mqtt as mqtt_mod
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.util import dt as dt_util
 
 T = 1_790_000_000
 
@@ -237,13 +241,17 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
         async with asyncio.timeout(5):
             while bridge._counts["announced"] < 1:
                 await asyncio.sleep(0.01)
-        assert client.create_bookmark.await_count == 4
-        assert [e.data["review_id"] for e in events] == ["a3"]
+        async with asyncio.timeout(5):
+            while bridge._counts["announced"] < 2:
+                await asyncio.sleep(0.01)
+        # a3 went through: SS answers, so a1 (deferred) is tried again too.
+        assert client.create_bookmark.await_count == 5
+        assert [e.data["review_id"] for e in events] == ["a3", "a1"]
         stats = hass.data[DATA_FRIGATE][entry.entry_id].stats()
         assert stats["subscribed"] and stats["topic"] == "nvr/reviews"
         # Not JSON / no "after": not a review message. a1 failed, a3 made it.
-        assert {k: stats[k] for k in ("messages", "retried", "bookmarked", "announced", "failed", "dropped", "queued")} == {
-            "messages": 2, "retried": 2, "bookmarked": 1, "announced": 1, "failed": 1, "dropped": 0, "queued": 0,
+        assert {k: stats[k] for k in ("messages", "retried", "bookmarked", "announced", "failed", "deferred", "queued")} == {
+            "messages": 2, "retried": 2, "bookmarked": 2, "announced": 2, "failed": 1, "deferred": 0, "queued": 0,
         }
         assert not stats["failing"]  # a3 went through after a1's failure
         assert stats["last_error"]["error"].startswith("x.Create failed")
@@ -471,11 +479,15 @@ async def test_retry_takes_the_reviews_newer_message(hass: HomeAssistant, bridge
 
 async def test_no_retry_while_failing_or_refused(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, no_retry_wait) -> None:
     """SS known down: fail fast (no queue stalled behind timeouts). Refused credentials: never."""
-    client.create_bookmark.side_effect = SSConnectionError("x", "Create", None)
+    down = SSConnectionError("x", "Create", None)
+    client.create_bookmark.side_effect = down
+    client.list_bookmarks.side_effect = down
     await bridge._process("a", review("new", rid="a"))
-    assert client.create_bookmark.await_count == 3
+    # Tried, then twice more (each looking for a bookmark the failed try may have made).
+    assert (client.create_bookmark.await_count, client.list_bookmarks.await_count) == (1, 2)
     await bridge._process("b", review("new", rid="b"))
-    assert client.create_bookmark.await_count == 4
+    assert client.create_bookmark.await_count == 2
+    assert list(bridge._deferred) == ["a", "b"]
     client.create_bookmark.reset_mock()
     bridge._failing_since = None
     client.create_bookmark.side_effect = SSAuthError("SYNO.API.Auth", "login", 400)
@@ -496,7 +508,7 @@ async def test_camera_list_reread_after_a_failure(hass: HomeAssistant, bridge: F
 
 async def test_camera_list_reread_regularly(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
     await bridge.handle(review("new", rid="a"))
-    with patch("custom_components.surveillance_station.frigate.time.monotonic", return_value=time.monotonic() + 601):
+    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601):
         await bridge.handle(review("new", rid="b"))
     assert client.cameras.await_count == 2
 
@@ -524,9 +536,10 @@ async def test_nothing_after_stop(hass: HomeAssistant, bridge: FrigateBridge) ->
 async def test_state_survives_a_restart(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, hass_storage) -> None:
     """Announced reviews and the quiet period are remembered: no second notification after a restart."""
     events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("person",), rid="p1"))
     await bridge.handle(review("new", objects=("dog",), rid="d1"))
     await hass.async_block_till_done()
-    assert len(events) == 1
+    assert len(events) == 2
     await flush_store(bridge._store)
 
     again = FrigateBridge(
@@ -536,13 +549,14 @@ async def test_state_survives_a_restart(hass: HomeAssistant, bridge: FrigateBrid
         mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
     ):
         await again.start()
+    assert {"p1", "d1"} <= set(again._decided)
     client.list_bookmarks.return_value = [
-        Bookmark(id=100, camera_id=6, name="Animal", comment="Frigate alert [frigate d1]", start=T, end=T + 30)
+        Bookmark(id=100, camera_id=6, name="Person", comment="Frigate alert [frigate p1]", start=T, end=T + 30)
     ]
-    await again.handle(review("update", objects=("dog",), rid="d1"))  # the same review goes on
+    await again.handle(review("update", objects=("person",), rid="p1"))  # the same review goes on
     await again.handle(review("new", objects=("cat",), rid="d2"))  # another animal, within the quiet period
     await hass.async_block_till_done()
-    assert len(events) == 1
+    assert len(events) == 2
     again.stop()
 
 
@@ -606,7 +620,9 @@ async def test_unexpected_error_is_not_retried_but_survived(hass: HomeAssistant,
     client.create_bookmark.side_effect = RuntimeError("bug")
     await bridge._process("a", review("new", rid="a"))
     assert client.create_bookmark.await_count == 1
-    assert bridge.stats()["failed"] == 1 and bridge.stats()["last_error"]["error"] == "RuntimeError: bug"
+    stats = bridge.stats()
+    assert stats["failed"] == 1 and stats["last_error"]["error"] == "RuntimeError: bug"
+    assert not stats["failing"] and not stats["deferred"]  # a bug in one message, not SS down
 
 
 async def test_frigate_back_online(hass: HomeAssistant, bridge: FrigateBridge) -> None:
@@ -622,4 +638,123 @@ async def test_unreadable_state_is_ignored(hass: HomeAssistant, bridge: FrigateB
     ):
         assert await bridge.start()
     assert "unreadable Frigate state" in caplog.text
+    bridge.stop()
+
+
+
+async def test_retry_finds_a_bookmark_made_before_the_error(
+    hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, no_retry_wait
+) -> None:
+    """SS made it, only its answer was lost: the retry finds it rather than make a second one."""
+    made = []
+
+    async def made_then_lost(camera_id, name, start, end, comment=""):
+        made.append(Bookmark(id=100, camera_id=camera_id, name=name, comment=comment, start=int(start), end=int(end)))
+        raise SSConnectionError("x", "Create", None)
+
+    client.create_bookmark.side_effect = made_then_lost
+    client.list_bookmarks.side_effect = lambda ids: list(made)
+    await bridge._process("1790000000.1-abc", review("new"))
+    assert len(made) == 1
+    assert bridge._tracked["1790000000.1-abc"].bookmark_id == 100
+
+
+async def test_cut_short_announcement_is_tried_again(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    """Unloaded (or restarting) while waiting for the frame: not counted as announced."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    waiting = asyncio.Event()
+
+    async def wait(*args):
+        waiting.set()
+        await asyncio.Event().wait()
+
+    with patch.object(bridge.manager, "thumbnail_when_recorded", AsyncMock(side_effect=wait)):
+        await bridge.handle(review("new"))
+        await bridge.handle(review("update"))  # while it waits: no second announcement
+        await waiting.wait()
+        for task in list(bridge._announcing):
+            task.cancel()
+        await asyncio.gather(*bridge._announcing, return_exceptions=True)
+    assert not events and "1790000000.1-abc" not in bridge._decided
+    await bridge.handle(review("update", zones=("porch",)))
+    await hass.async_block_till_done()
+    assert len(events) == 1
+
+
+async def test_unload_writes_state_and_removal_deletes_it(
+    hass: HomeAssistant, mqtt_mock, mock_config_entry: MockConfigEntry, client: MagicMock, hass_storage
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, data=mock_config_entry.data, unique_id=mock_config_entry.unique_id, options={CONF_FRIGATE: True}
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    bridge = hass.data[DATA_FRIGATE][entry.entry_id]
+    bridge._decide("r1")
+    bridge._save()  # delayed: not written yet
+    key = f"{DOMAIN}.frigate.{entry.entry_id}"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert hass_storage[key]["data"]["decided"] == ["r1"]  # written on unload, not 2 s later
+    await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
+    await hass.async_block_till_done()
+    assert key not in hass_storage  # and not written back by a pending save
+
+
+async def test_deferred_reviews_go_through_once_ss_answers(
+    hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, no_retry_wait
+) -> None:
+    """Failed while SS was down: the oldest is tried again every minute; once it goes through, all the others follow."""
+    create = client.create_bookmark.side_effect
+    client.create_bookmark.side_effect = SSConnectionError("x", "Create", None)
+    client.list_bookmarks.return_value = []
+    for rid in ("a", "b", "c"):
+        await bridge._process(rid, review("new", rid=rid))
+    assert bridge.stats()["failing"] and list(bridge._deferred) == ["a", "b", "c"]
+    # A message that doesn't reach SS, or reads that work, say nothing about bookmarks.
+    await bridge._process("x", review("genai", rid="x"))
+    assert bridge.stats()["failing"]
+
+    bridge._subscribed = True
+    bridge._check_health()  # still down: "a" tried, deferred again (now last)
+    await bridge._process("a", bridge._pending.pop("a"))
+    assert list(bridge._deferred) == ["b", "c", "a"] and not bridge._pending
+
+    client.create_bookmark.side_effect = create
+    bridge._check_health()
+    assert list(bridge._pending) == ["b"]
+    await bridge._process("b", bridge._pending.pop("b"))
+    assert not bridge.stats()["failing"]
+    assert list(bridge._pending) == ["c", "a"] and not bridge._deferred
+
+
+async def test_failing_with_nothing_waiting_is_probed(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    bridge._failing_since = time.monotonic()
+    bridge._subscribed = True
+    bridge._check_health()
+    await bridge._probe
+    assert not bridge.stats()["failing"]
+
+
+async def test_failing_probe_keeps_the_error(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    bridge._failing_since = time.monotonic()
+    bridge._subscribed = True
+    client.cameras.side_effect = SSConnectionError("SYNO.SurveillanceStation.Camera", "List", None, "TimeoutError")
+    bridge._check_health()
+    await bridge._probe
+    assert bridge.stats()["failing"] and "TimeoutError" in bridge._bookmark_error
+
+
+async def test_subscribe_failure_is_retried(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    first = MagicMock()
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch(
+        "custom_components.surveillance_station.frigate.FRIGATE_MQTT_RETRY_SECONDS", 0
+    ), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(side_effect=[first, HomeAssistantError("gone"), MagicMock(), MagicMock()])
+    ):
+        assert await bridge.start()
+    first.assert_called_once()  # the half-made subscription undone
+    assert bridge.stats()["subscribed"]
     bridge.stop()

@@ -80,6 +80,9 @@ _LOGGER = logging.getLogger(__name__)
 
 DATA_FRIGATE: HassKey[dict[str, FrigateBridge]] = HassKey(f"{DOMAIN}_frigate")
 
+# Patchable in tests (time.monotonic itself is the event loop's clock).
+_monotonic = time.monotonic
+
 _REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9._-]{1,64})\]")
 
 
@@ -159,13 +162,18 @@ class FrigateBridge:
         # one (it says everything the earlier one did), so a backlog after an
         # outage is one message per review, not a minute-old queue of updates.
         self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Reviews that failed while SS was failing: tried again once it
+        # answers (checked every minute), so an outage loses no bookmark.
+        self._deferred: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._unsubscribe: list[Callable[[], None]] = []
         self._subscribed = False
         self._announcing: set[asyncio.Task] = set()
+        self._announcing_ids: set[str] = set()
+        self._probe: asyncio.Task | None = None
         self._stop_health: Callable[[], None] | None = None
-        self._started_at = time.monotonic()
+        self._started_at = _monotonic()
         self._failing_since: float | None = None
         self._frigate_offline_since: float | None = None
         self._frigate_available: str | None = None
@@ -185,6 +193,7 @@ class FrigateBridge:
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
         self._last_error: tuple[float, str] | None = None
+        self._bookmark_error = "-"  # the last SS error making a bookmark, for the Repairs issue
 
     @property
     def _failing(self) -> bool:
@@ -206,6 +215,7 @@ class FrigateBridge:
             **self._counts,
             "ignored": dict(self._ignored),
             "queued": len(self._pending),
+            "deferred": len(self._deferred),
             "announcing": len(self._announcing),
             "failing": self._failing,
             "issues": sorted(self._issues),
@@ -241,17 +251,24 @@ class FrigateBridge:
         # HA's MQTT may be starting, retrying its broker, or reloading. Keep
         # waiting (this runs as an entry task, cancelled on unload) rather
         # than give up for good.
-        while not await mqtt.async_wait_for_mqtt_client(self.hass):
+        while True:
+            unsubscribe: list[Callable[[], None]] = []
+            if await mqtt.async_wait_for_mqtt_client(self.hass):
+                try:
+                    unsubscribe.append(await mqtt.async_subscribe(self.hass, f"{self.topic}/reviews", self._received))
+                    unsubscribe.append(
+                        await mqtt.async_subscribe(self.hass, f"{self.topic}/available", self._availability)
+                    )
+                    break
+                except HomeAssistantError:  # MQTT went away in between
+                    for u in unsubscribe:
+                        u()
             if self._stopped:
                 return False
             if not warned:
                 warned = True
                 _LOGGER.warning("MQTT is not available yet; Frigate detections are bookmarked once it is")
             await asyncio.sleep(FRIGATE_MQTT_RETRY_SECONDS)
-        unsubscribe = [
-            await mqtt.async_subscribe(self.hass, f"{self.topic}/reviews", self._received),
-            await mqtt.async_subscribe(self.hass, f"{self.topic}/available", self._availability),
-        ]
         if self._stopped:  # unloaded while MQTT was starting
             for u in unsubscribe:
                 u()
@@ -273,7 +290,7 @@ class FrigateBridge:
         if self._stop_health is not None:
             self._stop_health()
             self._stop_health = None
-        for task in (self._worker, *self._announcing):
+        for task in (self._worker, self._probe, *self._announcing):
             if task is not None:
                 task.cancel()
         # An unloaded entry's problems are not problems any more (a reload
@@ -281,6 +298,10 @@ class FrigateBridge:
         for issue in list(self._issues):
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
         self._issues.clear()
+
+    async def async_flush(self) -> None:
+        """Write what must survive a restart now (after stop(), on unload)."""
+        await self._store.async_save(self._data())
 
     @callback
     def _availability(self, msg: mqtt.ReceiveMessage) -> None:
@@ -291,7 +312,7 @@ class FrigateBridge:
         if state == "online":
             self._frigate_offline_since = None
         elif self._frigate_offline_since is None:
-            self._frigate_offline_since = time.monotonic()
+            self._frigate_offline_since = _monotonic()
 
     @callback
     def _received(self, msg: mqtt.ReceiveMessage) -> None:
@@ -331,6 +352,7 @@ class FrigateBridge:
                 await self._wake.wait()
                 continue
             key, review = self._pending.popitem(last=False)
+            self._deferred.pop(key, None)  # this message says more
             await self._process(key, review)
 
     async def _process(self, key: str, review: dict[str, Any]) -> None:
@@ -339,37 +361,62 @@ class FrigateBridge:
             try:
                 await self.handle(review)
             except SSError as err:
-                # A create may have gone through before the error: list afresh
-                # before looking for it again. And the camera may have been
+                # A create may have gone through before the error (only the
+                # answer lost): list the bookmarks afresh and look for it
+                # before making one again. And the camera may have been
                 # replaced in SS (same name, new id): list the cameras again.
                 self.manager.forget_bookmarks(self.entry_id)
                 self._cameras_at = -math.inf
+                review = {**review, _MAYBE_MADE: True}
                 if isinstance(err, SSAuthError) or self._failing or retries >= FRIGATE_RETRIES:
                     self._fail(err)
+                    self._defer(key, review)
                     return
                 retries += 1
                 self._counts["retried"] += 1
                 await asyncio.sleep(FRIGATE_RETRY_SECONDS)
                 # A newer message of the same review may have come meanwhile.
                 if (newer := self._pending.pop(key, None)) is not None:
-                    review = newer
+                    review = {**newer, _MAYBE_MADE: True}
                 continue
             except Exception as err:  # noqa: BLE001 - one bad message must not stop the bridge
-                self._fail(err)
-                return
-            if self._failing:
-                self._failing_since = None
-                _LOGGER.info("Frigate bookmarks work again")
+                # This message, not SS: counted and logged, not retried, and
+                # not "failing" (that is about SS).
+                self._counts["failed"] += 1
+                self._error(err)
+                _LOGGER.warning("Frigate review %s not handled", key, exc_info=True)
             return
 
-    def _fail(self, err: Exception) -> None:
+    def _fail(self, err: SSError) -> None:
         self._counts["failed"] += 1
         self._error(err)
-        if isinstance(err, SSError):
-            self.manager.track(self.entry_id, err)
+        self._bookmark_error = str(err)[:300]
+        self.manager.track(self.entry_id, err)
         if not self._failing:
-            self._failing_since = time.monotonic()
-            _LOGGER.warning("Frigate review not turned into a bookmark: %r", err, exc_info=not isinstance(err, SSError))
+            self._failing_since = _monotonic()
+            _LOGGER.warning("Frigate review not turned into a bookmark (tried again once SS answers): %s", err)
+
+    def _defer(self, key: str, review: dict[str, Any]) -> None:
+        self._deferred[key] = review
+        self._deferred.move_to_end(key)
+        if len(self._deferred) > FRIGATE_QUEUE_MAX:
+            self._deferred.popitem(last=False)
+            self._counts["dropped"] += 1
+
+    def _ok(self) -> None:
+        """A bookmark was made or changed: not failing, and what failed meanwhile is tried again.
+
+        Only then: SS answering reads says nothing about bookmarks (a camera
+        removed, rights taken away), and requeueing on reads could go round
+        in circles."""
+        if self._failing:
+            self._failing_since = None
+            _LOGGER.info("Surveillance Station answers again: bookmarking Frigate detections")
+        if self._deferred:
+            for key, review in self._deferred.items():
+                self._pending.setdefault(key, review)  # a newer message waiting wins
+            self._deferred.clear()
+            self._wake.set()
 
     async def handle(self, review: dict[str, Any]) -> None:
         kind = review.get("type")
@@ -406,7 +453,7 @@ class FrigateBridge:
             ended = None
         end = int(ended) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(time.time()))
 
-        if tracked is None and not (kind == "new" or review.get(_SEEN_NEW)):
+        if tracked is None and (review.get(_MAYBE_MADE) or not (kind == "new" or review.get(_SEEN_NEW))):
             # Created before a restart, or by a try that failed after SS did
             # it (its comment names the review)?
             tracked = await self._find(review_id, camera_id)
@@ -427,24 +474,28 @@ class FrigateBridge:
         )
         if tracked is None:
             bm = await self.client.create_bookmark(camera_id, name, start, end, comment)
+            self._ok()
             tracked = _Tracked(bm.id, camera_id, name, comment, start, end)
             self._remember(review_id, tracked)
             self._counts["bookmarked"] += 1
             self.manager.forget_bookmarks(self.entry_id)
         elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
             await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
+            self._ok()
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self.manager.forget_bookmarks(self.entry_id)
-        if review_id not in self._decided:
+        if review_id not in self._decided and review_id not in self._announcing_ids:
             # Once per review, as soon as it has its bookmark: normally at its
             # first message; later if that one failed (even at its end). Long
             # after it began (HA was down, SS unreachable) it is old news.
-            self._decide(review_id)
+            # Decided for good only once the event has fired: one cut short
+            # (unload, restart) is tried again by the review's next message.
             if objects and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
                 self._announce(
                     review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start
                 )
             else:
+                self._decide(review_id)
                 self._counts["not_announced"] += 1
         # Bookmarked: its kinds count as seen here (still going on: now;
         # ended: when last active).
@@ -465,14 +516,14 @@ class FrigateBridge:
         while len(self._decided) > FRIGATE_DECIDED_MAX:
             self._decided.popitem(last=False)
 
+    def _data(self) -> dict[str, Any]:
+        return {
+            "decided": list(self._decided),
+            "last_seen": [[c, k, t] for (c, k), t in self._last_seen.items()],
+        }
+
     def _save(self) -> None:
-        self._store.async_delay_save(
-            lambda: {
-                "decided": list(self._decided),
-                "last_seen": [[c, k, t] for (c, k), t in self._last_seen.items()],
-            },
-            2,
-        )
+        self._store.async_delay_save(self._data, 2)
 
     def _remember(self, review_id: str, tracked: _Tracked) -> None:
         self._tracked[review_id] = tracked
@@ -490,12 +541,12 @@ class FrigateBridge:
 
     async def _camera(self, frigate_camera: str) -> tuple[int, str] | None:
         key = camera_key(frigate_camera)
-        age = time.monotonic() - self._cameras_at
+        age = _monotonic() - self._cameras_at
         # Listed again at most once a minute for a camera not there (added or
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
         if age > FRIGATE_CAMERAS_TTL or (key not in self._cameras and age > 60):
-            self._cameras_at = time.monotonic()
+            self._cameras_at = _monotonic()
             self._cameras = {camera_key(c.name): (c.id, c.name) for c in await self.client.cameras()}
         if (found := self._cameras.get(key)) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
             self._unknown.add(frigate_camera)
@@ -537,6 +588,16 @@ class FrigateBridge:
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
             try:
+                await wait_for_frame()
+            finally:
+                self._announcing_ids.discard(review_id)
+            self.hass.bus.async_fire(DETECTION_EVENT, payload)
+            self._counts["announced"] += 1
+            self._decide(review_id)
+            self._save()
+
+        async def wait_for_frame() -> None:
+            try:
                 # Bounded: a slow SS or a busy ffmpeg must not hold the
                 # notification (the phone fetches the frame on demand anyway).
                 async with asyncio.timeout(FRIGATE_EVENT_WAIT_SECONDS + 10):
@@ -547,9 +608,8 @@ class FrigateBridge:
                 self._counts["announce_failed"] += 1
                 self._error(err)
                 _LOGGER.warning("Frame for detection %s not ready: %r", review_id, err)
-            self.hass.bus.async_fire(DETECTION_EVENT, payload)
-            self._counts["announced"] += 1
 
+        self._announcing_ids.add(review_id)
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")
         self._announcing.add(task)
         task.add_done_callback(self._announcing.discard)
@@ -567,11 +627,21 @@ class FrigateBridge:
     @callback
     def _check_health(self, _now: Any = None) -> None:
         """Problems that last become Repairs issues, and go when they do."""
-        now = time.monotonic()
+        now = _monotonic()
 
         def lasting(since: float | None) -> bool:
             return since is not None and now - since >= FRIGATE_ISSUE_AFTER_SECONDS
 
+        if self._subscribed and self._deferred:
+            # Try the oldest failed review again, first in line; if it goes
+            # through, _ok() brings back all the others.
+            key, review = self._deferred.popitem(last=False)
+            self._pending.setdefault(key, review)
+            self._pending.move_to_end(key, last=False)
+            self._wake.set()
+        elif self._subscribed and self._failing and self._probe is None:
+            # Nothing waiting to go: is SS back at all?
+            self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
         problems = {
             "frigate_mqtt": not self._subscribed and lasting(self._started_at),
             "frigate_failing": lasting(self._failing_since),
@@ -589,12 +659,26 @@ class FrigateBridge:
                     translation_key=issue,
                     translation_placeholders={
                         "topic": self.topic,
-                        "error": (self._last_error or (0, "-"))[1],
+                        "error": self._bookmark_error,
                     },
                 )
             elif not present and issue in self._issues:
                 self._issues.discard(issue)
                 ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
+
+
+    async def _probe_ss(self) -> None:
+        """Bookmarks failed and nothing is waiting: does SS answer again?"""
+        try:
+            cameras = await self.client.cameras()
+        except SSError as err:
+            self._bookmark_error = str(err)[:300]
+        else:
+            self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
+            self._cameras_at = _monotonic()
+            self._ok()
+        finally:
+            self._probe = None
 
 
 def store_key(entry_id: str) -> str:
@@ -607,3 +691,5 @@ def _strings(value: Any) -> list[str]:
 
 # Set on a queued message that replaced its review's "new": it was seen new.
 _SEEN_NEW = "_seen_new"
+# Set on a message whose try failed: its bookmark may exist all the same.
+_MAYBE_MADE = "_maybe_made"

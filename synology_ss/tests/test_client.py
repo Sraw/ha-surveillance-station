@@ -435,15 +435,24 @@ async def test_download_error_body_not_an_object() -> None:
 # --- refused logins ---
 
 
-async def test_blocked_ip_is_not_a_bad_password() -> None:
-    """407: DSM blocked this host for a while; the password is fine, so no reauth."""
+async def test_blocked_ip_is_not_a_bad_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    """407: DSM blocked this host for a while; the password is fine, so no reauth.
+    No login is tried for a minute (each could extend the block)."""
+    import synology_ss_playback.client as client_mod
+
+    now = [1000.0]
+    monkeypatch.setattr(client_mod, "_monotonic", lambda: now[0])
     called = MagicMock()
-    client, _ = _client([_resp(body=_json({"success": False, "error": {"code": 407}})), _resp(body=_json(_LOGIN))])
+    client, session = _client([_resp(body=_json({"success": False, "error": {"code": 407}})), _resp(body=_json(_LOGIN))])
     client.on_auth_failed = called
     with pytest.raises(SSError) as err:
         await client.login()
     assert not isinstance(err.value, SSAuthError)
     called.assert_not_called()
+    with pytest.raises(SSError, match="blocked"):
+        await client.login()
+    assert session.request.call_count == 1
+    now[0] += client_mod.BLOCKED_SECONDS
     await client.login()
     assert client._sid == "s"
 
@@ -453,7 +462,7 @@ async def test_refused_login_tried_again_after_a_while(monkeypatch: pytest.Monke
     import synology_ss_playback.client as client_mod
 
     now = [1000.0]
-    monkeypatch.setattr(client_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(client_mod, "_monotonic", lambda: now[0])
     client, session = _client([_resp(body=_json({"success": False, "error": {"code": 400}})), _resp(body=_json(_LOGIN))])
     with pytest.raises(SSAuthError):
         await client.login()
