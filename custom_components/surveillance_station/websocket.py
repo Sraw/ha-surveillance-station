@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from synology_ss_playback import (
+    Bookmark,
     SSConnectionError,
     SSError,
     SurveillanceStationClient,
@@ -19,7 +20,14 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
-from .const import DOMAIN, VOD_MAX_WINDOW_SECONDS, VOD_SESSION_TTL_SECONDS, VOD_URL
+from .const import (
+    BOOKMARK_PAGE_MAX,
+    DOMAIN,
+    MAX_QUERY_WINDOW_SECONDS,
+    VOD_MAX_WINDOW_SECONDS,
+    VOD_SESSION_TTL_SECONDS,
+    VOD_URL,
+)
 from .views import DATA_MANAGER, VodManager, VodSession
 
 # A window whose end is at least this close to now becomes a live session.
@@ -30,7 +38,7 @@ ERR_SS = "surveillance_station_error"
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_vod, ws_vod_runs):
+    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_vod, ws_vod_runs):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -54,6 +62,8 @@ def _range(msg: dict[str, Any]) -> tuple[int, int]:
     start, end = int(msg["start"]), int(msg["end"])
     if end <= start:
         raise ValueError("end must be after start")
+    if end - start > MAX_QUERY_WINDOW_SECONDS:
+        raise ValueError(f"window is longer than {MAX_QUERY_WINDOW_SECONDS // 86400} days")
     return start, end
 
 
@@ -142,27 +152,91 @@ async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveCon
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "surveillance_station/bookmarks",
-        **{k: v for k, v in _RANGE_SCHEMA.items() if k != "camera_id"},
-        # Omitted: every camera (the card's event list).
-        vol.Optional("camera_id"): vol.Coerce(int),
+        vol.Optional("entry_id"): str,
+        # Omitted: every camera.
+        vol.Optional("camera_ids"): [vol.Coerce(int)],
+        vol.Required("start"): vol.Coerce(float),
+        vol.Required("end"): vol.Coerce(float),
     }
 )
 @websocket_api.async_response
 async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """Bookmarks overlapping a time window, oldest first (the timeline)."""
+
     async def go():
-        _, client = _client(hass, msg.get("entry_id"))
+        entry_id, client = _client(hass, msg.get("entry_id"))
         start, end = _range(msg)
+        cams = msg.get("camera_ids")
+        found = [
+            b
+            for b in await _manager(hass).bookmarks(entry_id, client)
+            if b.end >= start and b.start <= end and (cams is None or b.camera_id in cams)
+        ]
+        return {"bookmarks": [_bookmark(b) for b in reversed(found)]}
+
+    await _run(hass, connection, msg, go())
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "surveillance_station/bookmark_page",
+        vol.Optional("entry_id"): str,
+        # Omitted: every camera.
+        vol.Optional("camera_ids"): [vol.Coerce(int)],
+        # Cursor: the last bookmark of the previous page. Omitted: the newest.
+        vol.Inclusive("before", "cursor"): vol.Coerce(int),
+        vol.Inclusive("before_id", "cursor"): vol.Coerce(int),
+        vol.Optional("limit", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=BOOKMARK_PAGE_MAX)),
+    }
+)
+@websocket_api.async_response
+async def ws_bookmark_page(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Every bookmark SS has, newest first, a page at a time (the event list).
+
+    Paged by a cursor rather than an offset, so bookmarks created while the
+    list is open don't shift the pages (they show up on the next first page).
+    """
+
+    async def go():
+        entry_id, client = _client(hass, msg.get("entry_id"))
+        cams = msg.get("camera_ids")
+        matching = [
+            b for b in await _manager(hass).bookmarks(entry_id, client) if cams is None or b.camera_id in cams
+        ]
+        if "before" in msg:
+            cursor = (msg["before"], msg["before_id"])
+            rest = [b for b in matching if (b.start, b.id) < cursor]
+        else:
+            rest = matching
+        page = rest[: msg["limit"]]
         return {
+            "total": len(matching),
+            "more": len(rest) > len(page),
             "bookmarks": [
-                {
-                    "id": b.id, "camera_id": b.camera_id, "name": b.name,
-                    "comment": b.comment, "start": b.start, "end": b.end,
-                }
-                for b in await client.bookmarks(msg.get("camera_id"), start, end)
-            ]
+                # A second in: the moment the bookmark is about, not the keyframe before it.
+                _bookmark(b, _manager(hass).sign_thumbnail(entry_id, b.camera_id, b.start + 1))
+                for b in page
+            ],
         }
 
     await _run(hass, connection, msg, go())
+
+
+def _bookmark(b: Bookmark, thumbnail: str | None = None) -> dict[str, Any]:
+    """A bookmark for the card; the timeline's have no thumbnail to sign."""
+    out = {
+        "id": b.id,
+        "camera_id": b.camera_id,
+        "name": b.name,
+        "comment": b.comment,
+        "start": b.start,
+        "end": b.end,
+    }
+    if thumbnail is not None:
+        out["thumbnail"] = thumbnail
+    return out
 
 
 @websocket_api.websocket_command({vol.Required("type"): "surveillance_station/vod", **_RANGE_SCHEMA})

@@ -16,6 +16,8 @@ the sessions, the segment cache and fetch queue, and the HTTP views.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import logging
@@ -24,11 +26,13 @@ import time
 
 from aiohttp import web
 from synology_ss_playback import (
+    Bookmark,
     Segment,
     SSConnectionError,
     SSError,
     SurveillanceStationClient,
     fetch_segment,
+    fetch_snapshot,
     live_edge,
     plan_segments,
     recordings_from,
@@ -42,9 +46,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util.hass_dict import HassKey
 
 from .const import (
+    BOOKMARK_CACHE_SECONDS,
+    BOOKMARK_ERROR_SECONDS,
     DOMAIN,
     MAX_PARALLEL_FETCHES,
+    MAX_PARALLEL_THUMBNAILS,
     SEGMENT_CACHE_BYTES,
+    THUMBNAIL_CACHE_BYTES,
+    THUMBNAIL_ENTRY_BYTES,
+    THUMBNAIL_MISS_SECONDS,
+    THUMBNAIL_URL,
+    THUMBNAIL_URL_TTL_HOURS,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
@@ -94,6 +106,19 @@ class VodManager:
         self._waiters: dict[tuple, int] = {}
         self._started: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
+        # (entry_id, camera_id, ts) -> (made at, JPEG or b"" for "nothing
+        # recorded then"), the jobs making them and how many requests wait on each.
+        self._thumbs: OrderedDict[tuple[str, int, int], tuple[float, bytes]] = OrderedDict()
+        self._thumbs_bytes = 0
+        self._thumb_tasks: dict[tuple[str, int, int], asyncio.Task] = {}
+        self._thumb_waiters: dict[tuple[str, int, int], int] = {}
+        self._thumb_sem = asyncio.Semaphore(MAX_PARALLEL_THUMBNAILS)
+        # Thumbnail URLs carry an HMAC under this key (see sign_thumbnail).
+        self._thumb_key = secrets.token_bytes(32)
+        # entry_id -> (fetched at, every bookmark newest first, or the error),
+        # and the one fetch per entry that every request waits on.
+        self._bookmarks: dict[str, tuple[float, list[Bookmark] | SSError]] = {}
+        self._bookmark_tasks: dict[str, asyncio.Task] = {}
 
     def client(self, entry_id: str) -> SurveillanceStationClient | None:
         """The logged-in client of a loaded entry."""
@@ -119,10 +144,17 @@ class VodManager:
         for key in [k for k in self._cache if k[0] == entry_id]:
             init, media = self._cache.pop(key)
             self._cache_bytes -= len(init) + len(media)
-        for key, task in list(self._inflight.items()):
-            if key[0] == entry_id:
-                task.cancel()
+        for tkey in [k for k in self._thumbs if k[0] == entry_id]:
+            self._drop_thumbnail(tkey)
+        for tasks in (self._inflight, self._thumb_tasks):
+            for key, task in list(tasks.items()):
+                if key[0] == entry_id:
+                    task.cancel()
+                    del tasks[key]
+        if (task := self._bookmark_tasks.pop(entry_id, None)) is not None:
+            task.cancel()
         self._unreachable.discard(entry_id)
+        self._bookmarks.pop(entry_id, None)
 
     def stats(self) -> dict[str, int]:
         return {
@@ -130,7 +162,131 @@ class VodManager:
             "cached_segments": len(self._cache),
             "cached_bytes": self._cache_bytes,
             "fetches_in_flight": len(self._inflight),
+            "cached_thumbnails": len(self._thumbs),
+            "cached_thumbnail_bytes": self._thumbs_bytes,
         }
+
+    async def bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
+        """Every bookmark of every camera, newest first, at most a few seconds old.
+
+        One fetch per entry at a time, whose result (or error) every request
+        waiting meanwhile shares: a NAS that hangs costs one timeout, not one
+        per request queued behind it.
+        """
+        if (hit := self._bookmarks.get(entry_id)) is not None:
+            at, found = hit
+            if isinstance(found, SSError):
+                if time.monotonic() - at < BOOKMARK_ERROR_SECONDS:
+                    raise found.with_traceback(None)
+            elif time.monotonic() - at < BOOKMARK_CACHE_SECONDS:
+                return found
+        task = self._bookmark_tasks.get(entry_id)
+        if task is None:
+            task = self.hass.async_create_background_task(
+                self._load_bookmarks(entry_id, client), "surveillance_station bookmarks", eager_start=False
+            )
+            task.add_done_callback(_retrieve_exception)
+            self._bookmark_tasks[entry_id] = task
+        return await _join(task, "bookmarks")
+
+    async def _load_bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
+        me = asyncio.current_task()
+        try:
+            cameras = await client.cameras()
+            found = await client.list_bookmarks([c.id for c in cameras])
+        except SSError as err:
+            self._bookmarks[entry_id] = (time.monotonic(), err)
+            raise
+        finally:
+            if self._bookmark_tasks.get(entry_id) is me:
+                del self._bookmark_tasks[entry_id]
+        self._bookmarks[entry_id] = (time.monotonic(), found)
+        return found
+
+    def sign_thumbnail(self, entry_id: str, camera_id: int, ts: int) -> str:
+        """A URL for the frame of camera_id at ts, valid for about a day.
+
+        An HMAC of our own rather than HA's async_sign_path: HA answers an
+        expired or foreign signature (after every HA restart, as its signing
+        key lives in memory) with 401, and counts each 401 as a failed login,
+        so a long-open card would get its device IP-banned. A bad signature
+        here is a plain 404. The expiry is rounded to the hour so the URL (and
+        the browser's cached copy) stays the same between list refreshes.
+        """
+        exp = (int(time.time()) // 3600 + 1 + THUMBNAIL_URL_TTL_HOURS) * 3600
+        path = f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}.jpg"
+        return f"{path}?exp={exp}&sig={self._thumbnail_sig(path, exp)}"
+
+    def check_thumbnail(self, path: str, exp: str | None, sig: str | None) -> bool:
+        # isascii: str.isdigit() accepts "²", and compare_digest rejects non-ASCII str.
+        if not exp or not sig or not (exp.isascii() and exp.isdigit()) or not sig.isascii():
+            return False
+        if int(exp) < time.time():
+            return False
+        return hmac.compare_digest(sig, self._thumbnail_sig(path, int(exp)))
+
+    def _thumbnail_sig(self, path: str, exp: int) -> str:
+        return hmac.new(self._thumb_key, f"{path}\n{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+
+    async def thumbnail(self, entry_id: str, camera_id: int, ts: int) -> bytes | None:
+        """JPEG of camera_id at ts, or None if nothing was recorded then.
+
+        Requests for the same frame share one job; a job nobody waits for any
+        more (the thumbnail was scrolled past) is cancelled.
+        """
+        key = (entry_id, camera_id, ts)
+        if (hit := self._thumbs.get(key)) is not None:
+            at, data = hit
+            # A miss is only remembered briefly: the recording may just not
+            # have been listed yet.
+            if data or time.monotonic() - at < THUMBNAIL_MISS_SECONDS:
+                self._thumbs.move_to_end(key)
+                return data or None
+            self._drop_thumbnail(key)
+        task = self._thumb_tasks.get(key)
+        if task is None or task.cancelling():
+            task = self.hass.async_create_background_task(
+                self._make_thumbnail(key), f"surveillance_station thumbnail {camera_id}@{ts}", eager_start=False
+            )
+            task.add_done_callback(_retrieve_exception)
+            self._thumb_tasks[key] = task
+        self._thumb_waiters[key] = self._thumb_waiters.get(key, 0) + 1
+        try:
+            return await _join(task, "thumbnail")
+        finally:
+            if left := self._thumb_waiters.pop(key) - 1:
+                self._thumb_waiters[key] = left
+            elif not task.done():
+                task.cancel()
+
+    async def _make_thumbnail(self, key: tuple[str, int, int]) -> bytes | None:
+        me = asyncio.current_task()
+        entry_id, camera_id, ts = key
+        try:
+            client = self.client(entry_id)
+            if client is None:
+                raise SSError("thumbnail", "fetch", None, "Surveillance Station entry is not loaded")
+            async with self._thumb_sem:
+                try:
+                    jpg = await fetch_snapshot(client, camera_id, ts, get_ffmpeg_manager(self.hass).binary)
+                except SSError as err:
+                    self.track(entry_id, err)
+                    raise
+        finally:
+            if self._thumb_tasks.get(key) is me:
+                del self._thumb_tasks[key]
+        self.track(entry_id, None)
+        self._drop_thumbnail(key)
+        data = jpg or b""
+        self._thumbs[key] = (time.monotonic(), data)
+        self._thumbs_bytes += len(data) + THUMBNAIL_ENTRY_BYTES
+        while self._thumbs_bytes > THUMBNAIL_CACHE_BYTES and len(self._thumbs) > 1:
+            self._drop_thumbnail(next(iter(self._thumbs)))
+        return data or None
+
+    def _drop_thumbnail(self, key: tuple[str, int, int]) -> None:
+        if (old := self._thumbs.pop(key, None)) is not None:
+            self._thumbs_bytes -= len(old[1]) + THUMBNAIL_ENTRY_BYTES
 
     def create_session(self, session: VodSession) -> str:
         now = time.time()
@@ -193,15 +349,20 @@ class VodManager:
             # The fetch runs as its own task so a client abort (hls.js aborts
             # on every seek) neither kills the work nor the other requests
             # waiting for the same segment; a retry then finds it cached.
+            # Not eager: a task that finished inside the call (an error before
+            # the first await) would clear its _inflight slot before it was
+            # set, and the finished task would then answer for that segment
+            # for good.
             task = self.hass.async_create_background_task(
                 self._fetch_and_cache(key, session.entry_id, seg),
                 f"surveillance_station segment {seg.recording_id}@{seg.offset_ms}",
+                eager_start=False,
             )
             task.add_done_callback(_retrieve_exception)
             self._inflight[key] = task
         self._waiters[key] = self._waiters.get(key, 0) + 1
         try:
-            return await asyncio.shield(task)
+            return await _join(task, "vod")
         finally:
             if left := self._waiters.pop(key) - 1:
                 self._waiters[key] = left
@@ -239,6 +400,20 @@ class VodManager:
             raise
         self.track(entry_id, None)
         return result
+
+
+async def _join[T](task: asyncio.Task[T], what: str) -> T:
+    """Wait for a shared job; its cancellation (entry unloaded) is an error, not ours.
+
+    A CancelledError escaping into a WebSocket handler would leave the card's
+    call unanswered for good; a view would drop the connection.
+    """
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if (me := asyncio.current_task()) is not None and me.cancelling():
+            raise  # the request itself was cancelled
+        raise SSError(what, "fetch", None, "Surveillance Station entry was unloaded") from None
 
 
 DATA_MANAGER: HassKey[VodManager] = HassKey(DOMAIN)
@@ -318,3 +493,35 @@ class VodSegmentView(_VodBaseView):
         session = self._session(token)
         _, media = await self._get_parts(session, self._segment(session, index))
         return web.Response(body=media, content_type="video/iso.segment", headers=_NO_STORE)
+
+
+class ThumbnailView(HomeAssistantView):
+    """A frame of the recording at an event, for the card's event list.
+
+    An ``<img>`` can't send an auth header, so the URL itself is the
+    credential: the WebSocket hands out URLs signed by
+    ``VodManager.sign_thumbnail``. Anything unsigned, expired or tampered with
+    is a 404 (never a 401, which HA would count as a failed login).
+    """
+
+    requires_auth = False
+    url = THUMBNAIL_URL + r"/{entry_id}/{camera_id:\d+}/{ts:\d+}.jpg"
+    name = "api:surveillance_station:thumbnail"
+
+    def __init__(self, manager: VodManager) -> None:
+        self.manager = manager
+
+    async def get(self, request: web.Request, entry_id: str, camera_id: str, ts: str) -> web.Response:
+        if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
+            raise web.HTTPNotFound()
+        try:
+            jpg = await self.manager.thumbnail(entry_id, int(camera_id), int(ts))
+        except SSConnectionError:
+            raise web.HTTPBadGateway() from None
+        except SSError as err:
+            _LOGGER.debug("Thumbnail %s@%s failed: %s", camera_id, ts, err)
+            raise web.HTTPBadGateway() from None
+        if jpg is None:
+            raise web.HTTPNotFound()
+        # The URL names a fixed moment: the image never changes.
+        return web.Response(body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})

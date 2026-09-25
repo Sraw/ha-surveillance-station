@@ -26,18 +26,27 @@ async def test_cameras(hass: HomeAssistant, setup_integration: MockConfigEntry, 
     }
 
 
-async def test_bookmarks_all_cameras(
+async def test_bookmarks_in_range(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, hass_ws_client: WebSocketGenerator
 ) -> None:
+    """The timeline's window: overlapping bookmarks, oldest first, of the cameras asked for."""
     ws = await hass_ws_client(hass)
-    await ws.send_json_auto_id({"type": "surveillance_station/bookmarks", "start": T0, "end": T0 + 3600})
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmarks", "start": T0, "end": T0 + 1000})
     msg = await ws.receive_json()
     assert msg["success"]
-    assert msg["result"]["bookmarks"][0] == {
+    assert [b["id"] for b in msg["result"]["bookmarks"]] == [1, 2]
+    bookmark = msg["result"]["bookmarks"][0]
+    assert bookmark == {
         "id": 1, "camera_id": 6, "name": "person", "comment": "", "start": T0 + 60, "end": T0 + 70,
     }
-    # No camera_id: every camera.
-    mock_client.bookmarks.assert_awaited_with(None, T0, T0 + 3600)
+
+    await ws.send_json_auto_id(
+        {"type": "surveillance_station/bookmarks", "camera_ids": [7], "start": T0, "end": T0 + 3600}
+    )
+    assert [b["id"] for b in (await ws.receive_json())["result"]["bookmarks"]] == [3]
+    # One SS round trip for both: the list is cached briefly and filtered here.
+    assert mock_client.list_bookmarks.await_count == 1
+    mock_client.list_bookmarks.assert_awaited_with([6, 7])
 
 
 async def test_unreachable(
@@ -112,3 +121,107 @@ async def test_sessions_dropped_on_unload(
     assert await hass.config_entries.async_unload(setup_integration.entry_id)
     client = await hass_client_no_auth()
     assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
+
+
+async def test_bookmark_page(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Newest first, paged by a cursor."""
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", "limit": 2})
+    first = (await ws.receive_json())["result"]
+    assert [b["id"] for b in first["bookmarks"]] == [3, 2]
+    assert (first["total"], first["more"]) == (3, True)
+
+    last = first["bookmarks"][-1]
+    await ws.send_json_auto_id(
+        {"type": "surveillance_station/bookmark_page", "limit": 2, "before": last["start"], "before_id": last["id"]}
+    )
+    second = (await ws.receive_json())["result"]
+    assert [b["id"] for b in second["bookmarks"]] == [1]
+    assert second["more"] is False
+
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", "camera_ids": [6]})
+    only6 = (await ws.receive_json())["result"]
+    assert ([b["id"] for b in only6["bookmarks"]], only6["total"]) == ([2, 1], 2)
+
+    for bad in ({"limit": 1000}, {"before": T0}):
+        await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", **bad})
+        assert (await ws.receive_json())["error"]["code"] == "invalid_format"
+
+
+async def test_window_capped(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    for kind in ("bookmarks", "recordings"):
+        extra = {"camera_id": 6} if kind == "recordings" else {}
+        await ws.send_json_auto_id(
+            {"type": f"surveillance_station/{kind}", "start": T0, "end": T0 + 9 * 86400, **extra}
+        )
+        assert (await ws.receive_json())["error"]["code"] == "invalid_format"
+
+
+async def test_thumbnail(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Signed URLs load without a header; the frame is fetched once, then cached."""
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
+    client = await hass_client_no_auth()
+
+    snap = AsyncMock(return_value=b"\xff\xd8jpeg")
+    with patch("custom_components.surveillance_station.views.fetch_snapshot", snap):
+        first = await client.get(url)
+        second = await client.get(url)
+    assert first.status == HTTPStatus.OK
+    assert first.content_type == "image/jpeg"
+    assert await second.read() == b"\xff\xd8jpeg"
+    assert snap.await_count == 1
+    assert snap.await_args.args[1:3] == (7, T0 + 2001)
+
+
+async def test_thumbnail_bad_signature_is_404(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Never 401: HA counts those as failed logins and bans the IP."""
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
+    path, query = url.split("?")
+    exp = query.split("&")[0].split("=")[1]
+    client = await hass_client_no_auth()
+    other_ts = path.replace(f"/{T0 + 2001}.jpg", f"/{T0 + 5}.jpg")
+    later = query.replace(f"exp={exp}", f"exp={int(exp) + 3600}")
+    snap = AsyncMock(return_value=b"\xff\xd8jpeg")
+    with patch("custom_components.surveillance_station.views.fetch_snapshot", snap):
+        for bad in (
+            path, f"{other_ts}?{query}", f"{path}?{later}", f"{path}?exp={exp}&sig=00",
+            f"{path}?exp=%C2%B2&sig=00", f"{path}?exp={exp}&sig=%C3%A9",  # non-ASCII: 404, not 500
+        ):
+            assert (await client.get(bad)).status == HTTPStatus.NOT_FOUND, bad
+        # Expired, e.g. a card left open for days.
+        with patch("custom_components.surveillance_station.views.time.time", return_value=int(exp) + 1):
+            assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
+    snap.assert_not_awaited()
+
+
+async def test_thumbnail_nothing_recorded(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
+    client = await hass_client_no_auth()
+    with patch("custom_components.surveillance_station.views.fetch_snapshot", AsyncMock(return_value=None)):
+        assert (await client.get(url)).status == HTTPStatus.NOT_FOUND

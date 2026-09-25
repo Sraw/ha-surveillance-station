@@ -10,9 +10,14 @@ API notes (verified against SS 9.x, see the repo README):
   a recording's *start* time, not on overlap, so a query must reach back by
   the longest recording length (``RECORDING_LOOKBACK_SECONDS``) and then
   filter by overlap itself.
-* Bookmarks come embedded in ``Recording.List`` **v5** results.
 * ``Recording.Download`` v6 with ``offsetTimeMs``/``playTimeMs`` returns an
   MP4 (moov at the end, no Range support). On failure it returns JSON.
+* Bookmarks: the documented ``ThirdParty.Bookmark.List`` v1 (SS 9.3 API
+  reference) returns every bookmark of the given cameras, newest first, with
+  times as NAS-local ISO strings without an offset (converted here with SS
+  Info's ``timezoneTZDB``). Its ``startTime``/``endTime`` filters only work
+  at day granularity and misplace the boundaries, so they are not used: the
+  caller filters the full list.
 """
 
 from __future__ import annotations
@@ -20,9 +25,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import logging
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
@@ -67,6 +74,7 @@ class SSInfo:
     serial: str  # the NAS serial number: stable across IP / port changes
     hostname: str
     version: str
+    timezone: str  # TZDB name, e.g. "US/Pacific"; SS reports local times in it
 
 
 @dataclass(frozen=True)
@@ -116,6 +124,7 @@ class SurveillanceStationClient:
         self._sid: str | None = None
         self._login_lock = asyncio.Lock()
         self._auth_failed: int | None = None
+        self._tz: ZoneInfo | None = None
         # Called when a re-login is refused at runtime (password changed).
         self.on_auth_failed: Callable[[], None] | None = None
 
@@ -220,7 +229,26 @@ class SurveillanceStationClient:
         version = ".".join(str(v[k]) for k in ("major", "minor", "small") if k in v)
         if "build" in v:
             version += f"-{v['build']}"
-        return SSInfo(serial=str(data["serial"]), hostname=str(data.get("hostname", "")), version=version)
+        info = SSInfo(
+            serial=str(data["serial"]),
+            hostname=str(data.get("hostname", "")),
+            version=version,
+            timezone=str(data.get("timezoneTZDB") or "UTC"),
+        )
+        if not data.get("timezoneTZDB"):
+            _LOGGER.warning("Surveillance Station reports no time zone; reading its local times as UTC")
+        try:
+            self._tz = ZoneInfo(info.timezone)
+        except ZoneInfoNotFoundError:
+            _LOGGER.warning("Unknown NAS time zone %r, assuming UTC", info.timezone)
+            self._tz = ZoneInfo("UTC")
+        return info
+
+    async def _timezone(self) -> ZoneInfo:
+        if self._tz is None:
+            await self.info()
+        assert self._tz is not None
+        return self._tz
 
     async def cameras(self) -> list[Camera]:
         data = await self._call("SYNO.SurveillanceStation.Camera", "List", 9)
@@ -266,44 +294,30 @@ class SurveillanceStationClient:
         out.sort(key=lambda r: r.start)
         return out
 
-    async def bookmarks(self, camera_id: int | None, start: int, end: int) -> list[Bookmark]:
-        """Bookmarks overlapping [start, end], oldest first; all cameras if camera_id is None."""
-        seen: set[int] = set()
-        out: list[Bookmark] = []
-        offset = 0
-        cameras = {} if camera_id is None else {"cameraIds": str(camera_id)}
-        while True:
-            data = await self._call(
-                "SYNO.SurveillanceStation.Recording", "List", 5,
-                **cameras, fromTime=int(start) - RECORDING_LOOKBACK_SECONDS,
-                toTime=int(end), offset=offset, limit=500,
+    async def list_bookmarks(self, camera_ids: list[int]) -> list[Bookmark]:
+        """Every bookmark of these cameras, newest first."""
+        if not camera_ids:
+            return []
+        tz = await self._timezone()
+        data = await self._call(
+            "SYNO.SurveillanceStation.ThirdParty.Bookmark", "List", 1,
+            camIds=",".join(str(int(c)) for c in camera_ids),
+        )
+        out = []
+        for b in data.get("bookmarks") or []:
+            start = _local_ts(b["startTime"], tz)
+            out.append(
+                Bookmark(
+                    id=int(b["bookmarkId"]),
+                    camera_id=int(b["camId"]),
+                    name=b.get("name") or "",
+                    comment=b.get("comment") or "",
+                    start=start,
+                    end=_local_ts(b["endTime"], tz) if b.get("endTime") else start,
+                )
             )
-            events = data.get("events", [])
-            for e in events:
-                out.extend(self._bookmarks_of(e, camera_id, start, end, seen))
-            offset += len(events)
-            if not events or offset >= int(data.get("total", 0)):
-                break
-        out.sort(key=lambda b: b.start)
+        out.sort(key=lambda b: (b.start, b.id), reverse=True)
         return out
-
-    @staticmethod
-    def _bookmarks_of(e: dict[str, Any], camera_id: int | None, start: int, end: int, seen: set[int]):
-        for b in e.get("bookmark") or []:
-            bid = int(b["id"])
-            ts = int(b.get("timestamp") or 0)
-            stop = int(b.get("endtime") or ts)
-            if bid in seen or stop < start or ts > end:
-                continue
-            seen.add(bid)
-            yield Bookmark(
-                id=bid,
-                camera_id=int(b.get("cameraId") or e.get("cameraId") or camera_id),
-                name=b.get("name") or "",
-                comment=b.get("comment") or "",
-                start=ts,
-                end=stop,
-            )
 
     async def download(self, recording_id: int, mount_id: int, offset_ms: int, duration_ms: int) -> bytes:
         """Cut [offset, offset+duration) out of one recording as MP4 bytes."""
@@ -330,3 +344,15 @@ class SurveillanceStationClient:
                 continue
             raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
         raise AssertionError("unreachable")
+
+
+def _local_ts(value: str, tz: ZoneInfo) -> int:
+    """NAS-local ISO time (no offset) to epoch seconds.
+
+    In the hour a DST change repeats, the earlier of the two readings is
+    taken: SS gives nothing else to tell them apart.
+    """
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return int(dt.timestamp())

@@ -182,5 +182,15 @@ class Boxes(unittest.TestCase):
         self.assertEqual(args[args.index("-output_ts_offset") + 1], "20.000")
 
 
+class LocalTime(unittest.TestCase):
+    def test_nas_local_iso_to_epoch(self):
+        from zoneinfo import ZoneInfo
+        from synology_ss_playback.client import _local_ts
+
+        # Values seen from SS 9.3 (NAS in US/Pacific) for the same bookmark.
+        self.assertEqual(_local_ts("2026-09-24T16:40:58", ZoneInfo("US/Pacific")), 1790293258)
+        self.assertEqual(_local_ts("2026-01-15T08:00:00", ZoneInfo("US/Pacific")), 1768492800)
+
+
 if __name__ == "__main__":
     unittest.main()

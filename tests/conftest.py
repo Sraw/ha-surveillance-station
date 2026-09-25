@@ -36,7 +36,7 @@ def mock_client() -> Generator[MagicMock]:
     client = MagicMock()
     client.login = AsyncMock()
     client.logout = AsyncMock()
-    client.info = AsyncMock(return_value=SSInfo(serial=SERIAL, hostname="The-NAS", version="9.3.0-12143"))
+    client.info = AsyncMock(return_value=SSInfo(serial=SERIAL, hostname="The-NAS", version="9.3.0-12143", timezone="US/Pacific"))
     client.cameras = AsyncMock(
         return_value=[Camera(id=6, name="Drive Way", enabled=True), Camera(id=7, name="Backyard", enabled=False)]
     )
@@ -46,8 +46,13 @@ def mock_client() -> Generator[MagicMock]:
             RecordingInfo(id=101, camera_id=6, start=T0 + 1800, end=T0 + 3600, mount_id=1, live=False, hevc=True),
         ]
     )
-    client.bookmarks = AsyncMock(
-        return_value=[Bookmark(id=1, camera_id=6, name="person", comment="", start=T0 + 60, end=T0 + 70)]
+    # Newest first, as SS returns them.
+    client.list_bookmarks = AsyncMock(
+        return_value=[
+            Bookmark(id=3, camera_id=7, name="cat", comment="", start=T0 + 2000, end=T0 + 2010),
+            Bookmark(id=2, camera_id=6, name="car", comment="c", start=T0 + 900, end=T0 + 905),
+            Bookmark(id=1, camera_id=6, name="person", comment="", start=T0 + 60, end=T0 + 70),
+        ]
     )
     client.on_auth_failed = None
     with (

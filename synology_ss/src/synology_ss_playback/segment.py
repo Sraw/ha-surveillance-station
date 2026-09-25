@@ -1,4 +1,5 @@
-"""Fetch one planned segment: cut it on the NAS, remux it to fragmented MP4.
+"""Fetch one planned segment (cut on the NAS, remuxed to fragmented MP4), or
+a single frame of a recording as a JPEG.
 
 ``Recording.Download`` returns a plain MP4 with the ``moov`` box at the end
 and no Range support, so ffmpeg needs it as a seekable file. The scratch file
@@ -9,7 +10,7 @@ lives only for the remux; a crash can leave one behind, which
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 import glob
 import logging
 import os
@@ -23,6 +24,7 @@ _LOGGER = logging.getLogger(__name__)
 
 TEMP_PREFIX = "ss_vod_"
 REMUX_TIMEOUT_SECONDS = 30
+SNAPSHOT_WIDTH = 320
 
 
 def recordings_from(infos: Iterable[RecordingInfo]) -> list[Recording]:
@@ -56,12 +58,21 @@ async def fetch_segment(
 
 
 async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes:
+    return await _run_ffmpeg(
+        ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
+    )
+
+
+async def _run_ffmpeg(
+    ffmpeg: str, raw: bytes, args: Callable[[str], list[str]], timeout: float
+) -> bytes:
+    """Run ffmpeg on a downloaded cut (via a scratch file; see module docstring)."""
     fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
     proc = None
     try:
         await asyncio.to_thread(_write_and_close, fd, raw)
         proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_remux_args(ffmpeg, path, seg.duration, seg.media_start, seg.hevc),
+            *args(path),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -70,15 +81,50 @@ async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes
             async with asyncio.timeout(timeout):
                 out, err = await proc.communicate()
         except TimeoutError:
-            raise SSError("ffmpeg", "remux", None, "timed out") from None
+            raise SSError("ffmpeg", "run", None, "timed out") from None
         if proc.returncode != 0:
-            raise SSError("ffmpeg", "remux", proc.returncode, err.decode(errors="replace")[-400:])
+            raise SSError("ffmpeg", "run", proc.returncode, err.decode(errors="replace")[-400:])
         return out
     finally:
         if proc is not None and proc.returncode is None:
             proc.kill()
             await proc.wait()
         await asyncio.to_thread(_unlink, path)
+
+
+async def fetch_snapshot(
+    client: SurveillanceStationClient,
+    camera_id: int,
+    t: float,
+    ffmpeg: str,
+    width: int = SNAPSHOT_WIDTH,
+    timeout: float = REMUX_TIMEOUT_SECONDS,
+) -> bytes | None:
+    """A JPEG of what the camera recorded at wall time t, or None if nothing was.
+
+    SS cuts from the keyframe at or before the offset (1 s GOP here), so the
+    frame is at most a second early.
+    """
+    now = time.time()
+    for rec in await client.recordings(camera_id, int(t) - 1, int(t) + 1):
+        end = now if rec.live else rec.end
+        if rec.start <= t < end:
+            break
+    else:
+        return None
+    raw = await client.download(rec.id, rec.mount_id, int((t - rec.start) * 1000), 1500)
+    jpg = await _run_ffmpeg(
+        ffmpeg,
+        raw,
+        lambda src: [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-i", src,
+            "-frames:v", "1", "-vf", f"scale={int(width)}:-2",
+            "-c:v", "mjpeg", "-q:v", "5", "-f", "image2", "pipe:1",
+        ],
+        timeout,
+    )
+    # Empty when the cut held no decodable frame (the last second of a file).
+    return jpg or None
 
 
 def remove_stale_temp_files() -> int:

@@ -27,7 +27,7 @@ from homeassistant.helpers.typing import ConfigType
 
 from . import websocket
 from .const import CARD_FILENAME, CONF_VERIFY_SSL, DOMAIN, STATIC_URL
-from .views import DATA_MANAGER, VodInitView, VodManager, VodPlaylistView, VodSegmentView
+from .views import DATA_MANAGER, ThumbnailView, VodInitView, VodManager, VodPlaylistView, VodSegmentView
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,16 +46,27 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.info("Removed %d stale remux scratch files", removed)
     manager = VodManager(hass)
     hass.data[DATA_MANAGER] = manager
-    for view in (VodPlaylistView, VodInitView, VodSegmentView):
+    for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView):
         hass.http.register_view(view(manager))
     websocket.async_register(hass)
     await hass.http.async_register_static_paths(
         [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), False)]
     )
-    version = await hass.async_add_executor_job(_version)
-    # Cache-bust on every release so browsers pick up a new card.
-    await _register_card(hass, f"{STATIC_URL}/{CARD_FILENAME}?v={version}")
+    if _storage_resources(hass) is None:
+        # YAML-mode resources can't be edited from here: load it everywhere.
+        add_extra_js_url(hass, await _card_url(hass))
     return True
+
+
+async def _card_url(hass: HomeAssistant) -> str:
+    # Cache-bust on every release so browsers pick up a new card.
+    version = await hass.async_add_executor_job(_version)
+    return f"{STATIC_URL}/{CARD_FILENAME}?v={version}"
+
+
+def _storage_resources(hass: HomeAssistant) -> ResourceStorageCollection | None:
+    resources = getattr(hass.data.get(LOVELACE_DATA), "resources", None)
+    return resources if isinstance(resources, ResourceStorageCollection) else None
 
 
 async def _register_card(hass: HomeAssistant, url: str) -> None:
@@ -65,12 +76,10 @@ async def _register_card(hass: HomeAssistant, url: str) -> None:
     service worker serves index.html stale-while-revalidate, so the mobile app
     can keep showing a page from before the integration was installed
     ("Custom element doesn't exist"). The resource list is fetched over the
-    WebSocket every time a dashboard loads. YAML-mode resources can't be
-    edited from here, so they fall back to add_extra_js_url.
+    WebSocket every time a dashboard loads. (YAML-mode resources: see
+    async_setup.)
     """
-    resources = getattr(hass.data.get(LOVELACE_DATA), "resources", None)
-    if not isinstance(resources, ResourceStorageCollection):
-        add_extra_js_url(hass, url)
+    if (resources := _storage_resources(hass)) is None:
         return
     await resources.async_get_info()  # loads the collection
     base = url.split("?")[0]
@@ -110,6 +119,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         hass.config_entries.async_update_entry(entry, unique_id=info.serial)
     client.on_auth_failed = lambda: entry.async_start_reauth(hass)
     entry.runtime_data = client
+    # Per entry rather than in async_setup, so that removing the last entry
+    # and adding one back (no restart in between) brings the card back.
+    await _register_card(hass, await _card_url(hass))
     return True
 
 
@@ -117,3 +129,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     await entry.runtime_data.logout()
     return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> None:
+    """Take the card's Lovelace resource away with the last entry."""
+    if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
+        return
+    if (resources := _storage_resources(hass)) is None:
+        return
+    await resources.async_get_info()
+    base = f"{STATIC_URL}/{CARD_FILENAME}"
+    for item in list(resources.async_items()):
+        if item["url"].split("?")[0] == base:
+            await resources.async_delete_item(item["id"])

@@ -12,18 +12,23 @@
  * the others follow its wall-clock time (see Player.follow). The timeline and
  * the event list cover the cameras shown.
  *
+ * Layout: camera chips, the stage (sized so chips-to-timeline fit on the
+ * screen), controls and timeline; the event list is a sidebar on wide cards
+ * and sits below on narrow ones. The card opens playing: live, or the moment
+ * a link asked for.
+ *
  * Card options (all optional):
  *   cameras:  names or ids to show (default: all); the viewer's last choice
  *             (the camera chips) wins
  *   camera:   name or id of the camera to start on (the master)
- *   span:     timeline width in seconds (default 3600)
+ *   span:     timeline width in seconds (default 3600); the viewer's last choice wins
  *   clock:    false hides the time overlay; the viewer's last choice wins
  *   entry_id: which Surveillance Station entry, if there is more than one
  * URL parameters override on load: ?ss_camera=<name|id>&ss_time=<epoch seconds>
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.5.0";
+const CARD_VERSION = "0.6.2";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -31,6 +36,8 @@ const SPANS = [
   [3600, "1h"],
   [6 * 3600, "6h"],
   [24 * 3600, "24h"],
+  [72 * 3600, "3d"],
+  [7 * 24 * 3600, "7d"],
 ];
 const SPEEDS = [1, 2, 4, 8];
 const PRE_ROLL = 30; // seconds before the target included in a new window
@@ -38,13 +45,19 @@ const WINDOW_AHEAD = 3600; // seconds after the target included in a new window
 const LIVE_LAG = 20; // "live" plays this far behind now (segments close at now-5)
 const REFRESH_MS = 60_000;
 const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
-// Event list ranges: [seconds, label].
-const EVENT_RANGES = [
-  [86400, "24h"],
-  [3 * 86400, "3d"],
-  [7 * 86400, "7d"],
-];
-const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600];
+// A transparent poster: without one, Android WebView (the HA app) paints its
+// default poster, a big grey play arrow, over a video with no frame yet, so
+// it flashed on every jump to a bookmark or new window.
+const BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const THUMB_RETRY_MS = 30_000;
+const EVENT_PAGE = 30; // events per page of the list; more load as it scrolls
+// The list (and its thumbnail links, valid ~24 h) is reloaded after this long.
+const EVENT_LIST_MAX_AGE_MS = 12 * 3600 * 1000;
+const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+// One colour per camera (chip, cell label, timeline pins, event rows); these
+// read on both light and dark backgrounds.
+const CAM_COLORS = ["#4f8ff7", "#f5a623", "#2dbd8f", "#e5534b", "#a371f7", "#e05aa8", "#1fb5c6", "#c9a227"];
+const MIN_STAGE_HEIGHT = 160; // px; below this the page scrolls instead
 // Grid sync: how often followers correct, and how.
 const SYNC_MS = 500;
 const DRIFT_JUMP = 2; // seconds off: seek
@@ -113,6 +126,32 @@ function fmtTime(t, seconds = true) {
 function fmtDate(t) {
   return new Date(t * 1000).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
 }
+function fmtDay(t) {
+  return new Date(t * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
+}
+/**
+ * Tick times in [start, end], every `step` seconds on the local clock: hour
+ * and day steps are counted in local time, so they stay on whole hours and
+ * midnights across a DST change (a day is then 23 or 25 hours).
+ */
+function ticksOf(start, end, step) {
+  const out = [];
+  if (step < 3600) {
+    // Sub-hour steps divide an hour, and zone offsets are whole quarter hours.
+    const tzo = new Date(start * 1000).getTimezoneOffset() * 60;
+    for (let t = Math.ceil((start - tzo) / step) * step + tzo; t <= end; t += step) out.push(t);
+    return out;
+  }
+  const d = new Date(start * 1000);
+  d.setMinutes(0, 0, 0);
+  const hours = step / 3600;
+  if (step >= 86400) d.setHours(0);
+  else d.setHours(Math.floor(d.getHours() / hours) * hours);
+  const next = () => (step >= 86400 ? d.setDate(d.getDate() + step / 86400) : d.setHours(d.getHours() + hours));
+  while (d.getTime() / 1000 < start) next();
+  for (; d.getTime() / 1000 <= end; next()) out.push(d.getTime() / 1000);
+  return out;
+}
 function fmtDur(s) {
   s = Math.max(0, Math.round(s));
   if (s < 60) return `${s}s`;
@@ -156,48 +195,87 @@ function setVeil(veil, text, kind = "loading", sub = "") {
 
 const STYLE = `
   :host { display: block; }
-  ha-card { overflow: hidden; }
-  .head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 12px 8px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  ha-card { overflow: hidden; container-type: inline-size; }
   [hidden] { display: none !important; }
-  button { font: inherit; color: var(--primary-text-color); background: var(--secondary-background-color);
-    border: 1px solid var(--divider-color); border-radius: 16px; padding: 4px 12px; cursor: pointer;
-    display: inline-flex; align-items: center; gap: 4px; min-height: 32px; }
-  button:hover { border-color: var(--primary-color); }
-  /* Camera chips: outlined = shown, filled = master. */
-  .cams button.shown { border-color: var(--primary-color); color: var(--primary-color); }
-  button.on { background: var(--primary-color); color: var(--text-primary-color, #fff); border-color: var(--primary-color); }
-  button.icon { padding: 4px 8px; border-radius: 50%; min-width: 36px; justify-content: center; }
   ha-icon { --mdc-icon-size: 20px; }
 
-  /* Stage: one cell per player; "single" shows one, "grid" all of them. */
-  .stage { position: relative; background: #000; user-select: none; -webkit-user-select: none; }
+  /* Buttons take only theme colours: the text colour is never the background colour. */
+  button { font: inherit; font-size: 14px; color: var(--primary-text-color); background: transparent;
+    border: 1px solid var(--divider-color); border-radius: 18px; padding: 0 12px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px;
+    white-space: nowrap; -webkit-tap-highlight-color: transparent; }
+  button:hover { background: color-mix(in srgb, var(--primary-text-color) 8%, transparent); }
+  button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
+  button.icon { border: none; border-radius: 50%; width: 36px; min-width: 36px; height: 36px; padding: 0; }
+  button.on { background: color-mix(in srgb, var(--primary-color) 22%, transparent);
+    border-color: var(--primary-color); color: var(--primary-text-color); }
+  button.icon.on { color: var(--primary-color); background: color-mix(in srgb, var(--primary-color) 16%, transparent); }
+
+  /* Layout: main column, and the event list beside it (wide) or under it (narrow). */
+  .layout { display: flex; flex-direction: column; }
+  .main { min-width: 0; }
+  @container (min-width: 1000px) {
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
+    .layout.noside { grid-template-columns: minmax(0, 1fr); }
+    /* The list is as tall as the main column and scrolls inside it. */
+    .side { height: 0; min-height: 100%; border-left: 1px solid var(--divider-color); border-top: none; }
+    .ev-list { max-height: none; }
+  }
+  .layout.noside .side { display: none; }
+
+  /* Camera chips: one row, scrolling sideways if it has to. */
+  .head { display: flex; align-items: center; gap: 8px; padding: 8px 8px 6px 12px; }
+  .cams { display: flex; gap: 6px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .cams::-webkit-scrollbar { display: none; }
+  /* Chips cut off at the edge fade out: there are more to scroll to. */
+  .cams { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); padding-right: 22px; }
+  .cams button { font-size: 13px; padding: 0 12px 0 10px; min-height: 32px; color: var(--secondary-text-color); }
+  .cams .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--cam); box-sizing: border-box; }
+  .cams button.shown { color: var(--primary-text-color); border-color: color-mix(in srgb, var(--cam) 55%, var(--divider-color));
+    background: color-mix(in srgb, var(--cam) 14%, transparent); }
+  .cams button.shown .dot { background: var(--cam); }
+  /* The master (sound + clock), when several are shown. */
+  .cams.multi button.master { border-color: var(--cam); box-shadow: inset 0 0 0 1px var(--cam); font-weight: 500; }
+  .head .evtoggle { flex: none; }
+  .badge { font-size: 11px; min-width: 18px; padding: 0 5px; border-radius: 9px; line-height: 18px;
+    background: var(--secondary-background-color); color: var(--secondary-text-color); }
+
+  /* Stage: one 16:9 cell per camera shown; sized by the card to fit the screen. */
+  .stagebox { display: flex; justify-content: center; }
+  .stage { position: relative; background: #000; user-select: none; -webkit-user-select: none; width: 100%; }
+  /* No camera yet (or the list failed): room for the message. */
+  .stage.nocam { aspect-ratio: 16 / 9; max-height: 50vh; }
   .stage.grid { display: grid; grid-template-columns: repeat(var(--cols, 2), 1fr); gap: 2px; }
   .cell { position: relative; overflow: hidden; background: #000; touch-action: pan-y; }
   .cell.zoomed { touch-action: none; }
   .vp { position: relative; transform-origin: center center; will-change: transform; }
+  video::-webkit-media-controls-overlay-play-button, video::-webkit-media-controls-start-playback-button { display: none !important; }
   video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; object-fit: contain; }
-  .stage.single video { max-height: 70vh; }
-  .stage.grid .cell.master { outline: 2px solid var(--primary-color); outline-offset: -2px; z-index: 1; }
+  .stage.grid .cell.master { outline: 2px solid var(--cam, var(--primary-color)); outline-offset: -2px; z-index: 1; }
   .label { position: absolute; left: 6px; bottom: 6px; z-index: 2; padding: 1px 6px; border-radius: 4px;
-    font-size: 11px; color: #fff; background: rgba(0,0,0,.5); pointer-events: none; }
+    font-size: 11px; color: #fff; background: rgba(0,0,0,.55); pointer-events: none; display: flex; align-items: center; gap: 5px; }
+  .label::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--cam); }
   .stage.single .label { display: none; }
   .clock { position: absolute; top: 6px; left: 6px; z-index: 3; padding: 1px 6px; border-radius: 4px;
     background: rgba(0,0,0,.45); color: #fff; font-variant-numeric: tabular-nums; font-size: 12px; pointer-events: none; }
   .stage.noclock .clock { display: none; }
+  .livetag { position: absolute; top: 6px; right: 6px; z-index: 3; padding: 1px 7px; border-radius: 4px; font-size: 11px;
+    font-weight: 600; letter-spacing: .04em; color: #fff; background: #d93025; pointer-events: none; }
 
   /* Fullscreen: the stage fills the screen; a control bar hides when idle. */
-  .stage:fullscreen { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .stage:fullscreen { width: 100vw !important; height: 100vh; display: flex; align-items: center; justify-content: center; }
   .stage.grid:fullscreen { display: grid; grid-template-rows: repeat(var(--rows, 2), 1fr); align-items: stretch; }
   .stage:fullscreen .cell { width: 100%; height: 100%; display: flex; align-items: center; }
   .stage:fullscreen .vp { width: 100%; height: 100%; }
-  .stage:fullscreen video { height: 100%; max-height: none; aspect-ratio: auto; }
+  .stage:fullscreen video { height: 100%; aspect-ratio: auto; }
   .fsbar { display: none; position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 4;
-    gap: 6px; align-items: center; padding: 6px 10px; border-radius: 24px; background: rgba(0,0,0,.55);
+    gap: 4px; align-items: center; padding: 4px 8px; border-radius: 24px; background: rgba(0,0,0,.6);
     transition: opacity .3s; }
   .stage:fullscreen .fsbar { display: flex; }
   .stage.idle .fsbar { opacity: 0; pointer-events: none; }
-  .fsbar button { color: #fff; background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.3); }
+  .fsbar button { color: #fff; }
+  .fsbar button:hover { background: rgba(255,255,255,.15); }
   .fsbar .fsclock { color: #fff; font-size: 13px; font-variant-numeric: tabular-nums; padding: 0 6px; }
 
   /* Loading / error veil: the current frame (or a still of the last one)
@@ -218,58 +296,104 @@ const STYLE = `
   .vtext { font-size: 16px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,.6); max-width: 90%; }
   .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
   .vsub:empty { display: none; }
-  .veil button { color: #fff; background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.45); }
+  .veil button { color: #fff; border-color: rgba(255,255,255,.5); }
   .veil:not(.loading) .spin, .veil.loading ha-icon, .veil:not(.error) button { display: none; }
   .stage.grid .veil { gap: 6px; padding: 8px; }
   .stage.grid .spin { width: 28px; height: 28px; }
   .stage.grid .veil ha-icon { --mdc-icon-size: 28px; }
   .stage.grid .vtext { font-size: 13px; }
-  .stage.grid .vsub { font-size: 11px; }
+  /* In a grid cell the label names the camera and the clock has the time. */
+  .stage.grid .vsub { display: none; }
 
   .warn { padding: 6px 12px; font-size: 13px; color: var(--warning-color, #b58100); }
   .warn:empty { display: none; }
-  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 12px; }
+
+  /* Controls: one row. */
+  .controls { position: relative; display: flex; align-items: center; gap: 2px; padding: 4px 8px; }
+  .controls .live { margin-left: 4px; font-size: 13px; padding: 0 10px; min-height: 30px; }
+  .controls .live.on { border-color: #d93025; background: color-mix(in srgb, #d93025 18%, transparent); }
+  .controls .live ha-icon { --mdc-icon-size: 18px; }
   .spacer { flex: 1; }
-  select, input { font: inherit; color: var(--primary-text-color); background: var(--secondary-background-color);
-    border: 1px solid var(--divider-color); border-radius: 8px; padding: 4px 6px; min-height: 32px; }
-  .tlbar { display: flex; align-items: center; gap: 6px; padding: 0 12px; }
-  .range { flex: 1; text-align: center; font-size: 13px; color: var(--secondary-text-color); }
-  .track { position: relative; height: 56px; margin: 6px 12px 0; touch-action: none; cursor: pointer;
+  select, input { font: inherit; font-size: 13px; color: var(--primary-text-color); background: transparent;
+    border: 1px solid var(--divider-color); border-radius: 8px; padding: 0 4px; min-height: 30px; color-scheme: light dark; }
+  select option { color: var(--primary-text-color); background: var(--ha-card-background, var(--card-background-color, var(--primary-background-color))); }
+  /* The date popover hangs off the controls row (not its button), so it can
+     never be wider than the card: on a phone the input shrinks to fit. */
+  .jump { position: absolute; right: 8px; bottom: calc(100% + 6px); z-index: 6; display: flex; gap: 6px; padding: 8px;
+    max-width: calc(100% - 16px); box-sizing: border-box;
+    border-radius: 12px; background: var(--ha-card-background, var(--card-background-color, var(--primary-background-color)));
+    border: 1px solid var(--divider-color); box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+  .jump .when { flex: 1 1 auto; min-width: 0; }
+  .jump button { flex: none; }
+  @container (max-width: 520px) {
+    .controls .wide { display: none; }
+    .controls .live .txt { display: none; }
+    .controls .live { padding: 0 8px; }
+    .range .long { display: none; }
+    .spans button { padding: 0 7px; }
+    .clock { font-size: 11px; }
+    button.icon { width: 34px; min-width: 34px; height: 34px; }
+  }
+
+  /* Timeline */
+  .tlbar { display: flex; align-items: center; gap: 4px; padding: 0 8px; }
+  .range { flex: 1; min-width: 0; font-size: 12px; color: var(--secondary-text-color); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; padding-left: 4px; }
+  .range .short { display: none; }
+  @container (max-width: 520px) { .range .short { display: inline; } }
+  .spans { display: flex; border: 1px solid var(--divider-color); border-radius: 16px; overflow: hidden; flex: none; }
+  .spans button { border: none; border-radius: 0; min-height: 28px; padding: 0 9px; font-size: 12px; color: var(--secondary-text-color); }
+  .spans button + button { border-left: 1px solid var(--divider-color); }
+  .spans button.on { color: var(--primary-text-color); font-weight: 600; }
+  .tlbar button.icon { width: 30px; min-width: 30px; height: 30px; }
+  .track { position: relative; height: 52px; margin: 4px 12px 10px; touch-action: none; cursor: pointer;
     background: var(--secondary-background-color); border-radius: 6px; user-select: none; }
   .bars { position: absolute; inset: 0; overflow: hidden; border-radius: 6px; }
-  .rec { position: absolute; top: 22px; height: 14px; background: color-mix(in srgb, var(--primary-color) 45%, transparent); }
-  .bm { position: absolute; top: 6px; height: 12px; min-width: 3px; border-radius: 2px;
-    background: var(--accent-color, #ff9800); }
+  .rec { position: absolute; top: 20px; height: 12px; background: color-mix(in srgb, var(--primary-color) 45%, transparent); }
+  @supports not (background: color-mix(in srgb, red 50%, blue)) { .rec { background: var(--primary-color); opacity: .45; } }
   .tick { position: absolute; bottom: 0; height: 6px; border-left: 1px solid var(--divider-color); }
   .tick span { position: absolute; bottom: 6px; left: 3px; font-size: 10px; color: var(--secondary-text-color); white-space: nowrap; }
   .nowm { position: absolute; top: 0; bottom: 0; border-left: 2px dashed var(--error-color, #db4437); }
-  .ph { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--primary-text-color); pointer-events: none; }
+  /* Bookmarks: a pin per event in its camera's colour, with a finger-sized hit area. */
+  .bm { position: absolute; top: 3px; height: 14px; min-width: 4px; border-radius: 3px; background: var(--cam);
+    box-shadow: 0 0 0 1px var(--secondary-background-color); z-index: 1; }
+  .bm::before { content: ""; position: absolute; left: -9px; right: -9px; top: -3px; bottom: -12px; }
+  /* Pins closer than a finger: exact hit areas, so taps between them still seek. */
+  .track.dense .bm::before { left: -1px; right: -1px; bottom: 0; }
+  .bm:hover { filter: brightness(1.2); }
+  .ph { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--primary-text-color); pointer-events: none; z-index: 2; }
   .ph::before { content: ""; position: absolute; top: 0; left: -5px; border: 6px solid transparent; border-top-color: var(--primary-text-color); }
-  .hover { position: absolute; top: -24px; transform: translateX(-50%); padding: 1px 6px; border-radius: 4px;
+  .hover { position: absolute; top: -26px; transform: translateX(-50%); padding: 1px 6px; border-radius: 4px; z-index: 3;
     background: var(--primary-text-color); color: var(--card-background-color, #fff); font-size: 12px; pointer-events: none; white-space: nowrap; }
-  .hover[hidden] { display: none; }
-  .legend { display: flex; gap: 12px; padding: 4px 12px 0; font-size: 12px; color: var(--secondary-text-color); }
-  .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border-radius: 2px; vertical-align: -1px; }
-  /* Event list: bookmarks of every camera, newest first, grouped by day. */
-  .events { border-top: 1px solid var(--divider-color); margin-top: 10px; padding: 10px 12px 12px; }
-  .ev-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
-  .ev-title { font-weight: 500; margin-right: 4px; }
-  .ev-head button { min-height: 28px; padding: 2px 10px; font-size: 13px; }
-  .ev-list { max-height: 420px; overflow-y: auto; }
-  .ev-day { position: sticky; top: 0; z-index: 1; padding: 6px 2px 4px; font-size: 12px; font-weight: 500;
-    color: var(--secondary-text-color); background: var(--card-background-color, var(--ha-card-background, #fff)); }
-  .ev { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 10px; row-gap: 2px;
-    width: 100%; text-align: left; border-radius: 10px; margin-bottom: 4px; padding: 6px 10px; }
-  .ev.on { color: var(--primary-text-color); border-color: var(--primary-color);
-    background: color-mix(in srgb, var(--primary-color) 14%, var(--secondary-background-color)); }
-  .ev .t { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--secondary-text-color); grid-row: span 2; }
-  .ev .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ev .c { grid-column: 2 / 4; font-size: 12px; color: var(--secondary-text-color); overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; }
-  .ev .cam { font-size: 12px; padding: 1px 8px; border-radius: 10px; white-space: nowrap;
-    background: color-mix(in srgb, var(--primary-color) 18%, transparent); }
-  .ev-empty { font-size: 13px; color: var(--secondary-text-color); padding: 6px 2px; }
-  .jump { display: inline-flex; gap: 4px; }
+
+  /* Event list: bookmarks of the cameras shown, newest first, loaded as you scroll. */
+  .side { display: flex; flex-direction: column; min-width: 0; }
+  .ev-head { display: flex; align-items: center; gap: 8px; padding: 10px 8px 6px 12px; }
+  .ev-title { font-weight: 500; }
+  /* Under the video (narrow cards, and browsers without container queries). */
+  .ev-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; overscroll-behavior: contain; max-height: 60vh; }
+  .side { border-top: 1px solid var(--divider-color); }
+  .ev-day { position: sticky; top: 0; z-index: 1; padding: 8px 4px 4px; font-size: 12px; font-weight: 500;
+    color: var(--secondary-text-color); background: var(--ha-card-background, var(--card-background-color, var(--primary-background-color))); }
+  .ev { display: grid; grid-template-columns: 112px minmax(0, 1fr); column-gap: 10px; align-items: center; width: 100%;
+    text-align: left; border: 1px solid transparent; border-radius: 10px; padding: 5px; margin-bottom: 2px; min-height: 0;
+    white-space: normal; }
+  .ev:hover { background: color-mix(in srgb, var(--primary-text-color) 6%, transparent); }
+  .ev.on { border-color: var(--primary-color); background: color-mix(in srgb, var(--primary-color) 14%, transparent); }
+  .thumb { position: relative; width: 112px; aspect-ratio: 16 / 9; border-radius: 6px; overflow: hidden;
+    background: var(--secondary-background-color); display: flex; align-items: center; justify-content: center; }
+  .thumb ha-icon { color: var(--secondary-text-color); --mdc-icon-size: 22px; opacity: .6; }
+  .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .thumb img.bad { display: none; }
+  .thumb .dur { position: absolute; right: 3px; bottom: 3px; font-size: 10px; padding: 0 4px; border-radius: 3px;
+    color: #fff; background: rgba(0,0,0,.6); font-variant-numeric: tabular-nums; }
+  .evt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .evt .n { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .evt .m { font-size: 12px; color: var(--secondary-text-color); display: flex; align-items: center; gap: 5px;
+    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+  .evt .m i { width: 8px; height: 8px; border-radius: 50%; background: var(--cam); flex: none; }
+  .evt .c { font-size: 12px; color: var(--secondary-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev-foot { padding: 10px 4px; font-size: 12px; color: var(--secondary-text-color); text-align: center; }
 `;
 
 /**
@@ -422,7 +546,7 @@ class Player {
     el.className = "cell";
     el.dataset.cell = cameraId;
     el.innerHTML = `
-      <div class="vp"><video muted playsinline preload="auto"></video><canvas class="still"></canvas></div>
+      <div class="vp"><video muted playsinline preload="auto" poster="${BLANK_POSTER}" disablepictureinpicture></video><canvas class="still"></canvas></div>
       ${VEIL_HTML}
       <div class="label">${esc(card._cameraName(cameraId))}</div>`;
     this.video = el.querySelector("video");
@@ -848,13 +972,51 @@ class SSTimelineCard extends HTMLElement {
     this._rate = 1;
     this._tlSeq = 0;
     this._followPausedUntil = 0;
-    this._events = []; // bookmarks of all cameras, newest first; drawn: the shown ones
     this._shown = []; // camera ids on screen, in camera order
     this._prevShown = null; // what the grid button goes back to
-    this._evRange = EVENT_RANGES[0][0];
+    this._evItems = []; // event list: bookmarks of the shown cameras, newest first, as loaded
     this._evSeq = 0;
     this._drag = false;
     this._onFullscreen = () => this._fullscreenChanged();
+    this._evNodes = new Map(); // event id / day -> its element, kept across redraws
+    // Keep the stage sized to the screen (see _fit). A mobile browser's
+    // address bar sliding in and out changes the height by a toolbar's worth
+    // while scrolling; that alone doesn't resize the video.
+    this._onResize = () => {
+      const { innerWidth: w, innerHeight: h } = window;
+      if (w === this._vw && Math.abs(h - this._vh) < 120) return;
+      this._fit();
+    };
+    this._resizeObs = new ResizeObserver(() => requestAnimationFrame(() => this._fit()));
+    // HA came back (e.g. restarted): its playback sessions and thumbnail
+    // links are gone, and events may have been missed meanwhile. HA's own
+    // dashboards usually rebuild their cards on reconnect (this one is then
+    // disconnected by the time the timer fires); a card that stays catches up.
+    this._onReconnect = () => setTimeout(() => this._reconnected(), 1000);
+    // The date/time popover closes on Escape or a tap anywhere else.
+    this._onDocDown = (e) => {
+      if (this._jumpBox && !this._jumpBox.hidden && !e.composedPath().some((n) => n.classList?.contains("jumpwrap")))
+        this._jumpBox.hidden = true;
+    };
+  }
+
+  _reconnected() {
+    if (!this.isConnected || !this._inited) return;
+    if (!this._master) {
+      // Still on "Can't list cameras": try again now that HA is back.
+      if (!this._camsFailed) return; // or still loading them
+      this._inited = false;
+      this._init();
+      return;
+    }
+    const t = this._master.wall();
+    const at = this._wantsLive(t) ? nowS() - LIVE_LAG : t;
+    const playing = this._master.intendsPlay();
+    this._loadTimeline();
+    // New sessions: a seek could stay inside one the server no longer has.
+    this._master.load(at, playing);
+    for (const p of this._players.values()) if (p !== this._master) p.load(at, playing);
+    this._resetEvents();
   }
 
   static getStubConfig() {
@@ -863,7 +1025,9 @@ class SSTimelineCard extends HTMLElement {
 
   setConfig(config) {
     this._config = { span: 3600, ...config };
-    this._span = Number(this._config.span) || 3600;
+    // The nearest of the spans offered.
+    const span = Number(prefs.get("span", Number(this._config.span))) || 3600;
+    this._span = SPANS.map(([v]) => v).reduce((a, b) => (Math.abs(b - span) < Math.abs(a - span) ? b : a));
     const end = nowS() + this._span * 0.05;
     this._view = { start: end - this._span, end };
     this._showClock = prefs.get("clock", this._config.clock !== false);
@@ -871,6 +1035,10 @@ class SSTimelineCard extends HTMLElement {
 
   set hass(hass) {
     const first = !this._hass;
+    if (hass.connection !== this._hass?.connection) {
+      this._hass?.connection?.removeEventListener?.("ready", this._onReconnect);
+      if (this.isConnected) hass.connection?.addEventListener?.("ready", this._onReconnect);
+    }
     this._hass = hass;
     if (first && this.isConnected) this._init();
   }
@@ -885,14 +1053,23 @@ class SSTimelineCard extends HTMLElement {
 
   connectedCallback() {
     if (this._hass && !this._inited) this._init();
-    else if (this._inited && this._resumeAt != null && this._master) {
-      const t = this._resumeAt;
-      this._resumeAt = null;
-      this._seekAll(t, false);
+    else if (this._inited && this._resume && this._master) {
+      // Back on the view: live again if it was live, else where it was.
+      const { t, playing, live } = this._resume;
+      this._resume = null;
+      const at = live ? nowS() - LIVE_LAG : t;
+      this._centerOn(at);
+      this._loadTimeline();
+      this._seekAll(at, playing);
+      this._refreshEvents();
     }
     this._refresh = setInterval(() => this._periodic(), REFRESH_MS);
     this._syncTimer = setInterval(() => this._sync(), SYNC_MS);
     document.addEventListener("fullscreenchange", this._onFullscreen);
+    document.addEventListener("pointerdown", this._onDocDown);
+    window.addEventListener("resize", this._onResize);
+    this._resizeObs?.observe(this);
+    this._hass?.connection?.addEventListener?.("ready", this._onReconnect);
   }
 
   disconnectedCallback() {
@@ -903,8 +1080,15 @@ class SSTimelineCard extends HTMLElement {
     // Leaving the page ends fullscreen, maybe after our listener is gone.
     this._wasFs = false;
     this._stage?.classList.remove("idle");
+    window.removeEventListener("resize", this._onResize);
+    document.removeEventListener("pointerdown", this._onDocDown);
+    this._resizeObs?.disconnect();
+    this._hass?.connection?.removeEventListener?.("ready", this._onReconnect);
     // Whatever state it was in (loading, a gap), pick up there on return.
-    if (this._master) this._resumeAt = this._master.wall();
+    if (this._master) {
+      const t = this._master.wall();
+      this._resume = { t, playing: this._master.intendsPlay(), live: this._wantsLive(t) };
+    }
     for (const p of this._players.values()) {
       p.seq++;
       p.loading = false;
@@ -917,12 +1101,14 @@ class SSTimelineCard extends HTMLElement {
 
   async _init() {
     this._inited = true;
+    this._camsFailed = false;
     this._render();
     let res;
     try {
       res = await this._ws({ type: "surveillance_station/cameras" });
     } catch (e) {
       this._stageMessage("Can't list cameras", "error", errText(e));
+      this._camsFailed = true;
       return;
     }
     this._cameras = res.cameras.filter((c) => c.enabled);
@@ -942,10 +1128,17 @@ class SSTimelineCard extends HTMLElement {
     this._cameraId = cam.id;
     this._buildPlayers();
     this._markCameras();
+    this._resetEvents();
+    // Opening the card plays: live, or the moment a link asked for.
     const start = t > 0 ? t : nowS() - LIVE_LAG;
     this._centerOn(start);
+    if (!this.isConnected) {
+      // Left the view while the cameras were loading: start on return.
+      this._resume = { t: start, playing: true, live: !(t > 0) };
+      return;
+    }
     this._loadTimeline();
-    this._seekAll(start, t > 0);
+    this._seekAll(start, true);
   }
 
   _findCamera(want) {
@@ -976,77 +1169,82 @@ class SSTimelineCard extends HTMLElement {
 
   _render() {
     const root = this.shadowRoot;
+    const icon = (i) => `<ha-icon icon="${i}"></ha-icon>`;
+    const skip = (d, i, cls = "") =>
+      `<button class="icon ${cls}" data-skip="${d}" title="${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s">${icon(i)}</button>`;
     root.innerHTML = `
       <style>${STYLE}</style>
       <ha-card>
-        <div class="head">
-          <div class="chips cams"></div>
-        </div>
-        <div class="stage single">
-          <div class="clock"></div>
-          <div class="stage-msg">${VEIL_HTML}</div>
-          <div class="fsbar">
-            <button class="icon" data-act="play" title="Play / pause"><ha-icon icon="mdi:play"></ha-icon></button>
-            <button data-skip="-30">-30s</button>
-            <button data-skip="-10">-10s</button>
-            <button data-skip="10">+10s</button>
-            <button data-skip="30">+30s</button>
-            <span class="fsclock"></span>
-            <button class="icon" data-act="solo"><ha-icon icon="mdi:view-grid-outline"></ha-icon></button>
-            <button class="icon" data-act="fs" title="Exit fullscreen"><ha-icon icon="mdi:fullscreen-exit"></ha-icon></button>
+        <div class="layout${prefs.get("events", true) ? "" : " noside"}">
+          <div class="main">
+            <div class="head">
+              <div class="cams"></div>
+              <button class="evtoggle" data-act="events" title="Events">${icon("mdi:bookmark-multiple-outline")}<span class="badge evcount"></span></button>
+            </div>
+            <div class="stagebox">
+              <div class="stage single nocam">
+                <div class="clock"></div>
+                <div class="livetag" hidden>LIVE</div>
+                <div class="stage-msg">${VEIL_HTML}</div>
+                <div class="fsbar">
+                  <button class="icon" data-act="play" title="Play / pause">${icon("mdi:play")}</button>
+                  ${skip(-30, "mdi:rewind-30")}${skip(-10, "mdi:rewind-10")}${skip(10, "mdi:fast-forward-10")}${skip(30, "mdi:fast-forward-30")}
+                  <span class="fsclock"></span>
+                  <button class="icon" data-act="solo">${icon("mdi:view-grid-outline")}</button>
+                  <button class="icon" data-act="fs" title="Exit fullscreen">${icon("mdi:fullscreen-exit")}</button>
+                </div>
+              </div>
+            </div>
+            <div class="warn"></div>
+            <div class="controls">
+              <button class="icon" data-act="play" title="Play / pause">${icon("mdi:play")}</button>
+              ${skip(-30, "mdi:rewind-30", "wide")}${skip(-10, "mdi:rewind-10")}${skip(10, "mdi:fast-forward-10")}${skip(30, "mdi:fast-forward-30", "wide")}
+              <select class="speed" title="Playback speed">
+                ${SPEEDS.map((v) => `<option value="${v}">${v}×</option>`).join("")}
+              </select>
+              <button class="live" data-act="live" title="Watch live (about ${LIVE_LAG} s behind)">${icon("mdi:access-point")}<span class="txt">Live</span></button>
+              <span class="spacer"></span>
+              <span class="jumpwrap">
+                <button class="icon" data-act="jump" title="Go to a date and time">${icon("mdi:calendar-clock")}</button>
+                <span class="jump" hidden>
+                  <input type="datetime-local" step="1" class="when" />
+                  <button data-act="go">Go</button>
+                </span>
+              </span>
+              <button class="icon" data-act="solo">${icon("mdi:view-grid-outline")}</button>
+              <button class="icon" data-act="clock" title="Show / hide the time on the video">${icon("mdi:clock-outline")}</button>
+              <button class="icon" data-act="mute" title="Sound">${icon("mdi:volume-off")}</button>
+              <button class="icon" data-act="fs" title="Fullscreen">${icon("mdi:fullscreen")}</button>
+            </div>
+            <div class="tlbar">
+              <button class="icon" data-act="pan-back" title="Earlier">${icon("mdi:chevron-left")}</button>
+              <div class="range"></div>
+              <div class="spans">${SPANS.map(([v, l]) => `<button data-span="${v}">${l}</button>`).join("")}</div>
+              <button class="icon" data-act="pan-fwd" title="Later">${icon("mdi:chevron-right")}</button>
+            </div>
+            <div class="track">
+              <div class="bars"></div>
+              <div class="ph"></div>
+              <div class="hover" hidden></div>
+            </div>
           </div>
-        </div>
-        <div class="warn"></div>
-        <div class="controls">
-          <button class="icon" data-act="play" title="Play / pause"><ha-icon icon="mdi:play"></ha-icon></button>
-          <button data-skip="-30" title="Back 30 s">-30s</button>
-          <button data-skip="-10" title="Back 10 s">-10s</button>
-          <button data-skip="10" title="Forward 10 s">+10s</button>
-          <button data-skip="30" title="Forward 30 s">+30s</button>
-          <select class="speed" title="Playback speed">
-            ${SPEEDS.map((s) => `<option value="${s}">${s}×</option>`).join("")}
-          </select>
-          <button data-act="live" title="Jump to the most recent footage"><ha-icon icon="mdi:access-point"></ha-icon>Latest</button>
-          <span class="spacer"></span>
-          <span class="jump">
-            <input type="datetime-local" step="1" class="when" />
-            <button data-act="go">Go</button>
-          </span>
-          <button class="icon" data-act="solo"><ha-icon icon="mdi:view-grid-outline"></ha-icon></button>
-          <button class="icon" data-act="clock" title="Show / hide the time on the video"><ha-icon icon="mdi:clock-outline"></ha-icon></button>
-          <button class="icon" data-act="mute" title="Sound"><ha-icon icon="mdi:volume-off"></ha-icon></button>
-          <button class="icon" data-act="fs" title="Fullscreen"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
-        </div>
-        <div class="tlbar">
-          <button class="icon" data-act="pan-back" title="Earlier"><ha-icon icon="mdi:chevron-left"></ha-icon></button>
-          <div class="chips spans">
-            ${SPANS.map(([s, l]) => `<button data-span="${s}">${l}</button>`).join("")}
-          </div>
-          <div class="range"></div>
-          <button class="icon" data-act="pan-fwd" title="Later"><ha-icon icon="mdi:chevron-right"></ha-icon></button>
-        </div>
-        <div class="track">
-          <div class="bars"></div>
-          <div class="ph"></div>
-          <div class="hover" hidden></div>
-        </div>
-        <div class="legend">
-          <span><i style="background: color-mix(in srgb, var(--primary-color) 45%, transparent)"></i>Recording</span>
-          <span><i style="background: var(--accent-color, #ff9800)"></i>Bookmark</span>
-        </div>
-        <div class="events">
-          <div class="ev-head">
-            <span class="ev-title">Events</span>
-            <span class="spacer"></span>
-            ${EVENT_RANGES.map(([s, l]) => `<button data-evrange="${s}">${l}</button>`).join("")}
-          </div>
-          <div class="ev-list"></div>
+          <aside class="side">
+            <div class="ev-head">
+              <span class="ev-title">Events</span><span class="badge evtotal"></span>
+              <span class="spacer"></span>
+              <button class="icon" data-act="events" title="Hide events">${icon("mdi:close")}</button>
+            </div>
+            <div class="ev-list"><div class="ev-items"></div><div class="ev-foot"></div></div>
+          </aside>
         </div>
       </ha-card>`;
 
-    const $ = (s) => root.querySelector(s);
+    const $ = (q) => root.querySelector(q);
+    this._layoutEl = $(".layout");
+    this._main = $(".main");
     this._stage = $(".stage");
     this._clock = $(".clock");
+    this._liveTag = $(".livetag");
     this._fsClock = $(".fsclock");
     this._stageVeil = $(".stage-msg .veil");
     this._track = $(".track");
@@ -1055,7 +1253,10 @@ class SSTimelineCard extends HTMLElement {
     this._hover = $(".hover");
     this._rangeEl = $(".range");
     this._evList = $(".ev-list");
+    this._evItemsEl = $(".ev-items");
+    this._evFoot = $(".ev-foot");
     this._when = $(".when");
+    this._jumpBox = $(".jump");
 
     if (hevcSupport() === false) {
       $(".warn").textContent =
@@ -1071,10 +1272,12 @@ class SSTimelineCard extends HTMLElement {
     this._stage.addEventListener("pointerdown", () => this._wakeFsBar());
     this._stage.addEventListener("pointermove", (e) => e.pointerType === "mouse" && this._wakeFsBar());
 
+    // Timeline: drag to scrub, release to seek; a tap on a bookmark pin opens that event.
     const tr = this._track;
     tr.addEventListener("pointerdown", (e) => {
       tr.setPointerCapture(e.pointerId);
       this._drag = true;
+      this._down = { x: e.clientX, bm: e.target.closest("[data-bm]")?.dataset.bm };
       this._showHover(e);
     });
     tr.addEventListener("pointermove", (e) => this._showHover(e));
@@ -1082,7 +1285,10 @@ class SSTimelineCard extends HTMLElement {
       if (!this._drag) return;
       this._drag = false;
       this._hover.hidden = true;
-      this._seekAll(this._timeAt(e), true);
+      const bm = Math.abs(e.clientX - this._down.x) < 6 && this._down.bm;
+      const ev = bm && this._bookmarks.find((x) => String(x.id) === bm);
+      if (ev) this._jumpToEvent(ev);
+      else this._seekAll(this._timeAt(e), true);
     });
     tr.addEventListener("pointercancel", () => {
       this._drag = false;
@@ -1092,27 +1298,62 @@ class SSTimelineCard extends HTMLElement {
       if (!this._drag) this._hover.hidden = true;
     });
 
+    // Events: thumbnails that fail (no recording any more) fall back to the icon;
+    // the next page loads when the end of the list comes near.
+    // A thumbnail that failed shows the icon, and is tried once more a little
+    // later (the NAS may just have been busy); rows live on across refreshes.
+    this._evList.addEventListener(
+      "error",
+      (e) => {
+        const img = e.target;
+        if (img.tagName !== "IMG") return;
+        img.classList.add("bad");
+        if (img.dataset.retried) return;
+        img.dataset.retried = "1";
+        setTimeout(() => img.isConnected && (img.src = img.src), THUMB_RETRY_MS);
+      },
+      true
+    );
+    this._evList.addEventListener("load", (e) => e.target.tagName === "IMG" && e.target.classList.remove("bad"), true);
+    this._evObserver?.disconnect();
+    this._evObserver = new IntersectionObserver(
+      (entries) => entries.some((x) => x.isIntersecting) && this._loadMoreEvents(),
+      { root: this._evList, rootMargin: "300px" }
+    );
+    this._evObserver.observe(this._evFoot);
+    this._evNodes.clear(); // they belonged to the old list element
+    this._jumpBox.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") this._jumpBox.hidden = true;
+    });
+
     this._markSpan();
     this._applyClock();
+    this._resizeObs.observe(this);
   }
 
   _stageMessage(text, kind = "loading", sub = "") {
     setVeil(this._stageVeil, text, kind, sub);
   }
 
+  _camColor(id) {
+    const i = this._cameras.findIndex((c) => c.id === id);
+    return CAM_COLORS[(i < 0 ? 0 : i) % CAM_COLORS.length];
+  }
+
   _renderCameras() {
-    const box = this.shadowRoot.querySelector(".cams");
-    box.innerHTML = this._cameras
-      .map((c) => `<button data-cam="${c.id}"><ha-icon icon="mdi:cctv"></ha-icon>${esc(c.name)}</button>`)
+    this.shadowRoot.querySelector(".cams").innerHTML = this._cameras
+      .map(
+        (c) =>
+          `<button data-cam="${c.id}" style="--cam:${this._camColor(c.id)}" title="Show / hide ${esc(c.name)}"><span class="dot"></span>${esc(c.name)}</button>`
+      )
       .join("");
-    this._markEventFilters();
-    this._loadEvents();
   }
 
   // ---- players / layout ---------------------------------------------------
 
   _makePlayer(id) {
     const p = new Player(this, id);
+    p.el.style.setProperty("--cam", this._camColor(id));
     this._stage.insertBefore(p.el, this._clock);
     return p;
   }
@@ -1148,6 +1389,8 @@ class SSTimelineCard extends HTMLElement {
     this._stage.style.setProperty("--rows", Math.ceil(n / cols));
     this._stage.classList.toggle("grid", n > 1);
     this._stage.classList.toggle("single", n <= 1);
+    this._stage.classList.toggle("nocam", n === 0);
+    requestAnimationFrame(() => this._fit());
     this._setMaster(this._cameraId);
     for (const b of this.shadowRoot.querySelectorAll('[data-act="solo"]')) {
       b.hidden = this._cameras.length < 2;
@@ -1182,12 +1425,14 @@ class SSTimelineCard extends HTMLElement {
     this._syncMuteIcon();
   }
 
-  /** Chips: outlined = shown, filled = the master. */
+  /** Chips: tinted = shown, a ring in its colour = the master (when several are shown). */
   _markCameras() {
+    this.shadowRoot.querySelector(".cams")?.classList.toggle("multi", this._shown.length > 1);
     for (const b of this.shadowRoot.querySelectorAll("[data-cam]")) {
       const id = Number(b.dataset.cam);
-      b.classList.toggle("on", id === this._cameraId);
+      b.classList.toggle("master", id === this._cameraId);
       b.classList.toggle("shown", this._shown.includes(id));
+      b.setAttribute("aria-pressed", String(this._shown.includes(id)));
     }
   }
 
@@ -1215,7 +1460,7 @@ class SSTimelineCard extends HTMLElement {
       this._recs = [];
       this._bookmarks = [];
       this._loadTimeline();
-      this._drawEvents();
+      this._resetEvents();
     }
   }
 
@@ -1351,6 +1596,7 @@ class SSTimelineCard extends HTMLElement {
     }
     // Zoom offsets were computed for the old size.
     for (const p of this._players.values()) p.zoom.reset();
+    if (!fs) this._fit();
   }
 
   _wakeFsBar() {
@@ -1370,27 +1616,35 @@ class SSTimelineCard extends HTMLElement {
       this._toggleCamera(id);
       return;
     }
-    if (!m) return;
+    if (b.dataset.act === "events") {
+      const open = this._layoutEl.classList.toggle("noside") === false;
+      prefs.set("events", open);
+      this._fit();
+      return;
+    }
+    if (!m) {
+      // The camera list failed: try again.
+      if (b.dataset.act === "retry") {
+        this._inited = false;
+        this._init();
+      }
+      return;
+    }
     if (b.dataset.skip) {
       this._seekAll(m.wall() + Number(b.dataset.skip), m.intendsPlay());
       return;
     }
     if (b.dataset.span) {
       this._span = Number(b.dataset.span);
+      prefs.set("span", this._span);
       this._centerOn(m.wall());
       this._markSpan();
       this._loadTimeline();
       return;
     }
     if (b.dataset.ev) {
-      const ev = this._events.find((x) => String(x.id) === b.dataset.ev);
+      const ev = this._evItems.find((x) => String(x.id) === b.dataset.ev);
       if (ev) this._jumpToEvent(ev);
-      return;
-    }
-    if (b.dataset.evrange) {
-      this._evRange = Number(b.dataset.evrange);
-      this._markEventFilters();
-      this._loadEvents();
       return;
     }
     switch (b.dataset.act) {
@@ -1410,9 +1664,17 @@ class SSTimelineCard extends HTMLElement {
         this._seekAll(t, true);
         break;
       }
+      case "jump":
+        this._jumpBox.hidden = !this._jumpBox.hidden;
+        if (!this._jumpBox.hidden) {
+          this._when.value = toLocalInput(m.wall());
+          this._when.focus();
+        }
+        break;
       case "go": {
         const t = new Date(this._when.value).getTime() / 1000;
         if (!Number.isFinite(t)) return;
+        this._jumpBox.hidden = true;
         this._centerOn(t);
         this._loadTimeline();
         this._seekAll(t, true);
@@ -1422,10 +1684,6 @@ class SSTimelineCard extends HTMLElement {
         const p = this._players.get(Number(b.closest(".cell")?.dataset.cell));
         const at = p && p !== this._master ? this._master.wall() : p?.target;
         if (p) (p.retry ?? (() => p.load(at, true)))();
-        else {
-          this._inited = false; // the camera list failed
-          this._init();
-        }
         break;
       }
       case "mute":
@@ -1476,15 +1734,15 @@ class SSTimelineCard extends HTMLElement {
     const shown = [...this._shown];
     const q = { start: Math.floor(start), end: Math.ceil(end) };
     try {
-      // Recordings per camera shown; bookmarks of all cameras in one call
-      // (the same query as the event list), filtered to the shown ones.
+      // Recordings per camera shown; bookmarks from the same (cached) list
+      // the event list pages through, so the two always agree.
       const [b, ...rs] = await Promise.all([
-        this._ws({ type: "surveillance_station/bookmarks", ...q }),
+        this._ws({ type: "surveillance_station/bookmarks", camera_ids: shown, ...q }),
         ...shown.map((id) => this._ws({ type: "surveillance_station/recordings", camera_id: id, ...q })),
       ]);
       if (seq !== this._tlSeq) return;
       this._recs = rs.flatMap((r) => r.recordings);
-      this._bookmarks = b.bookmarks.filter((x) => shown.includes(x.camera_id));
+      this._bookmarks = b.bookmarks;
     } catch (e) {
       // Keep the video usable; say it where the timeline is.
       if (seq === this._tlSeq) this._rangeEl.textContent = `Timeline failed: ${errText(e)}`;
@@ -1501,11 +1759,16 @@ class SSTimelineCard extends HTMLElement {
     const x = (t) => ((t - start) / span) * 100;
     let html = "";
 
-    const step = TICK_STEPS.find((s) => span / s <= 8) ?? TICK_STEPS[TICK_STEPS.length - 1];
-    const tzo = new Date(start * 1000).getTimezoneOffset() * 60;
-    for (let t = Math.ceil((start - tzo) / step) * step + tzo; t <= end; t += step) {
-      const label = step >= 3600 && new Date(t * 1000).getHours() === 0 ? fmtDate(t) : fmtTime(t, false);
-      html += `<div class="tick" style="left:${x(t)}%"><span>${label}</span></div>`;
+    // Ticks as dense as their labels allow: ~48 px for a time, ~64 px for a date.
+    const px = Math.max(this._track.clientWidth, 1);
+    const step =
+      TICK_STEPS.find((v) => (v * px) / span >= (v >= 86400 ? 64 : 48)) ?? TICK_STEPS[TICK_STEPS.length - 1];
+    for (const t of ticksOf(start, end, step)) {
+      const midnight = new Date(t * 1000).getHours() === 0;
+      const label = step >= 86400 || (step >= 3600 && midnight) ? fmtDay(t) : fmtTime(t, false);
+      // A label that would run off the right edge keeps just its tick.
+      const room = x(t) < 100 - (label.length * 6 * 100) / Math.max(this._track.clientWidth, 1);
+      html += `<div class="tick" style="left:${x(t)}%">${room ? `<span>${label}</span>` : ""}</div>`;
     }
     // With several cameras: time where any of them recorded.
     for (const [s, e] of unionOf(this._recs.map((r) => [r.start, r.live ? now : r.end]))) {
@@ -1514,20 +1777,34 @@ class SSTimelineCard extends HTMLElement {
       const b = Math.min(x(e), 100);
       html += `<div class="rec" style="left:${a}%;width:${Math.max(b - a, 0.1)}%"></div>`;
     }
+    let prev = -Infinity;
+    let dense = false;
     for (const bm of this._bookmarks) {
       if (bm.end < start || bm.start > end) continue;
+      const at = (x(bm.start) * px) / 100;
+      if (at - prev < 20) dense = true;
+      prev = at;
       const a = Math.max(x(bm.start), 0);
       const b = Math.min(x(Math.max(bm.end, bm.start)), 100);
-      const cam = this._shown.length > 1 ? `${this._cameraName(bm.camera_id)}: ` : "";
-      const tip = `${fmtTime(bm.start)} ${cam}${bm.name}${bm.comment ? " — " + bm.comment : ""}`;
-      html += `<div class="bm" style="left:${a}%;width:${Math.max(b - a, 0)}%" title="${esc(tip)}"></div>`;
+      const tip = `${fmtTime(bm.start)} ${this._cameraName(bm.camera_id)}: ${bm.name}${bm.comment ? " — " + bm.comment : ""}`;
+      html += `<div class="bm" data-bm="${bm.id}" style="left:${a}%;width:${Math.max(b - a, 0)}%;--cam:${this._camColor(bm.camera_id)}" title="${esc(tip)}"></div>`;
     }
     if (now >= start && now <= end) html += `<div class="nowm" style="left:${x(now)}%" title="Now"></div>`;
     this._bars.innerHTML = html;
+    this._track.classList.toggle("dense", dense);
 
-    this._rangeEl.textContent = `${fmtDate(start)} ${fmtTime(start, false)} – ${
-      fmtDate(end) === fmtDate(start) ? "" : fmtDate(end) + " "
-    }${fmtTime(end, false)}`;
+    // Narrow cards get the dates only, as compact as possible ("Sep 18–25").
+    const a = new Date(start * 1000);
+    const z = new Date(end * 1000);
+    const short =
+      fmtDay(start) === fmtDay(end)
+        ? fmtDay(start)
+        : a.getMonth() === z.getMonth()
+          ? `${fmtDay(start)}–${z.getDate()}`
+          : `${fmtDay(start)}–${fmtDay(end)}`;
+    this._rangeEl.innerHTML = `<span class="long">${fmtDay(start)} ${fmtTime(start, false)} – ${
+      fmtDay(end) === fmtDay(start) ? "" : fmtDay(end) + " "
+    }${fmtTime(end, false)}</span><span class="short">${short}</span>`;
     this._paint(this._currentWall());
   }
 
@@ -1537,79 +1814,210 @@ class SSTimelineCard extends HTMLElement {
 
   // ---- event list -------------------------------------------------------
 
-  async _loadEvents() {
-    const seq = ++this._evSeq;
-    const end = nowS();
+  /** Start the list over (the cameras shown changed, or first load). */
+  _resetEvents() {
+    this._evSeq++;
+    this._evItems = [];
+    this._evMore = true;
+    this._evLoading = false;
+    this._evError = null;
+    this._evTotal = null;
+    // Thumbnail links are valid for about a day; the list is reloaded before.
+    this._evLoadedAt = Date.now();
+    this._drawEvents();
+    this._loadMoreEvents();
+  }
+
+  /** The next page, older than the last event listed. */
+  async _loadMoreEvents() {
+    if (this._evLoading || !this._evMore || !this._shown.length) return;
+    const seq = this._evSeq;
+    const last = this._evItems.at(-1);
+    this._evLoading = true;
+    this._evError = null;
+    this._drawFoot();
     let res;
     try {
       res = await this._ws({
-        type: "surveillance_station/bookmarks",
-        start: Math.floor(end - this._evRange),
-        end: Math.ceil(end),
+        type: "surveillance_station/bookmark_page",
+        camera_ids: this._shown,
+        limit: EVENT_PAGE,
+        ...(last ? { before: last.start, before_id: last.id } : {}),
       });
     } catch (e) {
-      if (seq === this._evSeq) this._evList.innerHTML = `<div class="ev-empty">Couldn't load events: ${esc(errText(e))}</div>`;
+      if (seq === this._evSeq) {
+        this._evLoading = false;
+        this._evError = errText(e); // retried by _periodic
+        this._drawFoot();
+      }
       return;
     }
     if (seq !== this._evSeq) return;
-    this._events = res.bookmarks.reverse(); // newest first
+    this._evLoading = false;
+    const known = new Set(this._evItems.map((x) => x.id));
+    this._evItems.push(...res.bookmarks.filter((x) => !known.has(x.id)));
+    this._evMore = res.more;
+    this._evTotal = res.total;
+    this._drawEvents();
+    // Still room on screen (a tall sidebar): keep going.
+    requestAnimationFrame(() => {
+      const r = this._evList.getBoundingClientRect();
+      const f = this._evFoot.getBoundingClientRect();
+      if (this._evMore && r.height && f.top < r.bottom + 300) this._loadMoreEvents();
+    });
+  }
+
+  /**
+   * Periodic: bring the loaded part of the list up to date with the newest
+   * page. Events are ordered by start, and one can be bookmarked after a
+   * later one (a detection that ended late), so new events are merged in by
+   * time, not just put on top; events deleted in SS go away.
+   */
+  async _refreshEvents() {
+    if (this._evLoading || !this._shown.length) return;
+    if (this._evError || Date.now() - this._evLoadedAt > EVENT_LIST_MAX_AGE_MS) {
+      if (this._evItems.length && !this._evError) this._resetEvents();
+      else this._loadMoreEvents(); // the page that failed, again
+      return;
+    }
+    const seq = this._evSeq;
+    let res;
+    try {
+      res = await this._ws({ type: "surveillance_station/bookmark_page", camera_ids: this._shown, limit: EVENT_PAGE });
+    } catch (e) {
+      return;
+    }
+    if (seq !== this._evSeq || this._evLoading) return;
+    const items = this._evItems;
+    const page = res.bookmarks;
+    // Newest first, as the server orders them.
+    const cmp = (a, b) => b.start - a.start || b.id - a.id;
+    if (res.more && items.length && cmp(page.at(-1), items[0]) < 0) {
+      // More new events than one page (the view was away for a while): the
+      // ones between the page and the list would be unreachable.
+      this._resetEvents();
+      return;
+    }
+    const inPage = new Map(page.map((x) => [x.id, x]));
+    // What the page covers: everything down to its oldest (or all, if it's all there is).
+    const covered = (x) => !res.more || cmp(x, page.at(-1)) <= 0;
+    // Events still there take their current version (renamed / edited in SS).
+    const kept = items.filter((x) => inPage.has(x.id) || !covered(x)).map((x) => inPage.get(x.id) ?? x);
+    const edited = kept.some((x, i) => x !== items[i] && x.name + x.comment + x.end !== items[i].name + items[i].comment + items[i].end);
+    const known = new Set(kept.map((x) => x.id));
+    const oldest = items.at(-1);
+    const added = page.filter((x) => !known.has(x.id) && (!oldest || !this._evMore || cmp(x, oldest) <= 0));
+    const totalChanged = res.total !== this._evTotal;
+    this._evTotal = res.total;
+    if (!items.length) this._evMore = res.more;
+    if (!added.length && kept.length === items.length && !edited) {
+      // "Today" / "Yesterday" move on at midnight.
+      if (totalChanged || this._evDrawnDay !== new Date().toDateString()) this._drawEvents();
+      return;
+    }
+    this._evItems = [...kept, ...added].sort(cmp);
     this._drawEvents();
   }
 
-  _markEventFilters() {
-    const root = this.shadowRoot;
-    for (const b of root.querySelectorAll("[data-evrange]")) {
-      b.classList.toggle("on", Number(b.dataset.evrange) === this._evRange);
-    }
+  _drawFoot() {
+    if (!this._evFoot) return;
+    this._evFoot.textContent = this._evError
+      ? `Couldn't load events: ${this._evError}`
+      : this._evLoading
+        ? "Loading…"
+        : this._evItems.length
+          ? this._evMore ? "" : "No earlier events"
+          : `No bookmarks for ${this._shown.length === 1 ? this._cameraName(this._shown[0]) : "these cameras"}`;
   }
 
+  /**
+   * Show _evItems. Rows are kept across redraws and only moved, added or
+   * removed: a refresh doesn't reload thumbnails (or retry failed ones),
+   * and doesn't disturb focus, hover or a tap in progress.
+   */
   _drawEvents() {
-    const items = this._events.filter((e) => this._shown.includes(e.camera_id));
-    if (!items.length) {
-      const label = EVENT_RANGES.find(([s]) => s === this._evRange)?.[1] ?? "";
-      const which = this._shown.length === 1 ? this._cameraName(this._shown[0]) : "these cameras";
-      this._evList.innerHTML = `<div class="ev-empty">No bookmarks for ${esc(which)} in the last ${label}.</div>`;
-      return;
-    }
+    if (!this._evItemsEl) return;
     const today = new Date().toDateString();
+    this._evDrawnDay = today;
     const yesterday = new Date(Date.now() - 86400000).toDateString();
-    let html = "";
+    const want = [];
+    const keys = new Set();
     let day = null;
-    for (const e of items) {
+    const node = (key, html) => {
+      keys.add(key);
+      let el = this._evNodes.get(key);
+      if (!el) {
+        const tpl = document.createElement("template");
+        tpl.innerHTML = html.trim();
+        el = tpl.content.firstElementChild;
+        this._evNodes.set(key, el);
+      }
+      want.push(el);
+    };
+    for (const e of this._evItems) {
       const d = new Date(e.start * 1000).toDateString();
       if (d !== day) {
         day = d;
-        html += `<div class="ev-day">${d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start)}</div>`;
+        const label = d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start);
+        node(`d:${d}:${label}`, `<div class="ev-day">${label}</div>`);
       }
       const dur = e.end > e.start ? fmtDur(e.end - e.start) : "";
-      html += `<button class="ev" data-ev="${e.id}">
-          <span class="t">${fmtTime(e.start)}</span>
-          <span class="n">${esc(e.name || "(unnamed)")}${dur ? ` <span class="t">· ${dur}</span>` : ""}</span>
-          <span class="cam">${esc(this._cameraName(e.camera_id))}</span>
-          ${e.comment ? `<span class="c">${esc(e.comment)}</span>` : ""}
-        </button>`;
+      const thumb = e.thumbnail ? `<img loading="lazy" decoding="async" alt="" src="${esc(e.thumbnail)}">` : "";
+      node(
+        `e:${e.id}:${e.start}:${e.end}:${e.camera_id}:${e.name}:${e.comment}`,
+        `<button class="ev" data-ev="${e.id}" style="--cam:${this._camColor(e.camera_id)}">
+          <span class="thumb"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
+          <span class="evt">
+            <span class="n">${esc(e.name || "(unnamed)")}</span>
+            <span class="m"><i></i>${esc(this._cameraName(e.camera_id))} · ${fmtTime(e.start)}</span>
+            ${e.comment ? `<span class="c">${esc(e.comment)}</span>` : ""}
+          </span>
+        </button>`
+      );
     }
-    this._evList.innerHTML = html;
+    for (const key of [...this._evNodes.keys()]) if (!keys.has(key)) this._evNodes.delete(key);
+    const box = this._evItemsEl;
+    let cur = box.firstChild;
+    for (const el of want) {
+      if (el === cur) cur = cur.nextSibling;
+      else box.insertBefore(el, cur);
+    }
+    while (cur) {
+      const next = cur.nextSibling;
+      cur.remove();
+      cur = next;
+    }
+    const total = this._evTotal ?? "";
+    for (const q of [".evcount", ".evtotal"]) {
+      const el = this.shadowRoot.querySelector(q);
+      if (el) {
+        el.textContent = total;
+        el.hidden = total === "";
+      }
+    }
+    this._drawFoot();
     this._activeEvent = undefined;
     this._markActiveEvent(this._currentWall());
   }
 
   /** Highlight the events the playhead is in (on the cameras shown). */
   _markActiveEvent(t) {
-    if (!this._evList) return;
-    const ids = this._events
+    if (!this._evItemsEl) return;
+    const ids = (this._evItems ?? [])
       .filter((e) => this._shown.includes(e.camera_id) && t >= e.start - 3 && t <= Math.max(e.end, e.start + 10))
       .map((e) => String(e.id));
     const key = ids.join();
     if (key === this._activeEvent) return;
     this._activeEvent = key;
-    for (const b of this._evList.querySelectorAll(".ev")) b.classList.toggle("on", ids.includes(b.dataset.ev));
+    for (const b of this._evItemsEl.querySelectorAll(".ev")) b.classList.toggle("on", ids.includes(b.dataset.ev));
   }
 
+  /** Play an event: its camera becomes the master, from a little before it. */
   _jumpToEvent(ev) {
-    this._selectCamera(ev.camera_id, ev.start - 3, true); // a little lead-in
-    // On a phone the list is below the fold; bring the video back into view.
-    this._stage.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    this._selectCamera(ev.camera_id, ev.start - 3, true);
+    // On a phone the list is below the video; bring the video back into view.
+    const r = this._stage.getBoundingClientRect();
+    if (r.top < 0 || r.bottom > window.innerHeight) this._stage.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   _timeAt(e) {
@@ -1640,10 +2048,49 @@ class SSTimelineCard extends HTMLElement {
     const { start, end } = this._view;
     this._ph.style.display = t >= start && t <= end ? "" : "none";
     this._ph.style.left = `${((t - start) / (end - start)) * 100}%`;
-    if (document.activeElement !== this._when && this.shadowRoot.activeElement !== this._when) {
-      this._when.value = toLocalInput(t);
-    }
+    const live = this._isLive(t);
+    this._liveTag.hidden = !live;
+    this.shadowRoot.querySelector(".controls .live")?.classList.toggle("on", live);
     this._markActiveEvent(t);
+  }
+
+  /** Where to resume: live if it was playing (or about to play) the newest footage. */
+  _wantsLive(t) {
+    return this._isLive(t) || (!!this._master?.intendsPlay() && nowS() - t < LIVE_LAG + 20);
+  }
+
+  /** Playing (close to) the newest footage of a live playlist. */
+  _isLive(t) {
+    const m = this._master;
+    return !!m?.session?.live && nowS() - t < LIVE_LAG + 20;
+  }
+
+  /**
+   * Size the stage so that everything from the camera chips to the timeline
+   * fits on the screen: the cells keep 16:9 and the grid gets narrower
+   * (centred) when the full width would be too tall.
+   */
+  _fit() {
+    const st = this._stage;
+    if (!st || !this._main || this.shadowRoot.fullscreenElement) return;
+    this._vw = window.innerWidth;
+    this._vh = window.innerHeight;
+    const n = Math.max(this._players.size, 1);
+    const cols = n <= 1 ? 1 : n <= 4 ? 2 : 3;
+    const rows = Math.ceil(n / cols);
+    const gap = n > 1 ? 2 : 0;
+    const width = this._main.clientWidth;
+    if (!width) return;
+    // Everything in the column except the stage, and where the card starts
+    // on the page (below HA's toolbar), capped for cards further down.
+    const chrome = this._main.offsetHeight - st.offsetHeight;
+    const top = Math.min(Math.max(this.getBoundingClientRect().top + window.scrollY, 0), 200);
+    const avail = Math.max(window.innerHeight - top - chrome - 8, MIN_STAGE_HEIGHT);
+    const cellH = (avail - gap * (rows - 1)) / rows;
+    const fitW = (cellH * 16) / 9 * cols + gap * (cols - 1);
+    const w = Math.min(width, Math.floor(fitW));
+    const px = w < width ? `${w}px` : "";
+    if (st.style.width !== px) st.style.width = px;
   }
 
   _onTime() {
@@ -1664,7 +2111,7 @@ class SSTimelineCard extends HTMLElement {
 
   _periodic() {
     if (this._view.end > nowS() - this._span) this._loadTimeline();
-    this._loadEvents();
+    this._refreshEvents();
   }
 }
 

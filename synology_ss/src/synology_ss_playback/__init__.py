@@ -10,7 +10,7 @@ from .client import (
     SSInfo,
     SurveillanceStationClient,
 )
-from .segment import fetch_segment, recordings_from, remove_stale_temp_files
+from .segment import fetch_segment, fetch_snapshot, recordings_from, remove_stale_temp_files
 from .vod import (
     Recording,
     Run,
@@ -34,6 +34,7 @@ __all__ = [
     "Segment",
     "SurveillanceStationClient",
     "fetch_segment",
+    "fetch_snapshot",
     "live_edge",
     "plan_segments",
     "recordings_from",

@@ -8,7 +8,8 @@ recording, HA stream-copies it into fragmented MP4, and the browser decodes the
 original H.265/H.264.
 
 Status: step 1 of a larger plan (integration + test card). Next come an
-Advanced Camera Card engine and notification deep links.
+Advanced Camera Card engine, notification deep links, and Frigate detections
+written as SS bookmarks through the documented `ThirdParty.Bookmark.Create`.
 
 ## Pieces
 
@@ -16,8 +17,8 @@ Advanced Camera Card engine and notification deep links.
 |---|---|
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics |
-| `…/views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…`: playback sessions, the byte-bounded segment cache, the fetch queue |
-| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks`, `/vod`, `/vod_runs` |
+| `…/views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…`: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
+| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/vod`, `/vod_runs` |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
 
 ## Install
@@ -35,17 +36,32 @@ Advanced Camera Card engine and notification deep links.
 4. Add the card to a dashboard (`scripts/dashboard.py` creates a test dashboard
    `/ss-playback` from `dashboards/ss-playback.json`).
 
+To remove it: take the card off your dashboards and delete the entry under
+Settings → Devices & services (deleting the last entry also removes the card's
+Lovelace resource). Then delete `custom_components/surveillance_station`, run
+`docker exec -e PYTHONUSERBASE=/config/deps homeassistant pip uninstall -y
+synology-ss-playback`, and restart HA.
+
 ```yaml
 type: custom:ss-timeline-card
 cameras: [Drive Way, Front Door]   # optional: cameras shown (default: all)
 camera: Drive Way     # optional: the one to start on
-span: 3600            # optional: timeline width in seconds
+span: 3600            # optional: timeline width in seconds (15m .. 7d)
 clock: false          # optional: hide the date/time overlay
 ```
 
+- **Opens playing**: live (about 20 s behind real time, marked LIVE), or the
+  moment a link asked for. Coming back to the view resumes live if it was live.
+- **Fits the screen**: from the camera chips to the timeline, the card sizes
+  the video so it all fits in the window (cells stay 16:9; the grid gets
+  narrower when full width would be too tall). Narrow cards (phones) get one
+  compact row of controls: the ±30 s buttons and the time labels are dropped.
+
 - **Cameras shown**: one camera is the single view, several are a grid
   (2 side by side, 3-4 in 2x2, more in 3 columns). The camera chips add or
-  remove one (outlined = shown, filled = master; the last one stays). The
+  remove one (tinted = shown, a ring in the camera's colour = the master; the
+  last one stays). Each camera has a colour, used for its chip, its cell
+  label, its timeline pins and its event rows. The
   square button shows just the master, and switches back to the previous set.
   Double-tapping a grid cell does the same for that camera. The chips' choice
   is remembered per browser (`localStorage`) and wins over `cameras`.
@@ -53,10 +69,13 @@ clock: false          # optional: hide the date/time overlay
   follow it every 500 ms: a drift over 2 s (more at 4x/8x) is a seek, a smaller
   one over 0.1 s nudges `playbackRate` by up to ±20 %. A camera with no
   recording at that time pauses under a "No recording" veil. Seek / skip /
-  Latest apply to all cameras.
+  Live apply to all cameras.
 - **Timeline and Events cover the cameras shown**: recording bars are the time
   where any of them recorded, and the bookmarks on the timeline and in the
-  list are the same set. To see another camera's events, show it.
+  list come from the same list, so they always agree. To see another camera's
+  events, show it. Timeline spans: 15 min to 7 days.
+- **Bookmark pins** on the timeline open their event when tapped, exactly like
+  tapping the event in the list.
 - **Clock**: the overlay button toggles it; remembered per browser.
 - **Fullscreen**: the stage (video + a slim auto-hiding control bar) goes
   fullscreen and asks for landscape (`screen.orientation.lock`; honoured on
@@ -67,20 +86,26 @@ clock: false          # optional: hide the date/time overlay
   double-tap resets; the mouse wheel zooms in fullscreen. At 1x vertical
   swipes still scroll the page (`touch-action: pan-y`).
 
-Below the timeline, the **Events** list shows the SS bookmarks of the cameras
-shown (last 24 h / 3 d / 7 d, grouped by day). Tapping one makes that camera
-the master and plays from 3 s before it. The event being
-watched is highlighted. SS's own motion detections are not exposed by any
+The **Events** list is a collapsible sidebar on wide cards (≥ 1000 px) and
+sits under the timeline on narrow ones. It holds every SS bookmark of the
+cameras shown, newest first, grouped by day, each with a thumbnail of the
+moment. It loads 30 at a time as you scroll (cursor-paged, so events created
+meanwhile don't shift it). Once a minute it is brought up to date: new events
+are merged in by time (an event can be bookmarked after a later one), events
+deleted in SS go away, and after more than a page of new ones, or 12 h, it
+starts over. Rows are kept across refreshes, so thumbnails aren't reloaded.
+Tapping one
+makes that camera the master and plays from 3 s before it; events under the
+playhead are highlighted. SS's own motion detections are not exposed by any
 documented API (in continuous mode every `Event` is a recording file), so
-bookmarks are the event source; the detection pipeline writes one per
-detection through an SS webhook.
+bookmarks are the event source.
 
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.
 
 A window that reaches the present is **live**: its playlist is an HLS EVENT
 playlist that grows as SS records (segments are only published once they end
-on the 10 s grid behind real time, so they never change afterwards). "Latest"
+on the 10 s grid behind real time, so they never change afterwards). "Live"
 therefore plays continuously about 20 s behind real time. Older windows are
 closed VOD playlists. When one ends, the card looks up the next recording and
 carries on.
@@ -97,6 +122,9 @@ Nothing is written to disk for good, and every buffer has a cap:
 | HA memory | queued segment fetches | cancelled once every client that asked has gone (hls.js aborts on each seek), unless already downloading |
 | HA `/tmp` | one scratch file per remux (ffmpeg needs a seekable input) | deleted when the remux ends; `ss_vod_*.mp4` left by a crash are swept at startup |
 | Browser memory | hls.js buffers | master 30 s ahead + 30 s behind, others 12 + 10 s; about 90 MB for a 4-camera grid |
+| HA memory | event thumbnails (JPEG, 320 px, 10-20 KB) | 16 MB LRU (+256 B per entry, so "nothing recorded" answers count too; those expire after 5 min); 2 made at a time, one job per frame however many ask, cancelled once nobody waits for it |
+| HA memory | the bookmark list of each entry | re-read after 15 s; one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
+| Browser disk | thumbnails | `private, max-age=86400` (a thumbnail of a past moment never changes) |
 | Browser disk | segments | none: served `Cache-Control: no-store` (the URLs are per-session, so a cached copy would never be used again) |
 
 On the NAS, every segment download adds a line to the Surveillance Station
@@ -113,6 +141,19 @@ camera and one time window, and expires 4 hours after its last use (at most
 config entry. Login is a POST, and errors are rebuilt without request URLs, so
 neither the password nor the SS session id reaches logs or browsers.
 
+Event thumbnail URLs (`/api/surveillance_station/thumbnail/…`) work the same
+way, since an `<img>` can't send a header either: the WebSocket hands out URLs
+carrying an expiry (about 24 h) and an HMAC-SHA256 of the path and expiry,
+under a key made at startup. Each opens one JPEG of one camera at one moment.
+Anything unsigned, tampered with or expired is a **404**. HA's own signed
+paths (`async_sign_path`) were used at first and dropped: HA answers a stale
+one (after every HA restart, or after a day) with 401, and counts every 401 as
+a failed login, so a wall tablet left open would get its IP banned under
+`login_attempts_threshold`.
+
+Every HA user can use the card and so see every camera, like HA's own camera
+entities; there is no per-user camera permission.
+
 ## Surveillance Station API notes (verified on SS 9.x, DSM 7)
 
 - `SYNO.SurveillanceStation.Event` `List` v5 returns per-recording
@@ -120,14 +161,40 @@ neither the password nor the SS session id reaches logs or browsers.
 - **`fromTime`/`toTime` filter on a recording's start time, not overlap**, for
   both `Event.List` and `Recording.List`. A 5-minute window in the middle of a
   30-minute file returns nothing. Queries reach back 4 h and filter by overlap.
-- Bookmarks are embedded in `Recording.List` **v5** results (`bookmark[]`, with
-  `timestamp`/`endtime`). There is no list method on `Recording.Bookmark`.
+- Bookmarks: the documented `ThirdParty.Bookmark.List` v1 ([SS 9.3 Web API
+  reference](https://surveillance-api.synology.com/)) returns every bookmark of
+  the given `camIds`, newest first, times as **NAS-local ISO strings without
+  an offset**; `Info.GetInfo` gives the zone (`timezoneTZDB`). Its
+  `startTime`/`endTime` filters are unusable: they act at day granularity with
+  the boundaries in the wrong place (a 14:25-15:00 window on a day with
+  bookmarks at 14:28 and 14:47 returns none). So the integration fetches the
+  full list (cached 15 s) and filters and pages it itself. The undocumented
+  `Recording.Bookmark.ListBookmark` v1 does page properly (`start`/`limit`),
+  but isn't used.
+- A thumbnail is `Recording.Download` of 1.5 s at the moment plus one ffmpeg
+  frame, scaled to 320 px (~0.5 s, 10-20 KB).
 - `Recording.Download` v6 with `offsetTimeMs` + `playTimeMs` returns an MP4 of
   that range. The start is floored to the keyframe (1 s GOP here: offsets of
   20.0, 20.5 and 20.9 s give identical cuts), and the end runs past the request
   (3 s asked → 4.9 s). It works on the file still being recorded, and puts moov
   at the end with no Range support. Errors come back as JSON with HTTP 200.
   Planning therefore uses whole-second boundaries, and ffmpeg `-t` trims the tail.
+
+## Known limitations
+
+- A bookmark in the hour repeated when DST ends is placed in the first of the
+  two (SS lists bookmark times as local times without an offset).
+- The timeline re-lists every shown camera's recordings for the whole span
+  once a minute while it follows the present; at 7 d that is a few `Event.List`
+  pages per camera.
+- A card that must fit a short screen (a phone in landscape, 4 cameras) gets
+  small cells: the chips, controls and timeline need about 230 px. Fullscreen
+  is the way to watch there.
+- The event list's once-a-minute refresh reads the newest page. A bookmark
+  created now for a moment older than the newest 30 shows up when the list
+  starts over (after 12 h, a camera change, or a reload).
+- After HA restarts, HA rebuilds the dashboard, so the card starts over (live)
+  instead of resuming a paused moment.
 
 ## ffmpeg / browser traps found while building this
 

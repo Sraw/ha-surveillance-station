@@ -1,0 +1,117 @@
+# Self-assessment against the HA integration quality scale. This integration
+# has no entities, devices or actions: it serves HLS views, WebSocket commands
+# and a Lovelace card, so the entity rules are exempt.
+rules:
+  # Bronze
+  action-setup:
+    status: exempt
+    comment: No actions.
+  appropriate-polling:
+    status: exempt
+    comment: Nothing is polled; every NAS call answers a card request.
+  brands: done
+  common-modules: done
+  config-flow-test-coverage: done
+  config-flow: done
+  dependency-transparency:
+    status: todo
+    comment: synology-ss-playback is built from this repo, not yet on PyPI.
+  docs-actions:
+    status: exempt
+    comment: No actions.
+  docs-conditions:
+    status: exempt
+    comment: No conditions.
+  docs-high-level-description: done
+  docs-installation-instructions: done
+  docs-removal-instructions: done
+  docs-triggers:
+    status: exempt
+    comment: No triggers.
+  entity-event-setup:
+    status: exempt
+    comment: No entities.
+  entity-unique-id:
+    status: exempt
+    comment: No entities.
+  has-entity-name:
+    status: exempt
+    comment: No entities.
+  runtime-data: done
+  test-before-configure: done
+  test-before-setup: done
+  unique-config-entry: done
+
+  # Silver
+  action-exceptions:
+    status: exempt
+    comment: No actions; WebSocket commands return translated error codes.
+  config-entry-unloading: done
+  docs-configuration-parameters:
+    status: exempt
+    comment: No options flow; the card options are in the README.
+  docs-installation-parameters: done
+  entity-unavailable:
+    status: exempt
+    comment: No entities.
+  integration-owner:
+    status: todo
+    comment: codeowners is set once the repository is published.
+  log-when-unavailable: done
+  parallel-updates:
+    status: exempt
+    comment: No entity platforms.
+  reauthentication-flow: done
+  test-coverage:
+    status: todo
+    comment: 86 % (2026-09-25); the fetch-cancellation and cache-eviction paths lack tests.
+
+  # Gold
+  devices:
+    status: exempt
+    comment: No devices.
+  diagnostics: done
+  discovery-update-info:
+    status: exempt
+    comment: No discovery; the NAS is identified by its serial.
+  discovery:
+    status: exempt
+    comment: DSM's SSDP/zeroconf discovery belongs to the core synology_dsm integration.
+  docs-data-update: done
+  docs-examples: done
+  docs-known-limitations: done
+  docs-supported-devices: done
+  docs-supported-functions: done
+  docs-troubleshooting: done
+  docs-use-cases: done
+  dynamic-devices:
+    status: exempt
+    comment: No devices.
+  entity-category:
+    status: exempt
+    comment: No entities.
+  entity-device-class:
+    status: exempt
+    comment: No entities.
+  entity-disabled-by-default:
+    status: exempt
+    comment: No entities.
+  entity-translations:
+    status: exempt
+    comment: No entities.
+  exception-translations: done
+  icon-translations:
+    status: exempt
+    comment: No entities or actions.
+  reconfiguration-flow: done
+  repair-issues:
+    status: exempt
+    comment: Nothing the user can repair beyond reauth.
+  stale-devices:
+    status: exempt
+    comment: No devices.
+
+  # Platinum
+  async-dependency: done
+  inject-websession: done
+  strict-typing: todo

@@ -36,6 +36,21 @@ async def test_card_registered_as_resource(hass: HomeAssistant, setup_integratio
     assert urls == [f"/surveillance_station_static/{CARD_FILENAME}?v={version}"]
 
 
+async def test_card_resource_follows_the_last_entry(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """Removing the last entry removes the card; adding one back restores it."""
+    resources = hass.data[LOVELACE_DATA].resources
+    assert await hass.config_entries.async_remove(setup_integration.entry_id)
+    await hass.async_block_till_done()
+    assert resources.async_items() == []
+
+    entry = MockConfigEntry(domain=DOMAIN, data=USER_INPUT, unique_id=SERIAL)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(resources.async_items()) == 1
+
 
 async def test_auth_failure_starts_reauth(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock

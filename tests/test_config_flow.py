@@ -106,7 +106,7 @@ async def test_reconfigure_other_nas(
 ) -> None:
     mock_config_entry.add_to_hass(hass)
     result = await mock_config_entry.start_reconfigure_flow(hass)
-    mock_client.info.return_value = SSInfo(serial="OTHER", hostname="other", version="9")
+    mock_client.info.return_value = SSInfo(serial="OTHER", hostname="other", version="9", timezone="UTC")
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {**USER_INPUT, CONF_HOST: "192.0.2.99"})
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "wrong_device"
