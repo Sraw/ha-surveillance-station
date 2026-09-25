@@ -106,6 +106,7 @@ class SurveillanceStationClient:
         self._password = password
         self._sid: str | None = None
         self._login_lock = asyncio.Lock()
+        self._auth_failed: int | None = None
         # Called when a re-login is refused at runtime (password changed).
         self.on_auth_failed: Callable[[], None] | None = None
 
@@ -116,6 +117,11 @@ class SurveillanceStationClient:
         up with one login between them.
         """
         async with self._login_lock:
+            if self._auth_failed is not None:
+                # Credentials were refused once; retrying on every call would
+                # trip DSM's auto-block for this host within minutes. A
+                # successful reauth reloads the entry with a new client.
+                raise SSAuthError("SYNO.API.Auth", "login", self._auth_failed)
             if self._sid is not None and self._sid != stale_sid:
                 return
             # POST so the password never sits in a URL (URLs end up in
@@ -136,6 +142,8 @@ class SurveillanceStationClient:
             if not data.get("success"):
                 code = data.get("error", {}).get("code")
                 if code in AUTH_FAILED_ERRORS:
+                    self._auth_failed = code
+                    self._sid = None
                     if self.on_auth_failed is not None:
                         self.on_auth_failed()
                     raise SSAuthError("SYNO.API.Auth", "login", code)

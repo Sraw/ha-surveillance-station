@@ -112,13 +112,15 @@ class VodManager:
             if client is None:
                 return
             try:
-                infos = await client.recordings(session.camera_id, int(session.planned_end) - 60, int(new_end) + 1)
+                last = session.segments[-1]
+                infos = await client.recordings(
+                    session.camera_id, int(last.wall_start + last.duration) - 60, int(new_end) + 1
+                )
             except SSError as err:
                 _LOGGER.debug("Live playlist not extended: %s", err)
                 return
             # Append-only: whatever was published stays exactly as it was,
             # even if SS reports a file boundary late.
-            last = session.segments[-1]
             added = plan_segments(to_recordings(infos), last.wall_start, new_end, now, after=last)
             session.segments = session.segments + added
             session.planned_end = new_end
