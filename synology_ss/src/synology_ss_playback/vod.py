@@ -1,6 +1,6 @@
 """Turn Surveillance Station recordings into an HLS VOD playlist.
 
-Pure logic, no Home Assistant imports, so it can be unit tested on its own.
+Pure logic (no I/O), unit tested on its own.
 
 Surveillance Station stores continuous recordings as ~30 minute files and can
 cut any time range out of one of them (``Recording.Download`` with
@@ -8,7 +8,7 @@ cut any time range out of one of them (``Recording.Download`` with
 at the end and no Range support, so a browser cannot stream it directly. We
 therefore plan fixed-length segments on the wall clock, fetch each one from
 Surveillance Station on demand and remux it to fragmented MP4 (see
-``views.py``). This module does the planning and the playlist text.
+``segment.py``). This module does the planning and the playlist text.
 """
 
 from __future__ import annotations

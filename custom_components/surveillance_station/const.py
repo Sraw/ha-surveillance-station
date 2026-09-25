@@ -18,8 +18,5 @@ VOD_MAX_WINDOW_SECONDS = 24 * 3600
 # Remuxed segments kept in memory, by size: a 10 s segment is 3.5-6.5 MB for
 # these 4K H.265 streams, so this holds ~20 of them (a few per camera in a grid).
 SEGMENT_CACHE_BYTES = 96 * 1024 * 1024
-# Scratch files ffmpeg reads from (SS puts the moov box at the end).
-TEMP_PREFIX = "ss_vod_"
-REMUX_TIMEOUT_SECONDS = 30
 # Parallel Download+remux jobs against the NAS.
 MAX_PARALLEL_FETCHES = 4

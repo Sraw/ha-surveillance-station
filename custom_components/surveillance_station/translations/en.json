@@ -19,6 +19,18 @@
         "data": {
           "password": "Password"
         }
+      },
+      "reconfigure": {
+        "title": "Surveillance Station",
+        "description": "Change the address or the DSM account. It must be the same NAS.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "ssl": "Use HTTPS",
+          "verify_ssl": "Verify SSL certificate",
+          "username": "Username",
+          "password": "Password"
+        }
       }
     },
     "error": {
@@ -29,7 +41,17 @@
     },
     "abort": {
       "already_configured": "This Surveillance Station is already configured.",
-      "reauth_successful": "Password updated."
+      "reauth_successful": "Password updated.",
+      "reconfigure_successful": "Settings updated.",
+      "wrong_device": "That is a different NAS than the one this entry was set up for."
+    }
+  },
+  "exceptions": {
+    "invalid_auth": {
+      "message": "Surveillance Station rejected the login. Re-enter the password to continue."
+    },
+    "cannot_connect": {
+      "message": "Cannot reach Surveillance Station: {error}"
     }
   }
 }

@@ -6,6 +6,13 @@ import json
 import logging
 from pathlib import Path
 
+from synology_ss_playback import (
+    SSAuthError,
+    SSError,
+    SurveillanceStationClient,
+    remove_stale_temp_files,
+)
+
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.lovelace.const import LOVELACE_DATA
@@ -19,13 +26,14 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.typing import ConfigType
 
 from . import websocket
-from .api import SSAuthError, SSError, SurveillanceStationClient
 from .const import CARD_FILENAME, CONF_VERIFY_SSL, DOMAIN, STATIC_URL
-from .views import VodInitView, VodManager, VodPlaylistView, VodSegmentView, remove_stale_temp_files
+from .views import DATA_MANAGER, VodInitView, VodManager, VodPlaylistView, VodSegmentView
 
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+type SurveillanceStationConfigEntry = ConfigEntry[SurveillanceStationClient]
 
 
 def _version() -> str:
@@ -34,10 +42,10 @@ def _version() -> str:
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the parts shared by all entries: views, WS commands, the card."""
-    manager = VodManager(hass)
     if removed := await hass.async_add_executor_job(remove_stale_temp_files):
         _LOGGER.info("Removed %d stale remux scratch files", removed)
-    hass.data[DOMAIN] = manager
+    manager = VodManager(hass)
+    hass.data[DATA_MANAGER] = manager
     for view in (VodPlaylistView, VodInitView, VodSegmentView):
         hass.http.register_view(view(manager))
     websocket.async_register(hass)
@@ -74,29 +82,38 @@ async def _register_card(hass: HomeAssistant, url: str) -> None:
     await resources.async_create_item({"res_type": "module", "url": url})
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
     data = entry.data
     client = SurveillanceStationClient(
-        async_get_clientsession(hass, verify_ssl=data.get(CONF_VERIFY_SSL, False)),
+        async_get_clientsession(hass, verify_ssl=data[CONF_VERIFY_SSL]),
         data[CONF_HOST],
         data[CONF_PORT],
-        data.get(CONF_SSL, False),
+        data[CONF_SSL],
         data[CONF_USERNAME],
         data[CONF_PASSWORD],
     )
     try:
         await client.login()
+        info = await client.info()
     except SSAuthError as err:
-        raise ConfigEntryAuthFailed(str(err)) from err
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN, translation_key="invalid_auth"
+        ) from err
     except SSError as err:
-        raise ConfigEntryNotReady(str(err)) from err
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"error": str(err)},
+        ) from err
+    if entry.unique_id != info.serial:
+        # Entries from before 0.5 were keyed by host:port.
+        hass.config_entries.async_update_entry(entry, unique_id=info.serial)
     client.on_auth_failed = lambda: entry.async_start_reauth(hass)
-    hass.data[DOMAIN].clients[entry.entry_id] = client
+    entry.runtime_data = client
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    client = hass.data[DOMAIN].clients.pop(entry.entry_id, None)
-    if client is not None:
-        await client.logout()
+async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
+    hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
+    await entry.runtime_data.logout()
     return True

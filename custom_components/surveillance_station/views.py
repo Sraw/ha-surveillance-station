@@ -7,9 +7,10 @@ views themselves need no HA auth header (hls.js cannot add one) - the token
 *is* the capability, handed out only to authenticated WebSocket clients, and
 it expires.
 
-Each segment is fetched on demand: ``Recording.Download`` cuts the range out
-of the recording on the NAS, ffmpeg stream-copies it into fragmented MP4 (no
-transcoding), and the result is split into init + media parts.
+Each segment is fetched on demand (``synology_ss_playback.fetch_segment``:
+``Recording.Download`` cuts the range out of the recording on the NAS, ffmpeg
+stream-copies it into fragmented MP4). This module owns what is HA-specific:
+the sessions, the segment cache and fetch queue, and the HTTP views.
 """
 
 from __future__ import annotations
@@ -17,30 +18,37 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
-import glob
 import logging
-import os
 import secrets
-import tempfile
 import time
 
 from aiohttp import web
+from synology_ss_playback import (
+    Segment,
+    SSConnectionError,
+    SSError,
+    SurveillanceStationClient,
+    fetch_segment,
+    live_edge,
+    plan_segments,
+    recordings_from,
+    render_playlist,
+)
 
 from homeassistant.components.ffmpeg import get_ffmpeg_manager
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.util.hass_dict import HassKey
 
-from .api import SSError, SurveillanceStationClient
 from .const import (
+    DOMAIN,
     MAX_PARALLEL_FETCHES,
-    REMUX_TIMEOUT_SECONDS,
     SEGMENT_CACHE_BYTES,
-    TEMP_PREFIX,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
-from .vod import Recording, Segment, ffmpeg_remux_args, live_edge, plan_segments, render_playlist, split_fmp4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,7 +80,8 @@ class VodManager:
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
-        self.clients: dict[str, SurveillanceStationClient] = {}
+        # Entries whose Surveillance Station is known to be unreachable (logged once).
+        self._unreachable: set[str] = set()
         self._sessions: OrderedDict[str, VodSession] = OrderedDict()
         # key -> (init, media). media_start is part of the key because the
         # fragment timestamps depend on it, so only reloads of the same window
@@ -85,6 +94,43 @@ class VodManager:
         self._waiters: dict[tuple, int] = {}
         self._started: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
+
+    def client(self, entry_id: str) -> SurveillanceStationClient | None:
+        """The logged-in client of a loaded entry."""
+        entry = self.hass.config_entries.async_get_entry(entry_id)
+        if entry is None or entry.domain != DOMAIN or entry.state is not ConfigEntryState.LOADED:
+            return None
+        return entry.runtime_data
+
+    def track(self, entry_id: str, err: Exception | None) -> None:
+        """Log once when Surveillance Station goes away, and once when it's back."""
+        if isinstance(err, SSConnectionError):
+            if entry_id not in self._unreachable:
+                self._unreachable.add(entry_id)
+                _LOGGER.warning("Surveillance Station is unreachable: %s", err)
+        elif err is None and entry_id in self._unreachable:
+            self._unreachable.discard(entry_id)
+            _LOGGER.info("Surveillance Station is reachable again")
+
+    def drop_entry(self, entry_id: str) -> None:
+        """Forget an unloaded entry's sessions and segments."""
+        for token in [t for t, s in self._sessions.items() if s.entry_id == entry_id]:
+            del self._sessions[token]
+        for key in [k for k in self._cache if k[0] == entry_id]:
+            init, media = self._cache.pop(key)
+            self._cache_bytes -= len(init) + len(media)
+        for key, task in list(self._inflight.items()):
+            if key[0] == entry_id:
+                task.cancel()
+        self._unreachable.discard(entry_id)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "sessions": len(self._sessions),
+            "cached_segments": len(self._cache),
+            "cached_bytes": self._cache_bytes,
+            "fetches_in_flight": len(self._inflight),
+        }
 
     def create_session(self, session: VodSession) -> str:
         now = time.time()
@@ -115,7 +161,7 @@ class VodManager:
             new_end = min(live_edge(now), session.max_end)
             if new_end <= session.planned_end:
                 return
-            client = self.clients.get(session.entry_id)
+            client = self.client(session.entry_id)
             if client is None:
                 return
             try:
@@ -124,11 +170,13 @@ class VodManager:
                     session.camera_id, int(last.wall_start + last.duration) - 60, int(new_end) + 1
                 )
             except SSError as err:
+                self.track(session.entry_id, err)
                 _LOGGER.debug("Live playlist not extended: %s", err)
                 return
+            self.track(session.entry_id, None)
             # Append-only: whatever was published stays exactly as it was,
             # even if SS reports a file boundary late.
-            added = plan_segments(to_recordings(infos), last.wall_start, new_end, now, after=last)
+            added = plan_segments(recordings_from(infos), last.wall_start, new_end, now, after=last)
             session.segments = session.segments + added
             session.planned_end = new_end
             if new_end >= session.max_end:
@@ -181,90 +229,25 @@ class VodManager:
         return result
 
     async def _fetch_uncached(self, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
-        client = self.clients.get(entry_id)
+        client = self.client(entry_id)
         if client is None:
             raise SSError("vod", "fetch", None, "Surveillance Station entry is not loaded")
-        started = time.monotonic()
-        # Ask for a little extra; SS rounds to keyframes and ffmpeg -t trims.
-        raw = await client.download(
-            seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000) + 1000
-        )
-        fetched = time.monotonic()
-        data = await self._remux(raw, seg)
-        init, media = split_fmp4(data)
-        if not init or not media:
-            raise SSError("remux", "split", None, f"empty output for segment {seg.index}")
-        _LOGGER.debug(
-            "segment %s rec=%s off=%sms dur=%.1fs: download %.2fs (%d KB), remux %.2fs",
-            seg.index, seg.recording_id, seg.offset_ms, seg.duration,
-            fetched - started, len(raw) // 1024, time.monotonic() - fetched,
-        )
-        return init, media
-
-    async def _remux(self, raw: bytes, seg: Segment) -> bytes:
-        # SS puts the moov box at the end, so ffmpeg needs a seekable file.
-        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
-        proc = None
         try:
-            await self.hass.async_add_executor_job(_write_and_close, fd, raw)
-            proc = await asyncio.create_subprocess_exec(
-                *ffmpeg_remux_args(
-                    get_ffmpeg_manager(self.hass).binary, path, seg.duration, seg.media_start, seg.hevc
-                ),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                async with asyncio.timeout(REMUX_TIMEOUT_SECONDS):
-                    out, err = await proc.communicate()
-            except TimeoutError:
-                raise SSError("ffmpeg", "remux", None, "timed out") from None
-            if proc.returncode != 0:
-                raise SSError("ffmpeg", "remux", proc.returncode, err.decode(errors="replace")[-400:])
-            return out
-        finally:
-            if proc is not None and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            await self.hass.async_add_executor_job(_unlink, path)
+            result = await fetch_segment(client, seg, get_ffmpeg_manager(self.hass).binary)
+        except SSError as err:
+            self.track(entry_id, err)
+            raise
+        self.track(entry_id, None)
+        return result
 
 
-def remove_stale_temp_files() -> int:
-    """Delete scratch files a crash (or a killed container) left behind.
-
-    Every remux unlinks its file when done, so at startup none can be in use.
-    """
-    removed = 0
-    for path in glob.glob(os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}*.mp4")):
-        try:
-            os.unlink(path)
-            removed += 1
-        except OSError:
-            pass
-    return removed
-
-
-def to_recordings(infos) -> list[Recording]:
-    return [Recording(r.id, r.start, r.end, r.mount_id, r.live, r.hevc) for r in infos]
+DATA_MANAGER: HassKey[VodManager] = HassKey(DOMAIN)
 
 
 def _retrieve_exception(task: asyncio.Task) -> None:
     # Everyone waiting may have gone away; don't log "never retrieved".
     if not task.cancelled():
         task.exception()
-
-
-def _write_and_close(fd: int, data: bytes) -> None:
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-
-
-def _unlink(path: str) -> None:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
 
 
 # Every session has its own URLs, so a cached segment is never asked for again
@@ -296,7 +279,9 @@ class _VodBaseView(HomeAssistantView):
     async def _get_parts(self, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
         try:
             return await self.manager.fetch(session, seg)
-        except SSError as err:  # includes connection errors, see api.py
+        except SSConnectionError:
+            raise web.HTTPBadGateway() from None  # logged once by VodManager.track
+        except SSError as err:
             _LOGGER.warning("Segment %s of recording %s failed: %s", seg.index, seg.recording_id, err)
             raise web.HTTPBadGateway() from None
 

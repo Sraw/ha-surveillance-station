@@ -61,6 +61,15 @@ class SSConnectionError(SSError):
 
 
 @dataclass(frozen=True)
+class SSInfo:
+    """Identity of the Surveillance Station host."""
+
+    serial: str  # the NAS serial number: stable across IP / port changes
+    hostname: str
+    version: str
+
+
+@dataclass(frozen=True)
 class Camera:
     id: int
     name: str
@@ -204,6 +213,14 @@ class SurveillanceStationClient:
                 continue
             raise SSError(api, method, code, data.get("error"))
         raise AssertionError("unreachable")
+
+    async def info(self) -> SSInfo:
+        data = await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)
+        v = data.get("version") or {}
+        version = ".".join(str(v[k]) for k in ("major", "minor", "small") if k in v)
+        if "build" in v:
+            version += f"-{v['build']}"
+        return SSInfo(serial=str(data["serial"]), hostname=str(data.get("hostname", "")), version=version)
 
     async def cameras(self) -> list[Camera]:
         data = await self._call("SYNO.SurveillanceStation.Camera", "List", 9)

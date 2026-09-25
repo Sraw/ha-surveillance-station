@@ -1,0 +1,6 @@
+# Integration tests. Pinned to the HA release the integration is developed
+# against (pytest-homeassistant-custom-component 0.13.365 = HA 2026.9.2).
+pytest-homeassistant-custom-component==0.13.365
+# Requirements of the HA components this integration depends on.
+home-assistant-frontend==20260826.7
+ha-ffmpeg==3.2.2

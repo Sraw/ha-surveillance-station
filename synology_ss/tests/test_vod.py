@@ -1,16 +1,14 @@
-"""Tests for the pure VOD planning logic (run: python3 -m unittest discover tests)."""
+"""Tests for the pure VOD planning logic (run: python3 -m unittest discover -s synology_ss/tests)."""
 
 import pathlib
 import struct
 import sys
 import unittest
 
-sys.path.insert(
-    0, str(pathlib.Path(__file__).resolve().parents[1] / "custom_components" / "surveillance_station")
-)
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-import vod  # noqa: E402
-from vod import Recording  # noqa: E402
+from synology_ss_playback import vod  # noqa: E402
+from synology_ss_playback.vod import Recording  # noqa: E402
 
 NOW = 1_000_000.0
 

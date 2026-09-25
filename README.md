@@ -14,19 +14,22 @@ Advanced Camera Card engine and notification deep links.
 
 | Part | What it does |
 |---|---|
-| `api.py` | Async SS Web API client: login (session renewal on 105/106/107/119), cameras, recordings, bookmarks, `Recording.Download` range cuts |
-| `vod.py` | Pure logic: plans 10 s wall-clock-aligned HLS segments over a window, renders the playlist, splits ffmpeg output into init/media parts |
-| `views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` with on-demand fetch, in-flight dedupe and a small LRU |
-| `websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks`, `/vod` |
-| `frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
+| `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
+| `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics |
+| `…/views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…`: playback sessions, the byte-bounded segment cache, the fetch queue |
+| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks`, `/vod`, `/vod_runs` |
+| `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
 
 ## Install
 
 1. Create a dedicated DSM user for HA. It needs Surveillance Station access
    (a viewer-level SS privilege profile that can play back and download
    recordings) and nothing else.
-2. Copy `custom_components/surveillance_station` into HA's `config/custom_components/`
-   (`HA_CONFIG=/path/to/config scripts/deploy.sh`) and restart HA.
+2. `HA_CONFIG=/path/to/config [HA_CONTAINER=homeassistant] scripts/deploy.sh`,
+   then restart HA. It copies the integration into `custom_components/` and
+   installs the library into `<config>/deps` (the user site the HA container
+   puts on `sys.path`), since it isn't on PyPI yet. That install survives HA
+   image updates; after an update to a newer Python, run it again.
 3. Settings → Devices & services → Add → *Surveillance Station Playback*: host,
    port (5000 http / 5001 https), the DSM user.
 4. Add the card to a dashboard (`scripts/dashboard.py` creates a test dashboard
@@ -151,11 +154,20 @@ neither the password nor the SS session id reaches logs or browsers.
 ## Tests
 
 ```
-python3 -m unittest discover -s tests -v
+scripts/test.sh            # all tests, in a Python 3.14 container
+scripts/test.sh -k reauth  # extra pytest arguments
 ```
 
-Unit tests cover the pure planning/playlist logic. The endpoints and the card
-were verified against a live HA 2026.9 + SS setup:
+HA 2026.9 needs Python 3.14, so the tests run in a throwaway container (the
+venv is kept in the docker volume `ss-playback-test-venv`). The integration
+tests use `pytest-homeassistant-custom-component` pinned to the HA release,
+and mock only the library client: config flow (every step and error),
+setup / unload / reauth trigger / unique-ID migration, the WebSocket commands,
+the HLS views (token = credential, `no-store`, one NAS fetch per segment),
+and diagnostics redaction.
+
+The library's unit tests cover the planning/playlist logic. The endpoints and
+the card were verified against a live HA 2026.9 + SS setup:
 - ffprobe read the playlists: timestamps were continuous across recording
   rollovers, and a live playlist grew with its published prefix unchanged.
 - The burned-in camera clock (OSD) matched the requested wall time.

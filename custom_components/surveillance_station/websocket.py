@@ -5,15 +5,22 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from synology_ss_playback import (
+    SSConnectionError,
+    SSError,
+    SurveillanceStationClient,
+    live_edge,
+    plan_segments,
+    recordings_from,
+    runs_from_segments,
+)
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
-from .api import SSConnectionError, SSError, SurveillanceStationClient
 from .const import DOMAIN, VOD_MAX_WINDOW_SECONDS, VOD_SESSION_TTL_SECONDS, VOD_URL
-from .views import VodManager, VodSession, to_recordings
-from .vod import live_edge, plan_segments, runs_from_segments
+from .views import DATA_MANAGER, VodManager, VodSession
 
 # A window whose end is at least this close to now becomes a live session.
 LIVE_THRESHOLD_SECONDS = 60
@@ -28,16 +35,19 @@ def async_register(hass: HomeAssistant) -> None:
 
 
 def _manager(hass: HomeAssistant) -> VodManager:
-    return hass.data[DOMAIN]
+    return hass.data[DATA_MANAGER]
 
 
 def _client(hass: HomeAssistant, entry_id: str | None) -> tuple[str, SurveillanceStationClient]:
-    clients = _manager(hass).clients
-    if not clients:
-        raise KeyError("no Surveillance Station configured")
+    """The asked-for entry's client, or the first loaded one's."""
     if entry_id is None:
-        entry_id = next(iter(clients))
-    return entry_id, clients[entry_id]
+        entries = hass.config_entries.async_loaded_entries(DOMAIN)
+        if not entries:
+            raise KeyError("no Surveillance Station is set up")
+        entry_id = entries[0].entry_id
+    if (client := _manager(hass).client(entry_id)) is None:
+        raise KeyError(f"Surveillance Station entry {entry_id} is not loaded")
+    return entry_id, client
 
 
 def _range(msg: dict[str, Any]) -> tuple[int, int]:
@@ -47,16 +57,33 @@ def _range(msg: dict[str, Any]) -> tuple[int, int]:
     return start, end
 
 
-async def _run(connection: websocket_api.ActiveConnection, msg: dict[str, Any], coro) -> None:
+async def _run(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any], coro
+) -> None:
+    manager = _manager(hass)
+    entry_id = msg.get("entry_id")
     try:
-        connection.send_result(msg["id"], await coro)
+        result = await coro
     except (KeyError, ValueError) as err:
         connection.send_error(msg["id"], websocket_api.ERR_INVALID_FORMAT, str(err))
-    except SSConnectionError:
+        return
+    except SSConnectionError as err:
+        if entry_id or (entry_id := _first_entry_id(hass)):
+            manager.track(entry_id, err)
         connection.send_error(msg["id"], ERR_SS, "Surveillance Station is unreachable")
+        return
     except SSError as err:
         # SSError text is built from API names and SS error codes only.
         connection.send_error(msg["id"], ERR_SS, str(err))
+        return
+    if entry_id or (entry_id := _first_entry_id(hass)):
+        manager.track(entry_id, None)
+    connection.send_result(msg["id"], result)
+
+
+def _first_entry_id(hass: HomeAssistant) -> str | None:
+    entries = hass.config_entries.async_loaded_entries(DOMAIN)
+    return entries[0].entry_id if entries else None
 
 
 @websocket_api.websocket_command(
@@ -71,7 +98,7 @@ async def ws_cameras(hass: HomeAssistant, connection: websocket_api.ActiveConnec
             "cameras": [{"id": c.id, "name": c.name, "enabled": c.enabled} for c in await client.cameras()],
         }
 
-    await _run(connection, msg, go())
+    await _run(hass, connection, msg, go())
 
 
 def _describe(session: VodSession) -> dict[str, Any]:
@@ -109,7 +136,7 @@ async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveCon
             ],
         }
 
-    await _run(connection, msg, go())
+    await _run(hass, connection, msg, go())
 
 
 @websocket_api.websocket_command(
@@ -135,7 +162,7 @@ async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConn
             ]
         }
 
-    await _run(connection, msg, go())
+    await _run(hass, connection, msg, go())
 
 
 @websocket_api.websocket_command({vol.Required("type"): "surveillance_station/vod", **_RANGE_SCHEMA})
@@ -162,7 +189,7 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
         if end <= start:
             raise ValueError("window is in the future")
         infos = await client.recordings(msg["camera_id"], int(start), int(end) + 1)
-        segments = plan_segments(to_recordings(infos), start, end, now)
+        segments = plan_segments(recordings_from(infos), start, end, now)
         if not segments:
             return {"url": None, "runs": [], "start": start, "end": end, "live": False}
         session = VodSession(
@@ -172,7 +199,7 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
         token = _manager(hass).create_session(session)
         return {"url": f"{VOD_URL}/{token}/index.m3u8", **_describe(session)}
 
-    await _run(connection, msg, go())
+    await _run(hass, connection, msg, go())
 
 
 @websocket_api.websocket_command(
@@ -188,4 +215,4 @@ async def ws_vod_runs(hass: HomeAssistant, connection: websocket_api.ActiveConne
             raise KeyError("playback session expired")
         return _describe(session)
 
-    await _run(connection, msg, go())
+    await _run(hass, connection, msg, go())
