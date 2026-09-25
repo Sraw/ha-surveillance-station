@@ -136,6 +136,24 @@ class FrigateBridge:
         self._failing = False
         self._dropping = False
         self._stopped = False
+        # For diagnostics: is anything arriving, and where does it stop?
+        self._counts = {"received": 0, "bookmarked": 0, "announced": 0, "failed": 0, "dropped": 0}
+        self._last_received: float | None = None
+        self._last_error: tuple[float, str] | None = None
+
+    def stats(self) -> dict[str, Any]:
+        """Diagnostics: subscription, counters since start, the last error."""
+        return {
+            "subscribed": self._unsubscribe is not None,
+            "topic": f"{self.topic}/reviews",
+            "objects": sorted(self.objects, key=_rank),
+            "quiet_minutes": self.quiet / 60,
+            "quiet_kinds": sorted(self.quiet_kinds),
+            **self._counts,
+            "queued": self._queue.qsize(),
+            "last_received": self._last_received,
+            "last_error": self._last_error and {"at": self._last_error[0], "error": self._last_error[1]},
+        }
 
     async def start(self) -> bool:
         """Subscribe (False: MQTT isn't available); stop() undoes it."""
@@ -168,12 +186,15 @@ class FrigateBridge:
             return
         if not (isinstance(review, dict) and isinstance(review.get("after"), dict)):
             return
+        self._counts["received"] += 1
+        self._last_received = time.time()
         try:
             self._queue.put_nowait(review)
         except asyncio.QueueFull:
             # SS stuck for a long while: newer reviews matter more.
             self._queue.get_nowait()
             self._queue.put_nowait(review)
+            self._counts["dropped"] += 1
             if not self._dropping:
                 self._dropping = True
                 _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; dropping the oldest")
@@ -200,6 +221,8 @@ class FrigateBridge:
                 self._dropping = False
 
     def _fail(self, err: Exception) -> None:
+        self._counts["failed"] += 1
+        self._last_error = (time.time(), repr(err))
         if isinstance(err, SSError):
             self.manager.track(self.entry_id, err)
         if not self._failing:
@@ -253,6 +276,7 @@ class FrigateBridge:
             bm = await self.client.create_bookmark(camera_id, name, start, end, comment)
             tracked = _Tracked(bm.id, camera_id, name, comment, start, end)
             self._remember(review_id, tracked)
+            self._counts["bookmarked"] += 1
             self.manager.forget_bookmarks(self.entry_id)
             # One only heard of at its end (Home Assistant was down), or long
             # after it began (SS was unreachable, a restart mid-review), gets
@@ -339,6 +363,7 @@ class FrigateBridge:
                 self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
             )
             self.hass.bus.async_fire(DETECTION_EVENT, payload)
+            self._counts["announced"] += 1
 
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")
         self._announcing.add(task)

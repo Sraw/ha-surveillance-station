@@ -1,4 +1,4 @@
-"""Diagnostics: the entry's settings (credentials redacted), what SS reports, and playback state."""
+"""Diagnostics: the entry's settings (credentials redacted), what SS reports, playback and Frigate state."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import SurveillanceStationConfigEntry
+from .frigate import DATA_FRIGATE
 from .views import DATA_MANAGER
 
 TO_REDACT = {CONF_HOST, CONF_PASSWORD, CONF_USERNAME, "serial", "unique_id"}
@@ -34,6 +35,7 @@ async def async_get_config_entry_diagnostics(
             "entry": {"unique_id": entry.unique_id, "data": dict(entry.data)},
             "surveillance_station": surveillance_station,
             "playback": hass.data[DATA_MANAGER].stats(),
+            "frigate": bridge.stats() if (bridge := hass.data.get(DATA_FRIGATE, {}).get(entry.entry_id)) else None,
         },
         TO_REDACT,
     )

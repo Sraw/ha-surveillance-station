@@ -26,7 +26,7 @@ from custom_components.surveillance_station.const import (
     DETECTION_EVENT,
     DOMAIN,
 )
-from custom_components.surveillance_station.frigate import FrigateBridge, bookmark_comment, bookmark_name, camera_key
+from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge, bookmark_comment, bookmark_name, camera_key
 from custom_components.surveillance_station.views import DATA_MANAGER, VodManager
 from homeassistant.core import HomeAssistant
 
@@ -213,6 +213,13 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
         await hass.async_block_till_done()
         assert client.create_bookmark.await_count == 2
         assert [e.data["review_id"] for e in events] == ["a3"]
+        stats = hass.data[DATA_FRIGATE][entry.entry_id].stats()
+        assert stats["subscribed"] and stats["topic"] == "nvr/reviews"
+        # "not json" and the other topic never count; a1 failed, a3 made it.
+        assert {k: stats[k] for k in ("received", "bookmarked", "announced", "failed", "dropped", "queued")} == {
+            "received": 2, "bookmarked": 1, "announced": 1, "failed": 1, "dropped": 0, "queued": 0,
+        }
+        assert "Create" in stats["last_error"]["error"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

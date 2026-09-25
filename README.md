@@ -16,7 +16,7 @@ bookmarks (with an event to notify from).
 | Part | What it does |
 |---|---|
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
-| `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics |
+| `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics (including the Frigate bridge: subscribed?, reviews received / bookmarked / announced / failed, last error) |
 | `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
 | `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*) |
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE) |
@@ -336,6 +336,12 @@ entities; there is no per-user camera permission.
   bytes), and anything older than that hour is 400 again. So thumbnails come
   from `Recording.Download` + ffmpeg. `ThirdParty/Recording/Download` returns a
   zip, whole seconds only, so segments use `Recording.Download` v6 (ms offsets).
+- `Info.GetInfo` v8 can answer success **without** `serial` (seen once, right
+  after an HA restart; fine again moments later). The library raises `SSError`
+  for that, so setup is retried (`ConfigEntryNotReady`) instead of the entry
+  being left in `setup_error`, which silently stops bookmarks, notifications
+  and playback. A missing `timezoneTZDB` means UTC, but is asked again on the
+  next bookmark call rather than cached.
 - Bookmarks: the documented `ThirdParty.Bookmark.List` v1 ([SS 9.3 Web API
   reference](https://surveillance-api.synology.com/)) returns every bookmark of
   the given `camIds`, newest first, times as **NAS-local ISO strings without

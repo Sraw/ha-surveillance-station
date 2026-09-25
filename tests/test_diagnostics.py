@@ -18,3 +18,4 @@ async def test_diagnostics(
     assert diag["surveillance_station"]["info"]["version"] == "9.3.0-12143"
     assert [c["name"] for c in diag["surveillance_station"]["cameras"]] == ["Drive Way", "Backyard"]
     assert diag["playback"]["sessions"] == 0
+    assert diag["frigate"] is None  # not enabled

@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.9.4";
+const CARD_VERSION = "0.9.5";
 
 const SPANS = [
   [900, "15m"],
