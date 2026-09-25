@@ -37,7 +37,7 @@ async def test_waiters_share_one_fetch(hass: HomeAssistant, setup_integration: M
         a = asyncio.create_task(manager.fetch(session, session.segments[0]))
         b = asyncio.create_task(manager.fetch(session, session.segments[0]))
         await asyncio.sleep(0)
-        # One of the two callers gives up (hls.js aborts on a seek): the
+        # One of the two callers gives up (a player aborts on a seek): the
         # download already reached the NAS, so it keeps going for the other.
         a.cancel()
         gate.set()

@@ -1,9 +1,12 @@
-"""HLS VOD endpoints backed by Surveillance Station recordings.
+"""HTTP views: SS's stream relay, event thumbnails, and HLS VOD endpoints.
 
-Flow: the card asks (over the authenticated WebSocket) for a playback window;
+The card plays video from SS's own stream (LiveStreamView), live or recorded,
+wherever the browser has MSE. The HLS endpoints serve browsers without it.
+
+HLS flow: the card asks (over the authenticated WebSocket) for a playback window;
 ``VodManager.create_session`` plans the segments and returns an unguessable
 token. The playlist and every segment URL live under that token, so the HTTP
-views themselves need no HA auth header (hls.js cannot add one) - the token
+views themselves need no HA auth header (a <video> cannot add one) - the token
 *is* the capability, handed out only to authenticated WebSocket clients, and
 it expires.
 
@@ -21,6 +24,7 @@ import hmac
 from collections import OrderedDict
 from dataclasses import dataclass, field
 import logging
+import re
 import secrets
 import time
 
@@ -126,7 +130,7 @@ class VodManager:
         self._bookmark_tasks: dict[str, asyncio.Task] = {}
         # Live streams: unused tokens -> (entry_id, camera_id, expires), and
         # the relays running (entry_id, browser socket).
-        self._live_tokens: dict[str, tuple[str, int, float]] = {}
+        self._live_tokens: dict[str, tuple[str, int, float | None, float]] = {}
         self.live_streams: set[tuple[str, web.WebSocketResponse]] = set()
 
     def client(self, entry_id: str) -> SurveillanceStationClient | None:
@@ -302,20 +306,21 @@ class VodManager:
         if (old := self._thumbs.pop(key, None)) is not None:
             self._thumbs_bytes -= len(old[1]) + THUMBNAIL_ENTRY_BYTES
 
-    def create_live_token(self, entry_id: str, camera_id: int) -> str:
+    def create_live_token(self, entry_id: str, camera_id: int, at: float | None = None) -> str:
+        """A single-use token for a camera's stream: real time, or recordings from ``at``."""
         now = time.time()
-        for token in [t for t, v in self._live_tokens.items() if v[2] < now]:
+        for token in [t for t, v in self._live_tokens.items() if v[3] < now]:
             del self._live_tokens[token]
         token = secrets.token_urlsafe(32)
-        self._live_tokens[token] = (entry_id, camera_id, now + LIVE_TOKEN_TTL_SECONDS)
+        self._live_tokens[token] = (entry_id, camera_id, at, now + LIVE_TOKEN_TTL_SECONDS)
         return token
 
-    def take_live_token(self, token: str) -> tuple[str, int] | None:
-        """The (entry_id, camera_id) of an unused, unexpired token; it is used up."""
+    def take_live_token(self, token: str) -> tuple[str, int, float | None] | None:
+        """(entry_id, camera_id, at) of an unused, unexpired token; it is used up."""
         found = self._live_tokens.pop(token, None)
-        if found is None or found[2] < time.time():
+        if found is None or found[3] < time.time():
             return None
-        return found[0], found[1]
+        return found[:3]
 
     def create_session(self, session: VodSession) -> str:
         now = time.time()
@@ -375,8 +380,8 @@ class VodManager:
             return self._cache[key]
         task = self._inflight.get(key)
         if task is None or task.cancelling():
-            # The fetch runs as its own task so a client abort (hls.js aborts
-            # on every seek) neither kills the work nor the other requests
+            # The fetch runs as its own task so a client abort (a player may
+            # abort on every seek) neither kills the work nor the other requests
             # waiting for the same segment; a retry then finds it cached.
             # Not eager: a task that finished inside the call (an error before
             # the first await) would clear its _inflight slot before it was
@@ -439,7 +444,9 @@ class LiveStreamView(HomeAssistantView):
     for the VOD views); HA opens the documented SS stream socket with its own
     session and passes the messages through unchanged. The SS session id
     never reaches the browser, and the stream works wherever HA is reachable.
-    Nothing the browser sends is passed on.
+    The browser may only steer playback: ``time=<epoch>``, ``pause=true|false``
+    and ``speed=<0.5|1|2|4|8|16>`` (the card's speeds, and 16 to get over a
+    hole in a recording) are passed on, nothing else.
     """
 
     requires_auth = False
@@ -452,7 +459,7 @@ class LiveStreamView(HomeAssistantView):
     async def get(self, request: web.Request, token: str) -> web.StreamResponse:
         if (found := self.manager.take_live_token(token)) is None:
             raise web.HTTPNotFound()
-        entry_id, camera_id = found
+        entry_id, camera_id, at = found
         # No heartbeat: video flows all the time, and the browser's
         # keep-alives (or their absence) tell whether it is still there.
         browser = web.WebSocketResponse(max_msg_size=4096)
@@ -468,7 +475,7 @@ class LiveStreamView(HomeAssistantView):
         upstream = None
         try:
             try:
-                upstream, first = await client.open_live(camera_id)
+                upstream, first = await client.open_live(camera_id, at=at)
             except SSError as err:
                 self.manager.track(entry_id, err)
                 _LOGGER.debug("Live stream of camera %s failed: %s", camera_id, err)
@@ -486,11 +493,15 @@ class LiveStreamView(HomeAssistantView):
         return browser
 
 
+# What the browser may tell SS's stream: jump (epoch seconds), pause, speed.
+_STREAM_COMMAND = re.compile(r"time=[0-9]{9,11}|pause=(?:true|false)|speed=(?:0\.5|1|2|4|8|16)")
+
+
 async def _relay(upstream: aiohttp.ClientWebSocketResponse, browser: web.WebSocketResponse) -> None:
     """Pass SS's messages on until either side goes.
 
-    HA keeps SS's stream alive itself; the browser's keep-alives only show
-    that it's still there (a phone that dropped off Wi-Fi sends no reset, and
+    HA keeps SS's stream alive itself; the browser's messages (keep-alives,
+    or the playback commands passed on) show that it's still there (a phone that dropped off Wi-Fi sends no reset, and
     the relay would otherwise hold the stream until TCP gives up).
     """
 
@@ -508,6 +519,8 @@ async def _relay(upstream: aiohttp.ClientWebSocketResponse, browser: web.WebSock
             msg = await browser.receive(timeout=LIVE_IDLE_SECONDS)
             if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 return
+            if msg.type == aiohttp.WSMsgType.TEXT and _STREAM_COMMAND.fullmatch(msg.data):
+                await upstream.send_str(msg.data)
 
     async def keep_alive() -> None:
         while True:
@@ -548,7 +561,7 @@ def _retrieve_exception(task: asyncio.Task) -> None:
 
 # Every session has its own URLs, so a cached segment is never asked for again
 # once its session is gone; storing it would only fill the client's disk cache
-# (~2 GB per hour of a 4-camera grid). hls.js keeps what it needs in memory.
+# (~2 GB per hour of a 4-camera grid). The player keeps what it needs in memory.
 _NO_STORE = {"Cache-Control": "no-store"}
 
 

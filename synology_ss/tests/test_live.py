@@ -39,6 +39,13 @@ async def test_streams() -> None:
     assert "ss_webstream_task/?camId=10&_sid=sid1" in session.ws_connect.await_args.args[0]
 
 
+async def test_playback_from_a_time() -> None:
+    """Epoch seconds, whole: SS reads a bare local time an hour off in DST."""
+    client, session = _client([_ws(DATA)])
+    await client.open_live(10, at=1790000000.7)
+    assert session.ws_connect.await_args.args[0].endswith("camId=10&_sid=sid1&time=1790000000")
+
+
 async def test_expired_sid_logs_in_again_once() -> None:
     refused, ok = _ws(CLOSED), _ws(DATA)
     client, session = _client([refused, ok])

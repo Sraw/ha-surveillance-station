@@ -187,9 +187,16 @@ class SurveillanceStationClient:
         self._sid = None
 
     async def open_live(
-        self, camera_id: int, heartbeat: float = 30
+        self, camera_id: int, heartbeat: float = 30, at: float | None = None
     ) -> tuple[aiohttp.ClientWebSocketResponse, aiohttp.WSMessage]:
-        """Connect to a camera's real-time stream; returns the socket and its first message.
+        """Connect to a camera's stream; returns the socket and its first message.
+
+        Real time, or with ``at`` (epoch seconds) the recordings from then on:
+        SS starts at the keyframe before ``at``, skips ahead over gaps to the
+        next recording, and paces the frames in real time (``speed=N`` and
+        ``pause=true|false`` messages change that; ``time=<epoch>`` jumps).
+        The time goes as epoch seconds: a bare local time is read an hour off
+        during DST.
 
         The documented WebSocket stream (``/ss_webstream_task/``, see the SS
         Web API "Liveview / Playback" page): binary messages of a 4-byte
@@ -209,7 +216,8 @@ class SurveillanceStationClient:
             sid = self._sid
             try:
                 ws = await self._session.ws_connect(
-                    f"{base}/ss_webstream_task/?camId={int(camera_id)}&_sid={sid}",
+                    f"{base}/ss_webstream_task/?camId={int(camera_id)}&_sid={sid}"
+                    + ("" if at is None else f"&time={int(at)}"),
                     heartbeat=heartbeat,
                     max_msg_size=0,
                     timeout=aiohttp.ClientWSTimeout(ws_close=5),

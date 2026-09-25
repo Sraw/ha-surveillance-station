@@ -46,9 +46,11 @@ def _msg(header: str, payload: bytes = b"") -> bytes:
     return (4 + len(h)).to_bytes(4, "big") + h + payload
 
 
-async def _live_url(hass: HomeAssistant, hass_ws_client: WebSocketGenerator, camera_id: int = 10) -> str:
+async def _live_url(
+    hass: HomeAssistant, hass_ws_client: WebSocketGenerator, camera_id: int = 10, **extra
+) -> str:
     ws = await hass_ws_client(hass)
-    await ws.send_json_auto_id({"type": "surveillance_station/live", "camera_id": camera_id})
+    await ws.send_json_auto_id({"type": "surveillance_station/live", "camera_id": camera_id, **extra})
     return (await ws.receive_json())["result"]["url"]
 
 
@@ -59,7 +61,7 @@ async def test_relay(
     hass_ws_client: WebSocketGenerator,
     hass_client_no_auth: ClientSessionGenerator,
 ) -> None:
-    """Messages pass through unchanged; nothing goes back; the token works once."""
+    """Messages pass through unchanged; the token works once."""
     info = _msg("vdoCodec=H265&adoCodec=MPEG4-GENERIC")
     frame = _msg("mediaType=1&msec=1790000000000&key=1", b"moof+mdat")
     upstream = FakeUpstream([frame])
@@ -76,7 +78,7 @@ async def test_relay(
         assert hass.data[DATA_MANAGER].stats()["live_streams"] == 1
         await upstream.close()  # SS ends the stream: so does the relay
         assert (await ws.receive()).type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED)
-    mock_client.open_live.assert_awaited_once_with(10)
+    mock_client.open_live.assert_awaited_once_with(10, at=None)
     assert upstream.sent == []  # HA keeps SS alive on its own timer
     await asyncio.sleep(0.05)
     assert hass.data[DATA_MANAGER].stats()["live_streams"] == 0
@@ -150,3 +152,49 @@ async def test_plain_get_and_idle_browser(
     await asyncio.sleep(0.05)
     assert upstream.closed
     assert hass.data[DATA_MANAGER].stats()["live_streams"] == 0
+
+
+async def test_playback_commands(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A playback stream starts at the time asked; only the steering commands reach SS."""
+    upstream = FakeUpstream([])
+    mock_client.open_live = AsyncMock(
+        return_value=(upstream, aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, _msg("vdoCodec=H265"), None))
+    )
+    url = await _live_url(hass, hass_ws_client, time=1790000000.5)
+    client = await hass_client_no_auth()
+    passed = ["time=1790000100", "pause=true", "pause=false", "speed=0.5", "speed=8", "speed=16"]
+    refused = [
+        "keepAlive",
+        "time=2026-01-01T00:00:00",
+        "time=1790000100&camId=3",
+        "time=1790000100\n",
+        "speed=3",
+        "pause=1",
+        "_sid=x",
+        "time=\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669\u0660",  # Arabic-Indic digits
+        "time=\uff11\uff17\uff19\uff10\uff10\uff10\uff10\uff10\uff10\uff10",  # full-width
+    ]
+    async with client.ws_connect(url) as ws:
+        await ws.receive_bytes()
+        for s in refused + passed:
+            await ws.send_str(s)
+        await ws.send_bytes(b"time=1790000100")
+        await asyncio.sleep(0.05)
+        await upstream.close()
+    mock_client.open_live.assert_awaited_once_with(10, at=1790000000.5)
+    assert upstream.sent == passed
+
+
+async def test_bad_playback_time(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    for bad in (-5, 1e300, "inf", "nan"):
+        await ws.send_json_auto_id({"type": "surveillance_station/live", "camera_id": 10, "time": bad})
+        assert not (await ws.receive_json())["success"], bad

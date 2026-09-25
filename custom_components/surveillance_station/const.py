@@ -5,7 +5,7 @@ DOMAIN = "surveillance_station"
 CONF_VERIFY_SSL = "verify_ssl"
 DEFAULT_PORT = 5000
 
-# Where the bundled Lovelace card and hls.js are served from.
+# Where the bundled Lovelace card is served from.
 STATIC_URL = "/surveillance_station_static"
 CARD_FILENAME = "ss-timeline-card.js"
 

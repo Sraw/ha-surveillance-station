@@ -241,15 +241,22 @@ def _bookmark(b: Bookmark, thumbnail: str | None = None) -> dict[str, Any]:
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): "surveillance_station/live", vol.Optional("entry_id"): str, vol.Required("camera_id"): vol.Coerce(int)}
+    {
+        vol.Required("type"): "surveillance_station/live",
+        vol.Optional("entry_id"): str,
+        vol.Required("camera_id"): vol.Coerce(int),
+        # Epoch seconds: play the recordings from then on. Omitted: real time.
+        vol.Optional("time"): vol.All(vol.Coerce(float), vol.Range(min=0, max=2**32)),
+    }
 )
 @websocket_api.async_response
 async def ws_live(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
-    """A single-use URL for a camera's real-time stream (a WebSocket, see LiveStreamView)."""
+    """A single-use URL for a camera's stream (a WebSocket, see LiveStreamView)."""
 
     async def go():
         entry_id, _ = _client(hass, msg.get("entry_id"))
-        return {"url": f"{LIVE_URL}/{_manager(hass).create_live_token(entry_id, msg['camera_id'])}"}
+        token = _manager(hass).create_live_token(entry_id, msg["camera_id"], msg.get("time"))
+        return {"url": f"{LIVE_URL}/{token}"}
 
     await _run(hass, connection, msg, go())
 
