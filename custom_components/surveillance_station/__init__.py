@@ -31,10 +31,12 @@ from .const import (
     CONF_FRIGATE,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_QUIET,
+    CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_QUIET_KINDS,
     DEFAULT_FRIGATE_QUIET_MINUTES,
     DEFAULT_FRIGATE_TOPIC,
     DOMAIN,
@@ -157,6 +159,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             set(options.get(CONF_FRIGATE_OBJECTS) or DEFAULT_FRIGATE_OBJECTS),
             options.get(CONF_FRIGATE_LINK) or "",
             options.get(CONF_FRIGATE_QUIET, DEFAULT_FRIGATE_QUIET_MINUTES),
+            set(options.get(CONF_FRIGATE_QUIET_KINDS, DEFAULT_FRIGATE_QUIET_KINDS)),
         )
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.

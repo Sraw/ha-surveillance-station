@@ -194,12 +194,16 @@ event list, and in DS cam / the SS client. Every animal is called "Animal".
   the one Frigate picked as showing the object best (`thumb_time`), and it
   is also the bookmark's thumbnail in the card (kept up to date as Frigate
   picks a better one); the link still starts at the review's beginning.
-- **Quiet period** (option, 5 min by default): no event for a review when
-  the same camera had a bookmarked review of the same kinds (Person, Car,
-  Animal) active within it, the dog that wandered off and came back; it is
-  still bookmarked. A new kind (a person joining the dog) is announced.
+- **Quiet period** (options: 5 min, for animals by default; cars can be
+  added; **people never**): no event for a review whose kinds are all quiet
+  ones seen on the same camera within it, the dog that wandered off and came
+  back; it is still bookmarked. A person, or a kind not seen lately, is
+  always announced: a second person arriving is exactly what to hear about.
   Frigate's own `review.*.cutoff_time` decides when an absence splits a
-  review in the first place (40 / 30 s by default; 120 s here).
+  review in the first place (alerts 40 s, detections 30 s by default). Here
+  detections (dogs, cats) are at 120 s; alerts (people, cars) stay at 40 s,
+  since a longer one folds a second person arriving within it into the
+  first's review, and so into its one notification.
 - One event per review, when it first qualifies, with the objects seen by
   then: a car that a person later gets out of was announced as "Car". A
   review bookmarked more than 2 minutes after it began (SS was unreachable,

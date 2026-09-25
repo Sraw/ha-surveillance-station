@@ -36,11 +36,14 @@ from .const import (
     CONF_FRIGATE,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_QUIET,
+    CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_QUIET_KINDS,
     DEFAULT_FRIGATE_QUIET_MINUTES,
+    FRIGATE_QUIET_KINDS,
     DEFAULT_FRIGATE_TOPIC,
     DEFAULT_PORT,
     DOMAIN,
@@ -73,6 +76,9 @@ OPTIONS_SCHEMA = vol.Schema(
         vol.Optional(CONF_FRIGATE_LINK): str,
         vol.Required(CONF_FRIGATE_QUIET, default=DEFAULT_FRIGATE_QUIET_MINUTES): NumberSelector(
             NumberSelectorConfig(min=0, max=240, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
+        ),
+        vol.Optional(CONF_FRIGATE_QUIET_KINDS, default=DEFAULT_FRIGATE_QUIET_KINDS): SelectSelector(
+            SelectSelectorConfig(options=FRIGATE_QUIET_KINDS, multiple=True)
         ),
     }
 )

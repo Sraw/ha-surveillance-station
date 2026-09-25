@@ -11,8 +11,9 @@ Frigate cameras are matched to SS cameras by name, ignoring case, spaces and
 punctuation (``drive_way`` is "Drive Way").
 
 A created bookmark is announced as a ``surveillance_station_detection`` event
-(once per review, and not when the camera saw only the same kinds within the
-quiet period) for automations to notify with, carrying a signed frame of
+(once per review, and not when the review has only kinds that may be quiet,
+animals by default, never people, all seen on that camera within the quiet
+period) for automations to notify with, carrying a signed frame of
 the moment Frigate saw the object best and, if configured, a link to the card
 at the review's start. The bookmark's thumbnail in the card is that frame too. The event waits for
 SS to have recorded that moment (it lists recordings ~0-10 s behind), at most
@@ -49,6 +50,7 @@ from .const import (
     FRIGATE_QUEUE_MAX,
     FRIGATE_EVENT_WAIT_SECONDS,
     FRIGATE_OPEN_BOOKMARK_SECONDS,
+    FRIGATE_QUIET_KINDS,
     FRIGATE_TRACKED_MAX,
     LARGE_IMAGE_WIDTH,
 )
@@ -109,6 +111,7 @@ class FrigateBridge:
         objects: set[str],
         link: str,
         quiet_minutes: float = 0,
+        quiet_kinds: set[str] | None = None,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
@@ -118,6 +121,8 @@ class FrigateBridge:
         self.objects = objects
         self.link = link
         self.quiet = quiet_minutes * 60
+        # Never "Person", whatever is passed.
+        self.quiet_kinds = (quiet_kinds or set()) & set(FRIGATE_QUIET_KINDS)
         # (SS camera id, kind) -> when that kind was last active on that camera.
         self._last_seen: dict[tuple[int, str], float] = {}
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
@@ -237,10 +242,12 @@ class FrigateBridge:
         # from the keyframe at or before a second (every second here): rounded
         # up, that keyframe is within a second of Frigate's frame either way.
         frame = math.ceil(float(data["thumb_time"])) if data.get("thumb_time") else None
-        # Seen on this camera lately (before this review): no second notification.
+        # Only kinds seen on this camera lately (before this review), and all
+        # of them ones that may be quiet: no second notification.
         now = time.time()
         repeat = bool(objects) and all(
-            now - self._last_seen.get((camera_id, k), -math.inf) < self.quiet for k in kinds(objects)
+            k in self.quiet_kinds and now - self._last_seen.get((camera_id, k), -math.inf) < self.quiet
+            for k in kinds(objects)
         )
         if tracked is None:
             bm = await self.client.create_bookmark(camera_id, name, start, end, comment)

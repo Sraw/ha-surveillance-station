@@ -86,9 +86,13 @@ FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyon
 # restarted mid-review) fires no event: a notification would be old news.
 FRIGATE_ANNOUNCE_MAX_AGE = 120
 CONF_FRIGATE_QUIET = "frigate_quiet_minutes"
-# A camera's review with only kinds ("Person", "Animal") it has seen within
-# this many minutes fires no event: the dog that wandered off and came back.
+CONF_FRIGATE_QUIET_KINDS = "frigate_quiet_kinds"
+# A camera's review with only these kinds, all seen there within this many
+# minutes, fires no event: the dog that wandered off and came back. Never
+# people: a second person arriving is exactly what to be told about.
 DEFAULT_FRIGATE_QUIET_MINUTES = 5
+FRIGATE_QUIET_KINDS = ["Car", "Animal"]
+DEFAULT_FRIGATE_QUIET_KINDS = ["Animal"]
 # Bookmarks whose thumbnail is another moment than their start (the frame a
 # detector picked, where the object shows best), remembered across restarts.
 BOOKMARK_FRAMES_MAX = 20_000

@@ -21,6 +21,7 @@ from custom_components.surveillance_station.const import (
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_QUIET,
+    CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_TOPIC,
     DETECTION_EVENT,
     DOMAIN,
@@ -72,7 +73,7 @@ def bridge(hass: HomeAssistant, setup_integration: MockConfigEntry, client: Magi
     manager = hass.data[DATA_MANAGER]
     manager.thumbnail_when_recorded = AsyncMock(return_value=b"jpg")
     return FrigateBridge(
-        hass, setup_integration.entry_id, client, manager, "frigate", {"person", "car", "dog", "cat"}, "/ss-playback/playback", 5
+        hass, setup_integration.entry_id, client, manager, "frigate", {"person", "car", "dog", "cat"}, "/ss-playback/playback", 5, {"Animal"}
     )
 
 
@@ -238,6 +239,7 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         CONF_FRIGATE_TOPIC: "frigate",
         CONF_FRIGATE_LINK: "/ss-playback/playback",
         CONF_FRIGATE_QUIET: 5,
+        CONF_FRIGATE_QUIET_KINDS: ["Animal"],
     }
     start.assert_awaited_once()  # reloaded with the bridge on
 
@@ -330,3 +332,19 @@ async def test_quiet_period_off(hass: HomeAssistant, bridge: FrigateBridge, clie
     await bridge.handle(review("new", rid="p2"))
     await hass.async_block_till_done()
     assert len(events) == 2
+
+
+async def test_people_are_never_quiet(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, clock) -> None:
+    """A second person a minute after the first is announced, even if people are asked to be quiet; cars only when asked."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    bridge2 = FrigateBridge(
+        hass, bridge.entry_id, client, bridge.manager, "frigate", {"person", "car"}, "", 5, {"Person", "Car"}
+    )
+    assert bridge2.quiet_kinds == {"Car"}
+    for b in (bridge, bridge2):
+        for i, what in enumerate(("person", "person", "car", "car")):
+            clock.return_value = T + 60 * i + 1
+            await b.handle(review("new", objects=(what,), rid=f"{id(b)}-{i}", start=T + 60 * i))
+    await hass.async_block_till_done()
+    # bridge: cars aren't quiet by default; bridge2: the second car is.
+    assert [e.data["objects"] for e in events] == [["Person"]] * 2 + [["Car"]] * 2 + [["Person"]] * 2 + [["Car"]]
