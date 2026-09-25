@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-from synology_ss_playback import RecordingInfo, Segment, SSConnectionError, SSError
+from synology_ss_playback import Bookmark, RecordingInfo, Segment, SSConnectionError, SSError
 
 from custom_components.surveillance_station import views
 from custom_components.surveillance_station.thumbnail_store import ThumbnailStore
@@ -559,3 +559,30 @@ async def test_extend_leaves_the_playlist_unchanged_when_ss_is_unreachable(
         await manager.extend(session)
     assert session.planned_end == T0 + 20
     assert "not extended" in caplog.text
+
+
+def _bookmark(id: int, start: int = 0) -> Bookmark:
+    return Bookmark(id=id, camera_id=6, name="", comment="", start=start, end=start)
+
+
+async def test_set_frame_is_a_noop_when_the_moment_is_unchanged(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    manager.set_frame(entry_id, 1, 100)
+    manager.set_frame(entry_id, 2, 200)  # moved to the end
+    manager.set_frame(entry_id, 1, 100)  # same ts as already stored: not re-recorded
+    assert list(manager._frames)[-1] == f"{entry_id}/2"  # bookmark 1 wasn't moved back to the end
+    assert manager.frame(entry_id, _bookmark(1)) == 100
+
+
+async def test_set_frame_evicts_the_oldest_past_the_cap(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    with patch.object(views, "BOOKMARK_FRAMES_MAX", 2):
+        manager.set_frame(entry_id, 1, 10)
+        manager.set_frame(entry_id, 2, 20)
+        manager.set_frame(entry_id, 3, 30)  # evicts bookmark 1 (the oldest)
+    assert manager.frame(entry_id, _bookmark(1, start=5)) == 6  # fallen back to start + 1
+    assert manager.frame(entry_id, _bookmark(3)) == 30
