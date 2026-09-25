@@ -1,10 +1,11 @@
 """Diagnostics never contain credentials or the NAS's identity."""
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.diagnostics import get_diagnostics_for_config_entry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
+from synology_ss_playback import SSError
 
 from custom_components.surveillance_station.const import CONF_FRIGATE, CONF_FRIGATE_TOPIC, DOMAIN
 from homeassistant.core import HomeAssistant
@@ -39,3 +40,16 @@ async def test_diagnostics_with_frigate(
     assert diag["frigate"]["topic"] == "nvr/reviews"
     assert diag["frigate"]["messages"] == 0 and diag["frigate"]["ignored"] == {}
     assert diag["frigate"]["last_error"] is None
+
+
+async def test_diagnostics_when_surveillance_station_is_unreachable(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_client: ClientSessionGenerator,
+    mock_client: MagicMock,
+) -> None:
+    """Surveillance Station itself is diagnosed too; a failure there is reported, not raised."""
+    mock_client.info.side_effect = SSError("SYNO.SurveillanceStation.Info", "GetInfo", 119)
+    diag = await get_diagnostics_for_config_entry(hass, hass_client, setup_integration)
+    assert "error" in diag["surveillance_station"]
+    assert "119" in diag["surveillance_station"]["error"]

@@ -125,3 +125,20 @@ async def test_reauth_of_a_loaded_entry_reloads_once(
     # One login to check the password, one for the reload.
     assert mock_client.login.await_count == logins + 2
     assert "update listener" not in caplog.text
+
+
+async def test_reconfigure_errors_recover(
+    hass: HomeAssistant, mock_client: MagicMock, mock_config_entry: MockConfigEntry
+) -> None:
+    mock_config_entry.add_to_hass(hass)
+    result = await mock_config_entry.start_reconfigure_flow(hass)
+    mock_client.login.side_effect = SSConnectionError("SYNO.API.Auth", "login", None)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {**USER_INPUT, CONF_HOST: "192.0.2.20"})
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": "cannot_connect"}
+
+    mock_client.login.side_effect = None
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {**USER_INPUT, CONF_HOST: "192.0.2.20"})
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
