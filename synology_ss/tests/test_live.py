@@ -85,14 +85,16 @@ async def test_cancelled_while_waiting_closes_the_socket() -> None:
 
 async def test_no_data_within_the_timeout_closes_the_socket() -> None:
     """A connect that never sends anything (SS wedged) doesn't hang forever."""
-    ws = _ws(DATA)  # never actually returned: wait_for times out first
+    ws = _ws(DATA)  # never actually returned: the timeout wins first
+    hang = asyncio.Event()
 
-    async def timed_out(coro, timeout):
-        coro.close()  # never awaited otherwise
-        raise TimeoutError
+    async def never() -> aiohttp.WSMessage:
+        await hang.wait()
+        return DATA  # pragma: no cover - unreachable; hang is never set
 
+    ws.receive = never
     client, _ = _client([ws])
-    with patch.object(client_mod.asyncio, "wait_for", timed_out):
+    with patch.object(client_mod, "LIVE_CONNECT_TIMEOUT_SECONDS", 0.01):
         with pytest.raises(SSConnectionError, match="no data"):
             await client.open_live(10)
     ws.close.assert_awaited()

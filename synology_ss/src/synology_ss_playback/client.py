@@ -48,6 +48,9 @@ VIDEO_CODEC_H265 = 6
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
 RECORDING_LOOKBACK_SECONDS = 4 * 3600
+# A freshly opened live socket that sends nothing at all (SS wedged) within
+# this long is given up on rather than held forever.
+LIVE_CONNECT_TIMEOUT_SECONDS = 15
 
 
 def _is_hevc(codec: Any) -> bool:
@@ -230,7 +233,7 @@ class SurveillanceStationClient:
             except (aiohttp.ClientError, TimeoutError) as err:
                 raise SSConnectionError("ss_webstream_task", "connect", None, type(err).__name__) from None
             try:
-                first = await asyncio.wait_for(ws.receive(), 15)
+                first = await asyncio.wait_for(ws.receive(), LIVE_CONNECT_TIMEOUT_SECONDS)
             except TimeoutError:
                 await ws.close()
                 raise SSConnectionError("ss_webstream_task", "receive", None, "no data") from None
