@@ -38,3 +38,8 @@ jobs:
           # The library is used from its source tree, same as scripts/test.sh.
           PYTHONPATH: ${{ github.workspace }}/synology_ss/src
           PYTHONDONTWRITEBYTECODE: "1"
+      # Per-package gate (not a single pooled --cov-fail-under): each of
+      # custom_components/surveillance_station and
+      # synology_ss/src/synology_ss_playback must clear 95% on its own.
+      - run: coverage report --include='custom_components/surveillance_station/*' --fail-under=95
+      - run: coverage report --include='synology_ss/src/synology_ss_playback/*' --fail-under=95

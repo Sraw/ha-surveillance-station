@@ -417,14 +417,18 @@ scripts/test.sh            # all tests, in a Python 3.14 container
 scripts/test.sh -k reauth  # extra pytest arguments
 ```
 
-`.github/workflows/ci.yml` runs the same suite on push and pull request
-(plain Python 3.14 via `actions/setup-python`, not the local container - a
-GitHub-hosted runner doesn't need the memory/time cap `scripts/test.sh` uses
-to protect the dev host), plus `hassfest` and the HACS integration check.
-`pytest.ini` carries `--cov-fail-under=95` over both
-`custom_components/surveillance_station` and
-`synology_ss/src/synology_ss_playback`, so any of the three ways of running
-pytest enforces it.
+`.github/workflows/ci.yml` runs the same suite on push to `main` and on pull
+request (plain Python 3.14 via `actions/setup-python`, not the local
+container - a GitHub-hosted runner doesn't need the memory/time cap
+`scripts/test.sh` uses to protect the dev host), plus `hassfest` and the HACS
+integration check. Coverage must clear 95% separately for
+`custom_components/surveillance_station` and for
+`synology_ss/src/synology_ss_playback` (`coverage report --include=... --fail-under=95`,
+once per package) - a single pooled number could hide one package dragging
+the other up. `scripts/test.sh` with no extra arguments runs the same two
+checks after the full suite; a filtered run (`-k foo`) skips them, since it
+only exercises a slice of the code and the gate would fail regardless of
+whether the selected tests pass.
 
 HA 2026.9 needs Python 3.14, so the tests run in a throwaway container (the
 venv is kept in the docker volume `ss-playback-test-venv`). The integration
