@@ -59,6 +59,7 @@ from .const import (
     LARGE_IMAGE_DISK_BYTES,
     LARGE_IMAGE_WIDTH,
     LIVE_IDLE_SECONDS,
+    LIVE_KEEP_ALIVE_SECONDS,
     LIVE_TOKEN_TTL_SECONDS,
     LIVE_URL,
     MAX_LIVE_STREAMS,
@@ -617,7 +618,7 @@ async def _relay(upstream: aiohttp.ClientWebSocketResponse, browser: web.WebSock
 
     async def keep_alive() -> None:
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(LIVE_KEEP_ALIVE_SECONDS)
             await upstream.send_str("keepAlive")
 
     tasks = [asyncio.create_task(down()), asyncio.create_task(up()), asyncio.create_task(keep_alive())]

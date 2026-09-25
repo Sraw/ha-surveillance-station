@@ -27,6 +27,8 @@ LIVE_TOKEN_TTL_SECONDS = 30
 # A live relay whose browser sent nothing (the card keeps alive every 10 s)
 # for this long is closed.
 LIVE_IDLE_SECONDS = 90
+# How often the relay pings Surveillance Station to keep its socket open.
+LIVE_KEEP_ALIVE_SECONDS = 10
 # Live streams relayed at once (each is one camera's ~4-5 Mbps).
 MAX_LIVE_STREAMS = 16
 
