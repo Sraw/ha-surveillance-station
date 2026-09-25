@@ -103,6 +103,29 @@ async def test_entry_unloaded_between_token_and_connect(
     assert err.value.status == HTTPStatus.NOT_FOUND
 
 
+async def test_entry_reloaded_while_connecting(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+    mock_client: MagicMock,
+) -> None:
+    """Unloaded while SS was connecting: that stream isn't relayed on a logged-out client."""
+    upstream = FakeUpstream([b"x"])
+    manager = hass.data[DATA_MANAGER]
+    mock_client.open_live = AsyncMock(return_value=(upstream, aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"info", None)))
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    # Asked before connecting: this client; after: the reloaded entry's new one.
+    with patch.object(manager, "client", side_effect=[mock_client, MagicMock()]), pytest.raises(
+        aiohttp.WSServerHandshakeError
+    ) as err:
+        await client.ws_connect(url)
+    assert err.value.status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert upstream.closed
+    assert manager.stats()["live_streams"] == 0
+
+
 async def test_live_stream_cap(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,

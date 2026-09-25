@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -88,6 +88,28 @@ async def test_incomplete_info_retries(
     assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
     # Logged out, so retries don't pile up DSM sessions.
     mock_client.logout.assert_awaited()
+
+
+async def test_unexpected_error_retries(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """Whatever goes wrong in setup is retried: never a setup_error that waits for a person."""
+    mock_client.info.side_effect = AttributeError("'list' object has no attribute 'get'")
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+    mock_client.logout.assert_awaited()
+
+
+async def test_card_registration_failure_doesnt_stop_setup(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    mock_config_entry.add_to_hass(hass)
+    with patch("custom_components.surveillance_station._register_card", AsyncMock(side_effect=RuntimeError("lovelace"))):
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+    assert mock_config_entry.state is ConfigEntryState.LOADED
 
 
 async def test_unique_id_migrated_to_serial(hass: HomeAssistant, mock_client: MagicMock) -> None:

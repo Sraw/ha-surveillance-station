@@ -355,3 +355,120 @@ async def test_download_malformed_json_error_body() -> None:
     )
     with pytest.raises(SSError):
         await client.download(1, 1, 0, 1000)
+
+
+# --- malformed answers are SSErrors (retryable), never AttributeError/KeyError ---
+
+_LOGIN = {"success": True, "data": {"sid": "s"}}
+
+
+@pytest.mark.parametrize("body", [b"[]", b"null", b'"x"', b"42"])
+async def test_non_object_reply_is_an_sserror(body: bytes) -> None:
+    client, _ = _client([_resp(body=body)])
+    with pytest.raises(SSError, match="unexpected reply"):
+        await client.login()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{"success": True}, {"success": True, "data": []}, {"success": True, "data": {"sid": ""}}, {"success": True, "data": {"sid": 5}}],
+)
+async def test_login_without_a_session_is_an_sserror(answer: dict) -> None:
+    client, _ = _client([_resp(body=_json(answer))])
+    with pytest.raises(SSError, match="without a session"):
+        await client.login()
+
+
+async def test_call_with_odd_data_or_error() -> None:
+    client, _ = _client(
+        [_resp(body=_json(_LOGIN)), _resp(body=_json({"success": True, "data": [1]})), _resp(body=_json({"success": False, "error": "x"}))]
+    )
+    with pytest.raises(SSError, match="unexpected reply"):
+        await client.cameras()
+    with pytest.raises(SSError) as err:
+        await client.cameras()
+    assert err.value.code is None
+
+
+async def test_malformed_timezone_key_falls_back_to_utc() -> None:
+    client, _ = _client([_resp(body=_json(_LOGIN)), _resp(body=_json({"success": True, "data": {"serial": "S", "timezoneTZDB": "../etc"}}))])
+    await client.info()
+    assert str(await client._timezone()) == "UTC"
+
+
+async def test_odd_list_entries_are_skipped() -> None:
+    """One entry SS lists oddly must not hide all the others."""
+    tz = {"success": True, "data": {"serial": "S", "timezoneTZDB": "UTC"}}
+    bookmarks = {"success": True, "data": {"bookmarks": [
+        {"bookmarkId": 1, "camId": 6, "startTime": "2026-01-01T00:00:00"},
+        {"bookmarkId": 2, "camId": 6, "startTime": "not a time"},
+        {"camId": 6, "startTime": "2026-01-01T00:00:00"},
+        "junk",
+    ]}}
+    cameras = {"success": True, "data": {"cameras": [{"id": 6, "name": "A"}, {"name": "no id"}, None]}}
+    events = {"success": True, "data": {"total": "x", "events": [
+        {"id": 1, "cameraId": 6, "startTime": 10, "stopTime": 20},
+        {"id": 2, "cameraId": 6, "startTime": "?", "stopTime": 20},
+    ]}}
+    client, _ = _client([_resp(body=_json(_LOGIN)), _resp(body=_json(tz)), _resp(body=_json(bookmarks)),
+                         _resp(body=_json(cameras)), _resp(body=_json(events))])
+    assert [b.id for b in await client.list_bookmarks([6])] == [1]
+    assert [c.id for c in await client.cameras()] == [6]
+    assert [r.id for r in await client.recordings(6, 0, 30)] == [1]
+
+
+async def test_bad_create_answer_is_an_sserror() -> None:
+    client, _ = _client([_resp(body=_json(_LOGIN)), _resp(body=_json({"success": True, "data": {"serial": "S", "timezoneTZDB": "UTC"}})),
+                         _resp(body=_json({"success": True, "data": {"bookmark": [{"bookmarkId": 1, "startTime": "bad"}]}}))])
+    await client.info()
+    with pytest.raises(SSError):
+        await client.create_bookmark(6, "x", 0, 1)
+
+
+async def test_download_error_body_not_an_object() -> None:
+    client, _ = _client([_resp(body=_json(_LOGIN)), _resp(body=b"[1]", content_type="application/json")])
+    with pytest.raises(SSError) as err:
+        await client.download(1, 1, 0, 1000)
+    assert err.value.code is None
+
+
+# --- refused logins ---
+
+
+async def test_blocked_ip_is_not_a_bad_password() -> None:
+    """407: DSM blocked this host for a while; the password is fine, so no reauth."""
+    called = MagicMock()
+    client, _ = _client([_resp(body=_json({"success": False, "error": {"code": 407}})), _resp(body=_json(_LOGIN))])
+    client.on_auth_failed = called
+    with pytest.raises(SSError) as err:
+        await client.login()
+    assert not isinstance(err.value, SSAuthError)
+    called.assert_not_called()
+    await client.login()
+    assert client._sid == "s"
+
+
+async def test_refused_login_tried_again_after_a_while(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not every refusal is about the password (a directory service not up yet after a DSM reboot)."""
+    import synology_ss_playback.client as client_mod
+
+    now = [1000.0]
+    monkeypatch.setattr(client_mod.time, "monotonic", lambda: now[0])
+    client, session = _client([_resp(body=_json({"success": False, "error": {"code": 400}})), _resp(body=_json(_LOGIN))])
+    with pytest.raises(SSAuthError):
+        await client.login()
+    now[0] += client_mod.AUTH_RETRY_SECONDS - 1
+    with pytest.raises(SSAuthError):
+        await client.login()
+    assert session.request.call_count == 1
+    now[0] += 2
+    await client.login()
+    assert client._sid == "s" and client._auth_failed is None
+
+
+async def test_logout_is_quick() -> None:
+    """An unload waits for it: a NAS that is gone mustn't hold it for 30 s."""
+    client, session = _client([_resp(body=_json(_LOGIN)), _resp(body=_json({"success": True}))])
+    await client.login()
+    await client.logout()
+    assert session.request.call_args.kwargs["timeout"].total == 5

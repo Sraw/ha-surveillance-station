@@ -36,7 +36,9 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.9.6";
+const CARD_VERSION = "0.10.0";
+// After giving up on a stream, it is tried again this often while visible.
+const STREAM_RETRY_MS = 60000;
 
 const SPANS = [
   [900, "15m"],
@@ -1719,6 +1721,15 @@ class Player {
     if (this.drops > 3) {
       this.streamFailed = true;
       this.setStatus(live ? "Live view unavailable" : "Playback unavailable", "error", name, retry);
+      // And keep trying, slowly, while the card is on screen: a wall tablet
+      // must come back by itself after the NAS reboots (monthly DSM updates).
+      const seq = this.seq;
+      const later = () => {
+        if (seq !== this.seq || !this.streamFailed) return; // moved on, or retried by hand
+        if (document.visibilityState === "visible" && this.card.isConnected) retry();
+        else setTimeout(later, STREAM_RETRY_MS);
+      };
+      setTimeout(later, STREAM_RETRY_MS);
       return;
     }
     this.setStatus("Reconnecting", "loading", live ? `${name} · Live` : this.subline(at));

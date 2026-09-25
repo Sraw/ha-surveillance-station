@@ -87,6 +87,18 @@ FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyon
 # A review bookmarked later than this after it began (SS was unreachable, HA
 # restarted mid-review) fires no event: a notification would be old news.
 FRIGATE_ANNOUNCE_MAX_AGE = 120
+# A review message that failed with a transient SS error is tried this many
+# more times, this far apart (not while SS is known to be failing: then the
+# queue would stall behind timeouts).
+FRIGATE_RETRIES = 2
+FRIGATE_RETRY_SECONDS = 5
+FRIGATE_MQTT_RETRY_SECONDS = 60  # waiting for HA's MQTT to come up
+FRIGATE_CAMERAS_TTL = 600  # SS camera list refreshed at least this often
+FRIGATE_DECIDED_MAX = 512  # reviews remembered (across restarts) as announced or not
+# Health: a problem that lasts this long becomes a Repairs issue (cleared on
+# recovery); checked every FRIGATE_HEALTH_INTERVAL.
+FRIGATE_ISSUE_AFTER_SECONDS = 600
+FRIGATE_HEALTH_INTERVAL = 60
 CONF_FRIGATE_QUIET = "frigate_quiet_minutes"
 CONF_FRIGATE_QUIET_KINDS = "frigate_quiet_kinds"
 # A camera's review with only these kinds, all seen there within this many

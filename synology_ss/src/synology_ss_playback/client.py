@@ -43,7 +43,12 @@ _LOGGER = logging.getLogger(__name__)
 
 # Error codes that mean "log in again and retry" (common DSM Web API codes).
 SESSION_ERRORS = {105, 106, 107, 119}
-AUTH_FAILED_ERRORS = {400, 401, 402, 403, 404, 406, 407, 408, 409, 410}
+# Not 407 ("IP blocked"): DSM's auto-block expires, the password is fine.
+AUTH_FAILED_ERRORS = {400, 401, 402, 403, 404, 406, 408, 409, 410}
+# After refused credentials, one login is let through this often: often
+# enough to recover from a refusal that was not about the password, far
+# below DSM's auto-block threshold (10 failures in 5 minutes by default).
+AUTH_RETRY_SECONDS = 1800
 VIDEO_CODEC_H265 = 6
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
@@ -51,6 +56,21 @@ RECORDING_LOOKBACK_SECONDS = 4 * 3600
 # A freshly opened live socket that sends nothing at all (SS wedged) within
 # this long is given up on rather than held forever.
 LIVE_CONNECT_TIMEOUT_SECONDS = 15
+
+
+# What a malformed list entry raises while being read.
+_BAD_ITEM = (KeyError, TypeError, ValueError, AttributeError)
+
+
+def _items(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """data[key] as a list of objects: anything else in it is left out."""
+    value = data.get(key)
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def _error_code(data: dict[str, Any]) -> Any:
+    error = data.get("error")
+    return error.get("code") if isinstance(error, dict) else None
 
 
 def _is_hevc(codec: Any) -> bool:
@@ -136,6 +156,7 @@ class SurveillanceStationClient:
         self._sid: str | None = None
         self._login_lock = asyncio.Lock()
         self._auth_failed: int | None = None
+        self._auth_failed_at = 0.0
         self._tz: ZoneInfo | None = None
         self._live_relogin_at = -LIVE_RELOGIN_SECONDS
         # Called when a re-login is refused at runtime (password changed).
@@ -148,10 +169,10 @@ class SurveillanceStationClient:
         up with one login between them.
         """
         async with self._login_lock:
-            if self._auth_failed is not None:
-                # Credentials were refused once; retrying on every call would
-                # trip DSM's auto-block for this host within minutes. A
-                # successful reauth reloads the entry with a new client.
+            if self._auth_failed is not None and time.monotonic() - self._auth_failed_at < AUTH_RETRY_SECONDS:
+                # Credentials were refused; retrying on every call would trip
+                # DSM's auto-block for this host within minutes. A successful
+                # reauth reloads the entry with a new client.
                 raise SSAuthError("SYNO.API.Auth", "login", self._auth_failed)
             if self._sid is not None and self._sid != stale_sid:
                 return
@@ -171,24 +192,33 @@ class SurveillanceStationClient:
                 post=True,
             )
             if not data.get("success"):
-                code = data.get("error", {}).get("code")
+                code = _error_code(data)
                 if code in AUTH_FAILED_ERRORS:
                     self._auth_failed = code
+                    self._auth_failed_at = time.monotonic()
                     self._sid = None
                     if self.on_auth_failed is not None:
                         self.on_auth_failed()
                     raise SSAuthError("SYNO.API.Auth", "login", code)
                 raise SSError("SYNO.API.Auth", "login", code)
-            self._sid = data["data"]["sid"]
+            result = data.get("data")
+            sid = result.get("sid") if isinstance(result, dict) else None
+            if not isinstance(sid, str) or not sid:
+                raise SSError("SYNO.API.Auth", "login", None, "answer without a session")
+            self._auth_failed = None
+            self._sid = sid
 
     async def logout(self) -> None:
         if self._sid is None:
             return
         try:
+            # Short: an unload (and so a reload) waits for it, and a NAS that
+            # is gone would hold it for the full request timeout.
             await self._raw_json(
                 "auth.cgi",
                 {"api": "SYNO.API.Auth", "method": "logout", "version": 6,
                  "session": "SurveillanceStation", "_sid": self._sid},
+                timeout=5,
             )
         except SSError:
             pass
@@ -268,12 +298,21 @@ class SurveillanceStationClient:
         except (aiohttp.ClientError, TimeoutError) as err:
             raise SSConnectionError(api, method, None, type(err).__name__) from None
 
-    async def _raw_json(self, path: str, params: dict[str, Any], post: bool = False) -> dict[str, Any]:
-        body, _ = await self._request(path, params, post, 30)
+    async def _raw_json(
+        self, path: str, params: dict[str, Any], post: bool = False, timeout: float = 30
+    ) -> dict[str, Any]:
+        body, _ = await self._request(path, params, post, timeout)
+        api, method = params.get("api", path), params.get("method", "")
         try:
-            return json.loads(body)
-        except ValueError:
-            raise SSError(params.get("api", path), params.get("method", ""), None, "non-JSON reply") from None
+            data = json.loads(body)
+        except (ValueError, RecursionError):
+            raise SSError(api, method, None, "non-JSON reply") from None
+        # Anything but a JSON object (a list, null, a proxy's page) is an
+        # SSError too, never an AttributeError further on: callers (setup)
+        # retry SSErrors and treat anything else as a bug.
+        if not isinstance(data, dict):
+            raise SSError(api, method, None, "unexpected reply")
+        return data
 
     async def _call(self, api: str, method: str, version: int, **params: Any) -> dict[str, Any]:
         """entry.cgi call with one transparent re-login on session errors."""
@@ -286,8 +325,11 @@ class SurveillanceStationClient:
                 {"api": api, "method": method, "version": version, "_sid": sid, **params},
             )
             if data.get("success"):
-                return data.get("data") or {}
-            code = data.get("error", {}).get("code")
+                result = data.get("data") or {}
+                if not isinstance(result, dict):
+                    raise SSError(api, method, None, "unexpected reply")
+                return result
+            code = _error_code(data)
             if code in SESSION_ERRORS and attempt == 1:
                 _LOGGER.debug("Session error %s on %s.%s, logging in again", code, api, method)
                 await self.login(stale_sid=sid)
@@ -320,7 +362,7 @@ class SurveillanceStationClient:
             return info
         try:
             self._tz = ZoneInfo(info.timezone)
-        except ZoneInfoNotFoundError:
+        except (ZoneInfoNotFoundError, ValueError):
             _LOGGER.warning("Unknown NAS time zone %r, assuming UTC", info.timezone)
             self._tz = ZoneInfo("UTC")
         return info
@@ -332,14 +374,19 @@ class SurveillanceStationClient:
 
     async def cameras(self) -> list[Camera]:
         data = await self._call("SYNO.SurveillanceStation.Camera", "List", 9)
-        return [
-            Camera(
-                id=int(c["id"]),
-                name=c.get("newName") or c.get("name") or str(c["id"]),
-                enabled=bool(c.get("enabled", True)),
-            )
-            for c in data.get("cameras", [])
-        ]
+        out = []
+        for c in _items(data, "cameras"):
+            try:
+                out.append(
+                    Camera(
+                        id=int(c["id"]),
+                        name=str(c.get("newName") or c.get("name") or c["id"]),
+                        enabled=bool(c.get("enabled", True)),
+                    )
+                )
+            except _BAD_ITEM:
+                _LOGGER.debug("Skipping a camera SS lists as %r", c)
+        return out
 
     async def recordings(self, camera_id: int, start: int, end: int) -> list[RecordingInfo]:
         """Recordings of one camera that overlap [start, end], oldest first."""
@@ -351,25 +398,32 @@ class SurveillanceStationClient:
                 cameraIds=str(camera_id), fromTime=int(start) - RECORDING_LOOKBACK_SECONDS,
                 toTime=int(end), offset=offset, limit=200,
             )
-            events = data.get("events", [])
+            events = _items(data, "events")
             for e in events:
-                if e.get("deleted") or e.get("markAsDel"):
-                    continue
-                if int(e["stopTime"]) < start and not e.get("recording"):
-                    continue
-                out.append(
-                    RecordingInfo(
-                        id=int(e["id"]),
-                        camera_id=int(e["cameraId"]),
-                        start=int(e["startTime"]),
-                        end=int(e["stopTime"]),
-                        mount_id=int(e.get("mountId") or 0),
-                        live=bool(e.get("recording")),
-                        hevc=_is_hevc(e.get("videoCodec")),
+                try:
+                    if e.get("deleted") or e.get("markAsDel"):
+                        continue
+                    if int(e["stopTime"]) < start and not e.get("recording"):
+                        continue
+                    out.append(
+                        RecordingInfo(
+                            id=int(e["id"]),
+                            camera_id=int(e["cameraId"]),
+                            start=int(e["startTime"]),
+                            end=int(e["stopTime"]),
+                            mount_id=int(e.get("mountId") or 0),
+                            live=bool(e.get("recording")),
+                            hevc=_is_hevc(e.get("videoCodec")),
+                        )
                     )
-                )
+                except _BAD_ITEM:
+                    _LOGGER.debug("Skipping a recording SS lists as %r", e)
             offset += len(events)
-            if not events or offset >= int(data.get("total", 0)):
+            try:
+                total = int(data.get("total", 0))
+            except _BAD_ITEM:
+                total = 0
+            if not events or offset >= total:
                 break
         out.sort(key=lambda r: r.start)
         return out
@@ -384,18 +438,12 @@ class SurveillanceStationClient:
             camIds=",".join(str(int(c)) for c in camera_ids),
         )
         out = []
-        for b in data.get("bookmarks") or []:
-            start = _local_ts(b["startTime"], tz)
-            out.append(
-                Bookmark(
-                    id=int(b["bookmarkId"]),
-                    camera_id=int(b["camId"]),
-                    name=b.get("name") or "",
-                    comment=b.get("comment") or "",
-                    start=start,
-                    end=_local_ts(b["endTime"], tz) if b.get("endTime") else start,
-                )
-            )
+        for b in _items(data, "bookmarks"):
+            # One odd entry must not hide all the others.
+            try:
+                out.append(self._parse_bookmark(b, int(b["camId"]), tz))
+            except _BAD_ITEM:
+                _LOGGER.debug("Skipping a bookmark SS lists as %r", b)
         out.sort(key=lambda b: (b.start, b.id), reverse=True)
         return out
 
@@ -431,15 +479,20 @@ class SurveillanceStationClient:
     @staticmethod
     def _bookmark(data: dict[str, Any], camera_id: int, tz: ZoneInfo, method: str) -> Bookmark:
         # Create/Edit answer with the bookmark as SS stored it (local times).
-        b = (data.get("bookmark") or [None])[0]
-        if not b or "bookmarkId" not in b:
-            raise SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", method, None, data)
+        items = _items(data, "bookmark")
+        try:
+            return SurveillanceStationClient._parse_bookmark(items[0], camera_id, tz)
+        except (*_BAD_ITEM, IndexError):
+            raise SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", method, None, str(data)[:200]) from None
+
+    @staticmethod
+    def _parse_bookmark(b: dict[str, Any], camera_id: int, tz: ZoneInfo) -> Bookmark:
         start = _local_ts(b["startTime"], tz)
         return Bookmark(
             id=int(b["bookmarkId"]),
             camera_id=int(camera_id),
-            name=b.get("name") or "",
-            comment=b.get("comment") or "",
+            name=str(b.get("name") or ""),
+            comment=str(b.get("comment") or ""),
             start=start,
             end=_local_ts(b["endTime"], tz) if b.get("endTime") else start,
         )
@@ -461,9 +514,11 @@ class SurveillanceStationClient:
                 return body
             try:
                 err = json.loads(body)
-            except ValueError:
+            except (ValueError, RecursionError):
                 err = {}
-            code = err.get("error", {}).get("code")
+            if not isinstance(err, dict):
+                err = {}
+            code = _error_code(err)
             if code in SESSION_ERRORS and attempt == 1:
                 await self.login(stale_sid=sid)
                 continue

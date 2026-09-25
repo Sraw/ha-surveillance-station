@@ -67,16 +67,24 @@ async def _run_ffmpeg(
     ffmpeg: str, raw: bytes, args: Callable[[str], list[str]], timeout: float
 ) -> bytes:
     """Run ffmpeg on a downloaded cut (via a scratch file; see module docstring)."""
-    fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
+    # A full /tmp or a missing ffmpeg is an SSError like any other failure
+    # here, so callers answer 502 and keep going rather than crash.
+    try:
+        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
+    except OSError as err:
+        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
     proc = None
     try:
-        await asyncio.to_thread(_write_and_close, fd, raw)
-        proc = await asyncio.create_subprocess_exec(
-            *args(path),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            await asyncio.to_thread(_write_and_close, fd, raw)
+            proc = await asyncio.create_subprocess_exec(
+                *args(path),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as err:
+            raise SSError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
         try:
             async with asyncio.timeout(timeout):
                 out, err = await proc.communicate()

@@ -204,14 +204,45 @@ event list, and in DS cam / the SS client. Every animal is called "Animal".
   detections (dogs, cats) are at 120 s; alerts (people, cars) stay at 40 s,
   since a longer one folds a second person arriving within it into the
   first's review, and so into its one notification.
-- One event per review, when it first qualifies, with the objects seen by
-  then: a car that a person later gets out of was announced as "Car". A
-  review bookmarked more than 2 minutes after it began (SS was unreachable,
-  HA restarted mid-review), or only heard of at its end, gets its bookmark
-  but no event: the notification would be old news.
+- One event per review, as soon as it has its bookmark, with the objects
+  seen by then: a car that a person later gets out of was announced as
+  "Car". Normally that is its first message; if that one failed, a later
+  one (even its `end`). Which reviews were announced is kept across
+  restarts (with the quiet period), so a review going on over a restart is
+  announced neither twice nor never. One bookmarked more than 2 minutes
+  after it began (SS was unreachable, HA was down) gets its bookmark but no
+  event: the notification would be old news.
 - Anyone who can publish to Frigate's topic on the broker can make
   bookmarks (and pick the moment whose frame is signed into the event); the
   broker is expected to require a login, as Frigate's does.
+
+### Staying up unattended
+
+What keeps detections flowing without anyone reloading anything (each of
+these was tested live: MQTT reload, broker restart, HA restarted with the
+broker down, NAS unreachable at runtime and during HA's start):
+
+- A message that fails with a transient SS error is tried twice more, 5 s
+  apart, taking the review's newer message if one came meanwhile. While SS
+  is known to be failing, not: the next reviews shouldn't wait behind
+  timeouts.
+- Messages waiting for SS are one per review (a later one replaces the
+  earlier: it says everything that one did), at most 1000 reviews.
+- The SS camera list is read again every 10 minutes and after any failure:
+  a camera replaced in SS under the same name gets a new id.
+- HA's MQTT is waited for as long as it takes (it may be starting,
+  reloading or retrying its broker), checking every minute.
+- Setup: any failure (a malformed answer included) is retried by HA, never
+  a `setup_error` that waits for someone; answers that aren't what SS
+  should send are `SSError`s in the library.
+- A problem lasting 10 minutes becomes an issue in **Settings → Repairs**,
+  gone by itself once it clears: MQTT not available, bookmarks failing,
+  Frigate offline (its `<prefix>/available`).
+- Diagnostics show the bridge: subscribed, Frigate online, and every review
+  message's fate (ignored and why, coalesced, dropped, retried, failed,
+  bookmarked, announced or not), plus the last error.
+- The card retries a stream it gave up on every minute while on screen, so
+  a wall display comes back after the NAS reboots.
 
 A notification is an automation on that event, e.g.:
 

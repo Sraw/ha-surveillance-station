@@ -10,8 +10,8 @@ objects are added, and given its real end at the end. Every animal is named
 Frigate cameras are matched to SS cameras by name, ignoring case, spaces and
 punctuation (``drive_way`` is "Drive Way").
 
-A created bookmark is announced as a ``surveillance_station_detection`` event
-(once per review, and not when the review has only kinds that may be quiet,
+A review is announced as a ``surveillance_station_detection`` event once it
+has its bookmark (once per review, remembered across restarts; and not when the review has only kinds that may be quiet,
 animals by default, never people, all seen on that camera within the quiet
 period) for automations to notify with, carrying a signed frame of
 the moment Frigate saw the object best and, if configured, a link to the card
@@ -21,6 +21,13 @@ EVENT_WAIT_SECONDS, so the frame is there when a phone fetches it.
 
 The review id is kept in the bookmark's comment, so a review that ends after
 a Home Assistant restart still finds its bookmark.
+
+Reliability: a message that fails with a transient SS error is retried (a
+review's newer message replacing it); messages waiting for SS are one per
+review; the SS camera list is re-read regularly and after failures; MQTT is
+waited for as long as it takes. A problem that lasts (no MQTT, bookmarks
+failing, Frigate offline per ``<topic>/available``) becomes a Repairs issue,
+removed once it clears.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 import json
 import logging
 import math
@@ -36,10 +44,14 @@ import re
 import time
 from typing import Any
 
-from synology_ss_playback import SSError, SurveillanceStationClient
+from synology_ss_playback import SSAuthError, SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.hass_dict import HassKey
 
@@ -48,8 +60,15 @@ from .const import (
     DOMAIN,
     FRIGATE_ANIMALS,
     FRIGATE_ANNOUNCE_MAX_AGE,
-    FRIGATE_QUEUE_MAX,
+    FRIGATE_CAMERAS_TTL,
+    FRIGATE_DECIDED_MAX,
     FRIGATE_EVENT_WAIT_SECONDS,
+    FRIGATE_HEALTH_INTERVAL,
+    FRIGATE_ISSUE_AFTER_SECONDS,
+    FRIGATE_MQTT_RETRY_SECONDS,
+    FRIGATE_QUEUE_MAX,
+    FRIGATE_RETRIES,
+    FRIGATE_RETRY_SECONDS,
     FRIGATE_OPEN_BOOKMARK_SECONDS,
     FRIGATE_QUIET_KINDS,
     FRIGATE_TRACKED_MAX,
@@ -126,29 +145,50 @@ class FrigateBridge:
         self.quiet_kinds = (quiet_kinds or set()) & set(FRIGATE_QUIET_KINDS)
         # (SS camera id, kind) -> when that kind was last active on that camera.
         self._last_seen: dict[tuple[int, str], float] = {}
+        # Reviews whose notification was decided (sent, or not: quiet, old
+        # news). Kept across restarts with _last_seen, so a review that goes
+        # on over a restart is neither announced twice nor never.
+        self._decided: OrderedDict[str, None] = OrderedDict()
+        self._store: Store[dict[str, Any]] = Store(hass, 1, store_key(entry_id))
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
-        self._cameras_at = 0.0
+        self._cameras_at = -math.inf
         self._unknown: set[str] = set()  # Frigate cameras warned about
         self._tracked: OrderedDict[str, _Tracked] = OrderedDict()
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(FRIGATE_QUEUE_MAX)
+        # Waiting for SS: the latest message of each review, in the order the
+        # reviews first came in. A review's later message replaces its earlier
+        # one (it says everything the earlier one did), so a backlog after an
+        # outage is one message per review, not a minute-old queue of updates.
+        self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
-        self._unsubscribe: Callable[[], None] | None = None
+        self._unsubscribe: list[Callable[[], None]] = []
+        self._subscribed = False
         self._announcing: set[asyncio.Task] = set()
-        self._failing = False
+        self._stop_health: Callable[[], None] | None = None
+        self._started_at = time.monotonic()
+        self._failing_since: float | None = None
+        self._frigate_offline_since: float | None = None
+        self._frigate_available: str | None = None
+        self._issues: set[str] = set()
         self._dropping = False
         self._stopped = False
         # For diagnostics: is anything arriving, and where does it stop?
         # messages: every review message (new, each update, end), so several
-        # per review. messages = handled + queued + dropped; handled ends as
-        # ignored (by reason), failed, or went through (bookmarked counts new
-        # bookmarks only; each is then announced or not_announced).
+        # per review. messages = handled + queued + coalesced + dropped;
+        # handled ends as ignored (by reason), failed (after retries), or went
+        # through (bookmarked counts new bookmarks; each review is then
+        # announced or not_announced).
         self._counts = {
-            "messages": 0, "dropped": 0, "failed": 0, "bookmarked": 0,
+            "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "bookmarked": 0,
             "announced": 0, "not_announced": 0, "announce_failed": 0,
         }
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
         self._last_error: tuple[float, str] | None = None
+
+    @property
+    def _failing(self) -> bool:
+        return self._failing_since is not None
 
     def stats(self) -> dict[str, Any]:
         """Diagnostics: subscription, counters since start, the last error."""
@@ -157,16 +197,18 @@ class FrigateBridge:
             return None if ts is None else dt_util.utc_from_timestamp(ts).isoformat()
 
         return {
-            "subscribed": self._unsubscribe is not None,
+            "subscribed": self._subscribed,
             "topic": f"{self.topic}/reviews",
+            "frigate_available": self._frigate_available,
             "objects": sorted(self.objects, key=_rank),
             "quiet_minutes": self.quiet / 60,
             "quiet_kinds": sorted(self.quiet_kinds),
             **self._counts,
             "ignored": dict(self._ignored),
-            "queued": self._queue.qsize(),
+            "queued": len(self._pending),
             "announcing": len(self._announcing),
             "failing": self._failing,
+            "issues": sorted(self._issues),
             "last_message": at(self._last_message),
             "last_error": self._last_error and {"at": at(self._last_error[0]), "error": self._last_error[1]},
         }
@@ -181,30 +223,82 @@ class FrigateBridge:
         self._last_error = (time.time(), text[:300])
 
     async def start(self) -> bool:
-        """Subscribe (False: MQTT isn't available); stop() undoes it."""
-        if not await mqtt.async_wait_for_mqtt_client(self.hass):
-            _LOGGER.error("MQTT is not available: Frigate detections are not bookmarked (reload the entry once it is)")
-            return False
-        unsubscribe = await mqtt.async_subscribe(self.hass, f"{self.topic}/reviews", self._received)
+        """Subscribe once MQTT is there (False: stopped first); stop() undoes it."""
+        try:
+            stored = await self._store.async_load() or {}
+            now = time.time()
+            for review_id in stored.get("decided") or []:
+                self._decide(str(review_id))
+            for camera_id, kind, t in stored.get("last_seen") or []:
+                if now - float(t) < self.quiet:
+                    self._last_seen[(int(camera_id), str(kind))] = float(t)
+        except (ValueError, TypeError, AttributeError, HomeAssistantError):
+            _LOGGER.warning("Ignoring unreadable Frigate state %s", store_key(self.entry_id))
+        self._stop_health = async_track_time_interval(
+            self.hass, self._check_health, timedelta(seconds=FRIGATE_HEALTH_INTERVAL)
+        )
+        warned = False
+        # HA's MQTT may be starting, retrying its broker, or reloading. Keep
+        # waiting (this runs as an entry task, cancelled on unload) rather
+        # than give up for good.
+        while not await mqtt.async_wait_for_mqtt_client(self.hass):
+            if self._stopped:
+                return False
+            if not warned:
+                warned = True
+                _LOGGER.warning("MQTT is not available yet; Frigate detections are bookmarked once it is")
+            await asyncio.sleep(FRIGATE_MQTT_RETRY_SECONDS)
+        unsubscribe = [
+            await mqtt.async_subscribe(self.hass, f"{self.topic}/reviews", self._received),
+            await mqtt.async_subscribe(self.hass, f"{self.topic}/available", self._availability),
+        ]
         if self._stopped:  # unloaded while MQTT was starting
-            unsubscribe()
+            for u in unsubscribe:
+                u()
             return False
+        if warned:
+            _LOGGER.info("MQTT is available: bookmarking Frigate detections")
         self._unsubscribe = unsubscribe
+        self._subscribed = True
         self._worker = self.hass.async_create_background_task(self._work(), "surveillance_station frigate")
         return True
 
     @callback
     def stop(self) -> None:
         self._stopped = True
-        if self._unsubscribe is not None:
-            self._unsubscribe()
-            self._unsubscribe = None
+        self._subscribed = False
+        for unsubscribe in self._unsubscribe:
+            unsubscribe()
+        self._unsubscribe = []
+        if self._stop_health is not None:
+            self._stop_health()
+            self._stop_health = None
         for task in (self._worker, *self._announcing):
             if task is not None:
                 task.cancel()
+        # An unloaded entry's problems are not problems any more (a reload
+        # checks again from scratch).
+        for issue in list(self._issues):
+            ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
+        self._issues.clear()
+
+    @callback
+    def _availability(self, msg: mqtt.ReceiveMessage) -> None:
+        if self._stopped:
+            return
+        state = str(msg.payload).strip().lower()
+        self._frigate_available = state
+        if state == "online":
+            self._frigate_offline_since = None
+        elif self._frigate_offline_since is None:
+            self._frigate_offline_since = time.monotonic()
 
     @callback
     def _received(self, msg: mqtt.ReceiveMessage) -> None:
+        # After stop(): HA's MQTT restores subscriptions onto a new client
+        # when it reloads, and an unsubscribe made before that may not reach it.
+        if self._stopped:
+            return
         try:
             review = json.loads(msg.payload)
         except (ValueError, RecursionError):
@@ -213,37 +307,60 @@ class FrigateBridge:
             return
         self._counts["messages"] += 1
         self._last_message = time.time()
-        try:
-            self._queue.put_nowait(review)
-        except asyncio.QueueFull:
+        key = str(review["after"].get("id") or "") or f"_{self._counts['messages']}"
+        if (earlier := self._pending.get(key)) is not None:
+            self._counts["coalesced"] += 1
+            if earlier.get("type") == "new" or earlier.get(_SEEN_NEW):
+                review[_SEEN_NEW] = True
+        self._pending[key] = review  # an existing key keeps its place
+        if len(self._pending) > FRIGATE_QUEUE_MAX:
             # SS stuck for a long while: newer reviews matter more.
-            self._queue.get_nowait()
-            self._queue.put_nowait(review)
+            self._pending.popitem(last=False)
             self._counts["dropped"] += 1
             if not self._dropping:
                 self._dropping = True
                 _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; dropping the oldest")
+        self._wake.set()
 
     async def _work(self) -> None:
-        # One at a time and in order: an alert can end before its bookmark
-        # has been created.
+        # One review at a time, in order.
         while True:
-            review = await self._queue.get()
+            if not self._pending:
+                self._dropping = False
+                self._wake.clear()
+                await self._wake.wait()
+                continue
+            key, review = self._pending.popitem(last=False)
+            await self._process(key, review)
+
+    async def _process(self, key: str, review: dict[str, Any]) -> None:
+        retries = 0
+        while True:
             try:
                 await self.handle(review)
             except SSError as err:
                 # A create may have gone through before the error: list afresh
-                # before looking for it again.
+                # before looking for it again. And the camera may have been
+                # replaced in SS (same name, new id): list the cameras again.
                 self.manager.forget_bookmarks(self.entry_id)
-                self._fail(err)
+                self._cameras_at = -math.inf
+                if isinstance(err, SSAuthError) or self._failing or retries >= FRIGATE_RETRIES:
+                    self._fail(err)
+                    return
+                retries += 1
+                self._counts["retried"] += 1
+                await asyncio.sleep(FRIGATE_RETRY_SECONDS)
+                # A newer message of the same review may have come meanwhile.
+                if (newer := self._pending.pop(key, None)) is not None:
+                    review = newer
+                continue
             except Exception as err:  # noqa: BLE001 - one bad message must not stop the bridge
                 self._fail(err)
-            else:
-                if self._failing:
-                    self._failing = False
-                    _LOGGER.info("Frigate bookmarks work again")
-            if self._queue.empty():
-                self._dropping = False
+                return
+            if self._failing:
+                self._failing_since = None
+                _LOGGER.info("Frigate bookmarks work again")
+            return
 
     def _fail(self, err: Exception) -> None:
         self._counts["failed"] += 1
@@ -251,7 +368,7 @@ class FrigateBridge:
         if isinstance(err, SSError):
             self.manager.track(self.entry_id, err)
         if not self._failing:
-            self._failing = True
+            self._failing_since = time.monotonic()
             _LOGGER.warning("Frigate review not turned into a bookmark: %r", err, exc_info=not isinstance(err, SSError))
 
     async def handle(self, review: dict[str, Any]) -> None:
@@ -266,10 +383,10 @@ class FrigateBridge:
         except (KeyError, TypeError, ValueError):
             self._ignore("malformed")
             return
-        data = after.get("data") or {}
+        data = after.get("data") if isinstance(after.get("data"), dict) else {}
         # An object a sub label was given to (a known face, a plate) is
         # listed as "<label>-verified". Frigate lists them in no fixed order.
-        seen = {str(o).removesuffix("-verified") for o in data.get("objects") or []}
+        seen = {str(o).removesuffix("-verified") for o in _strings(data.get("objects"))}
         objects = sorted((o for o in self.objects if o in seen), key=_rank)
         tracked = self._tracked.get(review_id)
         if tracked is None and not objects:
@@ -280,20 +397,27 @@ class FrigateBridge:
             self._ignore("unknown_camera")
             return
         camera_id, camera_name = camera
-        zones = [str(z) for z in data.get("zones") or []]
+        zones = _strings(data.get("zones"))
         name = bookmark_name(objects)
         comment = bookmark_comment(review_id, str(after.get("severity")), zones)
-        ended = after.get("end_time")
-        end = int(float(ended)) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(time.time()))
+        try:
+            ended = float(after["end_time"]) if after.get("end_time") else None
+        except (TypeError, ValueError):
+            ended = None
+        end = int(ended) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(time.time()))
 
-        if tracked is None and kind != "new":
-            # Created before a restart (its comment names the review)?
+        if tracked is None and not (kind == "new" or review.get(_SEEN_NEW)):
+            # Created before a restart, or by a try that failed after SS did
+            # it (its comment names the review)?
             tracked = await self._find(review_id, camera_id)
         # The frame Frigate picked as showing the object best (it may pick a
         # better one as the review goes on): the bookmark's thumbnail. SS cuts
         # from the keyframe at or before a second (every second here): rounded
         # up, that keyframe is within a second of Frigate's frame either way.
-        frame = math.ceil(float(data["thumb_time"])) if data.get("thumb_time") else None
+        try:
+            frame = math.ceil(float(data["thumb_time"])) if data.get("thumb_time") else None
+        except (TypeError, ValueError):
+            frame = None
         # Only kinds seen on this camera lately (before this review), and all
         # of them ones that may be quiet: no second notification.
         now = time.time()
@@ -307,29 +431,48 @@ class FrigateBridge:
             self._remember(review_id, tracked)
             self._counts["bookmarked"] += 1
             self.manager.forget_bookmarks(self.entry_id)
-            # One only heard of at its end (Home Assistant was down), or long
-            # after it began (SS was unreachable, a restart mid-review), gets
-            # its bookmark, but is old news for a notification.
-            if kind != "end" and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
-                self._announce(review_id, bm.id, camera_id, camera_name, after, objects, zones, start, frame or start)
-            else:
-                self._counts["not_announced"] += 1
         elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
             await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self.manager.forget_bookmarks(self.entry_id)
+        if review_id not in self._decided:
+            # Once per review, as soon as it has its bookmark: normally at its
+            # first message; later if that one failed (even at its end). Long
+            # after it began (HA was down, SS unreachable) it is old news.
+            self._decide(review_id)
+            if objects and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
+                self._announce(
+                    review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start
+                )
+            else:
+                self._counts["not_announced"] += 1
         # Bookmarked: its kinds count as seen here (still going on: now;
         # ended: when last active).
-        active = float(ended) if ended else now
+        active = ended or now
         for k in kinds(objects):
             self._last_seen[(camera_id, k)] = max(self._last_seen.get((camera_id, k), 0), active)
         if len(self._last_seen) > 256:
             self._last_seen = {k: v for k, v in self._last_seen.items() if now - v < self.quiet}
+        self._save()
         if frame is not None and frame != tracked.frame:
             tracked.frame = frame
             self.manager.set_frame(self.entry_id, tracked.bookmark_id, frame)
         if kind == "end":
             self._tracked.pop(review_id, None)
+
+    def _decide(self, review_id: str) -> None:
+        self._decided[review_id] = None
+        while len(self._decided) > FRIGATE_DECIDED_MAX:
+            self._decided.popitem(last=False)
+
+    def _save(self) -> None:
+        self._store.async_delay_save(
+            lambda: {
+                "decided": list(self._decided),
+                "last_seen": [[c, k, t] for (c, k), t in self._last_seen.items()],
+            },
+            2,
+        )
 
     def _remember(self, review_id: str, tracked: _Tracked) -> None:
         self._tracked[review_id] = tracked
@@ -347,8 +490,11 @@ class FrigateBridge:
 
     async def _camera(self, frigate_camera: str) -> tuple[int, str] | None:
         key = camera_key(frigate_camera)
-        if key not in self._cameras and time.monotonic() - self._cameras_at > 60:
-            # Listed again at most once a minute, for a camera added or renamed.
+        age = time.monotonic() - self._cameras_at
+        # Listed again at most once a minute for a camera not there (added or
+        # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
+        # failure (replaced: same name, new id).
+        if age > FRIGATE_CAMERAS_TTL or (key not in self._cameras and age > 60):
             self._cameras_at = time.monotonic()
             self._cameras = {camera_key(c.name): (c.id, c.name) for c in await self.client.cameras()}
         if (found := self._cameras.get(key)) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
@@ -391,9 +537,12 @@ class FrigateBridge:
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
             try:
-                await self.manager.thumbnail_when_recorded(
-                    self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
-                )
+                # Bounded: a slow SS or a busy ffmpeg must not hold the
+                # notification (the phone fetches the frame on demand anyway).
+                async with asyncio.timeout(FRIGATE_EVENT_WAIT_SECONDS + 10):
+                    await self.manager.thumbnail_when_recorded(
+                        self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
+                    )
             except Exception as err:  # noqa: BLE001 - announce without the frame ready
                 self._counts["announce_failed"] += 1
                 self._error(err)
@@ -411,3 +560,50 @@ class FrigateBridge:
         sep = "&" if "?" in self.link else "?"
         # A few seconds before: the card's own event jumps start there too.
         return f"{self.link}{sep}ss_camera={camera_id}&ss_time={start - 3}"
+
+    def _issue_id(self, issue: str) -> str:
+        return f"{issue}_{self.entry_id}"
+
+    @callback
+    def _check_health(self, _now: Any = None) -> None:
+        """Problems that last become Repairs issues, and go when they do."""
+        now = time.monotonic()
+
+        def lasting(since: float | None) -> bool:
+            return since is not None and now - since >= FRIGATE_ISSUE_AFTER_SECONDS
+
+        problems = {
+            "frigate_mqtt": not self._subscribed and lasting(self._started_at),
+            "frigate_failing": lasting(self._failing_since),
+            "frigate_offline": lasting(self._frigate_offline_since),
+        }
+        for issue, present in problems.items():
+            if present and issue not in self._issues:
+                self._issues.add(issue)
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    self._issue_id(issue),
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key=issue,
+                    translation_placeholders={
+                        "topic": self.topic,
+                        "error": (self._last_error or (0, "-"))[1],
+                    },
+                )
+            elif not present and issue in self._issues:
+                self._issues.discard(issue)
+                ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
+
+
+def store_key(entry_id: str) -> str:
+    return f"{DOMAIN}.frigate.{entry_id}"
+
+
+def _strings(value: Any) -> list[str]:
+    return [str(v) for v in value] if isinstance(value, list) else []
+
+
+# Set on a queued message that replaced its review's "new": it was seen new.
+_SEEN_NEW = "_seen_new"

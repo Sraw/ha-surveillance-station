@@ -23,6 +23,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from . import websocket
@@ -42,7 +43,7 @@ from .const import (
     DOMAIN,
     STATIC_URL,
 )
-from .frigate import DATA_FRIGATE, FrigateBridge
+from .frigate import DATA_FRIGATE, FrigateBridge, store_key as frigate_store_key
 from .views import (
     DATA_MANAGER,
     LargeImageView,
@@ -142,6 +143,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             translation_key="cannot_connect",
             translation_placeholders={"error": str(err)},
         ) from err
+    except Exception as err:
+        # A bug or an answer nobody foresaw: retried rather than a setup_error
+        # that stays until someone reloads by hand (2026-09-25).
+        _LOGGER.exception("Unexpected error setting up Surveillance Station; retrying")
+        await client.logout()
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="cannot_connect",
+            translation_placeholders={"error": type(err).__name__},
+        ) from err
     if entry.unique_id != info.serial:
         # Entries from before 0.5 were keyed by host:port.
         hass.config_entries.async_update_entry(entry, unique_id=info.serial)
@@ -149,7 +160,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
     entry.runtime_data = client
     # Per entry rather than in async_setup, so that removing the last entry
     # and adding one back (no restart in between) brings the card back.
-    await _register_card(hass, await _card_url(hass))
+    try:
+        await _register_card(hass, await _card_url(hass))
+    except Exception:
+        # The card is a convenience; bookmarks and playback work without it.
+        _LOGGER.exception("Could not register the timeline card's Lovelace resource")
     if entry.options.get(CONF_FRIGATE):
         options = entry.options
         bridge = FrigateBridge(
@@ -183,6 +198,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConf
     if (manager := hass.data.get(DATA_MANAGER)) is not None:
         await manager.disk.drop_entry(entry.entry_id)
         await manager.disk_large.drop_entry(entry.entry_id)
+    await Store(hass, 1, frigate_store_key(entry.entry_id)).async_remove()
     if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
         return
     if (resources := _storage_resources(hass)) is None:

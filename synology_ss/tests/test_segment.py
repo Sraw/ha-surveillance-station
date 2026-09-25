@@ -159,3 +159,15 @@ def test_remove_stale_temp_files_ignores_a_file_already_gone() -> None:
 
 def test_unlink_swallows_missing_file() -> None:
     seg_mod._unlink("/nonexistent/path/for/sure.mp4")  # no FileNotFoundError raised
+
+
+async def test_run_ffmpeg_missing_binary_is_an_sserror() -> None:
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", AsyncMock(side_effect=FileNotFoundError(2, "No such file"))):
+        with pytest.raises(SSError, match="FileNotFoundError"):
+            await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5)
+
+
+async def test_run_ffmpeg_no_scratch_space_is_an_sserror() -> None:
+    with patch.object(seg_mod.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")):
+        with pytest.raises(SSError, match="scratch file"):
+            await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5)

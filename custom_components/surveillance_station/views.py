@@ -221,7 +221,10 @@ class VodManager:
         for token in [t for t, v in self._live_tokens.items() if v[0] == entry_id]:
             del self._live_tokens[token]
         for stream in [x for x in self.live_streams if x[0] == entry_id]:
-            self.hass.async_create_task(stream[1].close(code=aiohttp.WSCloseCode.GOING_AWAY))
+            # One still connecting to SS isn't prepared (close() would raise);
+            # it notices the entry is gone once connected.
+            if stream[1].prepared:
+                self.hass.async_create_task(stream[1].close(code=aiohttp.WSCloseCode.GOING_AWAY))
         self._unreachable.discard(entry_id)
         self._bookmarks.pop(entry_id, None)
 
@@ -575,6 +578,9 @@ class LiveStreamView(HomeAssistantView):
                 _LOGGER.debug("Live stream of camera %s failed: %s", camera_id, err)
                 raise web.HTTPBadGateway() from None
             self.manager.track(entry_id, None)
+            if self.manager.client(entry_id) is not client:
+                # The entry unloaded (or reloaded) while SS was connecting.
+                raise web.HTTPServiceUnavailable()
             await browser.prepare(request)
             await browser.send_bytes(first.data)
             await _relay(upstream, browser)

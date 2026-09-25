@@ -81,5 +81,19 @@
       "invalid_link": "Enter a path starting with /, such as /ss-playback/playback.",
       "no_objects": "Choose at least one object."
     }
+  },
+  "issues": {
+    "frigate_mqtt": {
+      "title": "Frigate detections: MQTT is not available",
+      "description": "Home Assistant's MQTT integration has not been available for over 10 minutes, so Frigate reviews on `{topic}/reviews` are not being turned into Surveillance Station bookmarks or notifications. Check the MQTT integration and its broker; this clears by itself once MQTT is back."
+    },
+    "frigate_failing": {
+      "title": "Frigate detections are not being bookmarked",
+      "description": "Surveillance Station has refused or failed every Frigate review for over 10 minutes, so detections get no bookmark and no notification. Last error: {error}. This clears by itself once a bookmark goes through."
+    },
+    "frigate_offline": {
+      "title": "Frigate is offline",
+      "description": "Frigate has reported itself offline on `{topic}/available` for over 10 minutes, so nothing is being detected. Check the Frigate container; this clears by itself once Frigate is back online."
+    }
   }
 }
