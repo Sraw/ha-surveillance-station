@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  hassfest:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  test:
+    name: pytest (Python 3.14)
+    runs-on: ubuntu-latest
+    # Same idea as scripts/test.sh's container cap: die on our own terms
+    # rather than run away on the runner.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements_test.txt
+      - run: python -m pytest -p no:cacheprovider
+        env:
+          # The library is used from its source tree, same as scripts/test.sh.
+          PYTHONPATH: ${{ github.workspace }}/synology_ss/src
+          PYTHONDONTWRITEBYTECODE: "1"

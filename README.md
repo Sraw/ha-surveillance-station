@@ -417,6 +417,15 @@ scripts/test.sh            # all tests, in a Python 3.14 container
 scripts/test.sh -k reauth  # extra pytest arguments
 ```
 
+`.github/workflows/ci.yml` runs the same suite on push and pull request
+(plain Python 3.14 via `actions/setup-python`, not the local container - a
+GitHub-hosted runner doesn't need the memory/time cap `scripts/test.sh` uses
+to protect the dev host), plus `hassfest` and the HACS integration check.
+`pytest.ini` carries `--cov-fail-under=95` over both
+`custom_components/surveillance_station` and
+`synology_ss/src/synology_ss_playback`, so any of the three ways of running
+pytest enforces it.
+
 HA 2026.9 needs Python 3.14, so the tests run in a throwaway container (the
 venv is kept in the docker volume `ss-playback-test-venv`). The integration
 tests use `pytest-homeassistant-custom-component` pinned to the HA release,
