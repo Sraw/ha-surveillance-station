@@ -7,7 +7,7 @@ directories, stray non-thumbnail entries, and OSError during write/unlink.
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,12 +16,20 @@ from custom_components.surveillance_station.thumbnail_store import ThumbnailStor
 from homeassistant.core import HomeAssistant
 
 
+def _os_like(**overrides: MagicMock) -> MagicMock:
+    """A stand-in for the ``os`` module, scoped to thumbnail_store's own
+    reference to it (patched in with patch.object(ts_mod, "os", ...) below):
+    real (wraps the actual module) except for the given overrides, so it
+    can't affect anything else in the process still using the real module."""
+    return MagicMock(wraps=os, **overrides)
+
+
 async def test_scan_skips_an_unreadable_root(
     hass: HomeAssistant, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A root that exists but can't be listed (not just missing) is a warning, not a crash."""
     store = ThumbnailStore(hass, str(tmp_path), 1000)
-    with patch.object(ts_mod.os, "listdir", side_effect=PermissionError("denied")):
+    with patch.object(ts_mod, "os", _os_like(listdir=MagicMock(side_effect=PermissionError("denied")))):
         await store.load()
     assert len(store) == 0
     assert "Can't read the thumbnail cache" in caplog.text
@@ -63,7 +71,7 @@ async def test_scan_skips_a_file_it_cannot_stat(hass: HomeAssistant, tmp_path: P
         def stat(self):
             raise OSError("gone")
 
-    with patch.object(ts_mod.os, "scandir", return_value=[BadEntry()]):
+    with patch.object(ts_mod, "os", _os_like(scandir=MagicMock(return_value=[BadEntry()]))):
         store = ThumbnailStore(hass, str(tmp_path), 1000)
         await store.load()
     assert len(store) == 0
@@ -74,7 +82,7 @@ async def test_read_ignores_a_failure_to_update_the_access_time(hass: HomeAssist
     store = ThumbnailStore(hass, str(tmp_path), 1000)
     store.put(("E", 6, 1), b"data")
     await store.settle()
-    with patch.object(ts_mod.os, "utime", side_effect=OSError("read-only fs")):
+    with patch.object(ts_mod, "os", _os_like(utime=MagicMock(side_effect=OSError("read-only fs")))):
         assert await store.get(("E", 6, 1)) == b"data"
 
 
@@ -103,7 +111,7 @@ async def test_write_failure_when_the_temp_file_cleanup_also_fails(
     (dest_dir / "1.jpg").mkdir()
 
     store = ThumbnailStore(hass, str(tmp_path), 1000)
-    with patch.object(ts_mod.os, "unlink", side_effect=OSError("also gone")):
+    with patch.object(ts_mod, "os", _os_like(unlink=MagicMock(side_effect=OSError("also gone")))):
         store.put(("E", 6, 1), b"data")
         await store.settle()
     assert len(store) == 0
