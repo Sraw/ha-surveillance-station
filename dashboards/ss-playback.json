@@ -1,0 +1,17 @@
+{
+  "title": "SS Playback",
+  "views": [
+    {
+      "title": "Playback",
+      "path": "playback",
+      "icon": "mdi:cctv",
+      "panel": true,
+      "cards": [
+        {
+          "type": "custom:ss-timeline-card",
+          "span": 3600
+        }
+      ]
+    }
+  ]
+}

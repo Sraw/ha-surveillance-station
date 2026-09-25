@@ -1,0 +1,12 @@
+{
+  "domain": "surveillance_station",
+  "name": "Surveillance Station Playback",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["ffmpeg", "frontend", "http"],
+  "documentation": "https://github.com/",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "0.1.1"
+}

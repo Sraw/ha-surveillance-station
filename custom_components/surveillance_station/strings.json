@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Surveillance Station",
+        "description": "Use a dedicated DSM account whose Surveillance Station privilege profile allows playback and download. Two-step verification must be off for it.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "ssl": "Use HTTPS",
+          "verify_ssl": "Verify SSL certificate",
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot reach Surveillance Station.",
+      "invalid_auth": "Login rejected.",
+      "no_cameras": "Logged in, but this account sees no cameras. Check its Surveillance Station privilege profile.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This Surveillance Station is already configured."
+    }
+  }
+}
