@@ -204,6 +204,7 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
         client.create_bookmark.side_effect = SSConnectionError("x", "Create", None)
         async_fire_mqtt_message(hass, "nvr/reviews", json.dumps(review("new", rid="a1")))
         async_fire_mqtt_message(hass, "nvr/reviews", "not json")
+        async_fire_mqtt_message(hass, "nvr/reviews", json.dumps({"type": "new"}))  # no "after"
         async_fire_mqtt_message(hass, "frigate/reviews", json.dumps(review("new", rid="a2")))
         await hass.async_block_till_done()
         assert client.create_bookmark.await_count == 1
@@ -215,11 +216,13 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
         assert [e.data["review_id"] for e in events] == ["a3"]
         stats = hass.data[DATA_FRIGATE][entry.entry_id].stats()
         assert stats["subscribed"] and stats["topic"] == "nvr/reviews"
-        # "not json" and the other topic never count; a1 failed, a3 made it.
-        assert {k: stats[k] for k in ("received", "bookmarked", "announced", "failed", "dropped", "queued")} == {
-            "received": 2, "bookmarked": 1, "announced": 1, "failed": 1, "dropped": 0, "queued": 0,
+        # Not JSON / no "after": not a review message. a1 failed, a3 made it.
+        assert {k: stats[k] for k in ("messages", "bookmarked", "announced", "failed", "dropped", "queued")} == {
+            "messages": 2, "bookmarked": 1, "announced": 1, "failed": 1, "dropped": 0, "queued": 0,
         }
-        assert "Create" in stats["last_error"]["error"]
+        assert not stats["failing"]  # a3 went through after a1's failure
+        assert stats["last_error"]["error"].startswith("x.Create failed")
+        assert stats["last_error"]["at"].endswith("+00:00") and stats["last_message"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -355,3 +358,36 @@ async def test_people_are_never_quiet(hass: HomeAssistant, bridge: FrigateBridge
     await hass.async_block_till_done()
     # bridge: cars aren't quiet by default; bridge2: the second car is.
     assert [e.data["objects"] for e in events] == [["Person"]] * 2 + [["Car"]] * 2 + [["Person"]] * 2 + [["Car"]]
+
+
+async def test_stats_ignored_and_dropped(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    """Silence with messages arriving says why: which messages were ignored, or dropped."""
+    await bridge.handle({"type": "genai", "after": {"id": "x"}})
+    await bridge.handle({"type": "new", "after": {"id": "x"}})  # no start_time
+    await bridge.handle(review("new", objects=("bicycle",), rid="b1"))
+    await bridge.handle(review("new", camera="garage", rid="b2"))
+    assert bridge.stats()["ignored"] == {"other_type": 1, "malformed": 1, "no_objects": 1, "unknown_camera": 1}
+    client.create_bookmark.assert_not_called()
+
+    bridge._queue = asyncio.Queue(1)  # no worker on this bridge: nothing drains it
+    msg = MagicMock(payload=json.dumps(review("update")))
+    for _ in range(3):
+        bridge._received(msg)
+    stats = bridge.stats()
+    assert (stats["messages"], stats["dropped"], stats["queued"]) == (3, 2, 1)
+
+
+async def test_announced_even_if_the_frame_fails(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    events = async_capture_events(hass, DETECTION_EVENT)
+    with patch.object(bridge.manager, "thumbnail_when_recorded", AsyncMock(side_effect=OSError("ffmpeg gone"))):
+        await bridge.handle(review("new"))
+        await hass.async_block_till_done()
+    assert len(events) == 1
+    stats = bridge.stats()
+    assert (stats["announced"], stats["announce_failed"], stats["announcing"]) == (1, 1, 0)
+    assert stats["last_error"]["error"] == "OSError: ffmpeg gone"
+
+
+async def test_not_announced_counted(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    await bridge.handle(review("end", end=T + 20))  # heard of only at its end
+    assert (bridge.stats()["bookmarked"], bridge.stats()["not_announced"]) == (1, 1)

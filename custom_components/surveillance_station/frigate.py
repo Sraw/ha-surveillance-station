@@ -40,6 +40,7 @@ from synology_ss_playback import SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.util import dt as dt_util
 from homeassistant.util.hass_dict import HassKey
 
 from .const import (
@@ -137,12 +138,24 @@ class FrigateBridge:
         self._dropping = False
         self._stopped = False
         # For diagnostics: is anything arriving, and where does it stop?
-        self._counts = {"received": 0, "bookmarked": 0, "announced": 0, "failed": 0, "dropped": 0}
-        self._last_received: float | None = None
+        # messages: every review message (new, each update, end), so several
+        # per review. messages = handled + queued + dropped; handled ends as
+        # ignored (by reason), failed, or went through (bookmarked counts new
+        # bookmarks only; each is then announced or not_announced).
+        self._counts = {
+            "messages": 0, "dropped": 0, "failed": 0, "bookmarked": 0,
+            "announced": 0, "not_announced": 0, "announce_failed": 0,
+        }
+        self._ignored: dict[str, int] = {}
+        self._last_message: float | None = None
         self._last_error: tuple[float, str] | None = None
 
     def stats(self) -> dict[str, Any]:
         """Diagnostics: subscription, counters since start, the last error."""
+
+        def at(ts: float | None) -> str | None:
+            return None if ts is None else dt_util.utc_from_timestamp(ts).isoformat()
+
         return {
             "subscribed": self._unsubscribe is not None,
             "topic": f"{self.topic}/reviews",
@@ -150,10 +163,22 @@ class FrigateBridge:
             "quiet_minutes": self.quiet / 60,
             "quiet_kinds": sorted(self.quiet_kinds),
             **self._counts,
+            "ignored": dict(self._ignored),
             "queued": self._queue.qsize(),
-            "last_received": self._last_received,
-            "last_error": self._last_error and {"at": self._last_error[0], "error": self._last_error[1]},
+            "announcing": len(self._announcing),
+            "failing": self._failing,
+            "last_message": at(self._last_message),
+            "last_error": self._last_error and {"at": at(self._last_error[0]), "error": self._last_error[1]},
         }
+
+    def _ignore(self, reason: str) -> None:
+        self._ignored[reason] = self._ignored.get(reason, 0) + 1
+
+    def _error(self, err: Exception) -> None:
+        # Diagnostics end up in bug reports: an SSError's text is ours (no
+        # URL, no sid); anything else may quote a payload, so keep it short.
+        text = str(err) if isinstance(err, SSError) else f"{type(err).__name__}: {err}"
+        self._last_error = (time.time(), text[:300])
 
     async def start(self) -> bool:
         """Subscribe (False: MQTT isn't available); stop() undoes it."""
@@ -186,8 +211,8 @@ class FrigateBridge:
             return
         if not (isinstance(review, dict) and isinstance(review.get("after"), dict)):
             return
-        self._counts["received"] += 1
-        self._last_received = time.time()
+        self._counts["messages"] += 1
+        self._last_message = time.time()
         try:
             self._queue.put_nowait(review)
         except asyncio.QueueFull:
@@ -222,7 +247,7 @@ class FrigateBridge:
 
     def _fail(self, err: Exception) -> None:
         self._counts["failed"] += 1
-        self._last_error = (time.time(), repr(err))
+        self._error(err)
         if isinstance(err, SSError):
             self.manager.track(self.entry_id, err)
         if not self._failing:
@@ -234,10 +259,12 @@ class FrigateBridge:
         after = review["after"]
         review_id = str(after.get("id") or "")
         if kind not in ("new", "update", "end") or not _REVIEW_ID.fullmatch(f"[frigate {review_id}]"):
+            self._ignore("malformed" if kind in ("new", "update", "end") else "other_type")
             return
         try:
             start = int(float(after["start_time"]))
         except (KeyError, TypeError, ValueError):
+            self._ignore("malformed")
             return
         data = after.get("data") or {}
         # An object a sub label was given to (a known face, a plate) is
@@ -246,9 +273,11 @@ class FrigateBridge:
         objects = sorted((o for o in self.objects if o in seen), key=_rank)
         tracked = self._tracked.get(review_id)
         if tracked is None and not objects:
+            self._ignore("no_objects")  # none of the chosen objects (yet)
             return
         camera = await self._camera(str(after.get("camera") or ""))
         if camera is None:
+            self._ignore("unknown_camera")
             return
         camera_id, camera_name = camera
         zones = [str(z) for z in data.get("zones") or []]
@@ -283,6 +312,8 @@ class FrigateBridge:
             # its bookmark, but is old news for a notification.
             if kind != "end" and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
                 self._announce(review_id, bm.id, camera_id, camera_name, after, objects, zones, start, frame or start)
+            else:
+                self._counts["not_announced"] += 1
         elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
             await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
             tracked.name, tracked.comment, tracked.end = name, comment, end
@@ -359,9 +390,14 @@ class FrigateBridge:
 
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
-            await self.manager.thumbnail_when_recorded(
-                self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
-            )
+            try:
+                await self.manager.thumbnail_when_recorded(
+                    self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
+                )
+            except Exception as err:  # noqa: BLE001 - announce without the frame ready
+                self._counts["announce_failed"] += 1
+                self._error(err)
+                _LOGGER.warning("Frame for detection %s not ready: %r", review_id, err)
             self.hass.bus.async_fire(DETECTION_EVENT, payload)
             self._counts["announced"] += 1
 
