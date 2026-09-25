@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
-from synology_ss_playback import RecordingInfo, SSConnectionError
+from synology_ss_playback import RecordingInfo, SSConnectionError, SSError
 
 from homeassistant.core import HomeAssistant
 
@@ -60,6 +60,42 @@ async def test_unreachable(
     assert msg["error"] == {"code": "surveillance_station_error", "message": "Surveillance Station is unreachable"}
 
 
+async def test_no_entry_id_and_nothing_loaded(hass: HomeAssistant, hass_ws_client: WebSocketGenerator) -> None:
+    """No entry_id given and no Surveillance Station is set up at all."""
+    from custom_components.surveillance_station.const import DOMAIN
+    from homeassistant.setup import async_setup_component
+
+    assert await async_setup_component(hass, DOMAIN, {})
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/cameras"})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+
+
+async def test_unknown_entry_id(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/cameras", "entry_id": "not-a-real-entry-id"})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+
+
+async def test_generic_ss_error_is_reported_verbatim(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Unlike a connection error, a generic SSError's text (API + code) is sent as is."""
+    mock_client.cameras.side_effect = SSError("SYNO.SurveillanceStation.Camera", "List", 119)
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/cameras"})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "surveillance_station_error"
+    assert "119" in msg["error"]["message"]
+
+
 async def test_invalid_range(hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator) -> None:
     ws = await hass_ws_client(hass)
     await ws.send_json_auto_id({"type": "surveillance_station/recordings", "camera_id": 6, "start": T0, "end": T0})
@@ -107,6 +143,52 @@ async def test_vod_playlist_and_segments(
 
     assert (await client.get(f"{base}/seg/99.m4s")).status == HTTPStatus.NOT_FOUND
     assert (await client.get("/api/surveillance_station/vod/not-a-token/index.m3u8")).status == HTTPStatus.NOT_FOUND
+
+
+async def test_vod_window_in_the_future_is_rejected(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    future = T0 + 10_000_000  # long after "now" (mocked recordings ignore it anyway)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": future, "end": future + 60})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
+
+
+async def test_vod_no_recordings_in_window_returns_no_url(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, hass_ws_client: WebSocketGenerator
+) -> None:
+    mock_client.recordings.return_value = []
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": T0, "end": T0 + 60})
+    msg = await ws.receive_json()
+    assert msg["success"]
+    assert msg["result"] == {"url": None, "runs": [], "start": float(T0), "end": float(T0 + 60), "live": False}
+
+
+async def test_vod_runs(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": T0, "end": T0 + 60})
+    created = (await ws.receive_json())["result"]
+    token = created["url"].rsplit("/", 2)[1]
+
+    await ws.send_json_auto_id({"type": "surveillance_station/vod_runs", "token": token})
+    msg = await ws.receive_json()
+    assert msg["success"]
+    assert msg["result"]["runs"] == created["runs"]
+
+
+async def test_vod_runs_unknown_token(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod_runs", "token": "not-a-real-token"})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "invalid_format"
 
 
 async def test_sessions_dropped_on_unload(
@@ -225,6 +307,66 @@ async def test_thumbnail_nothing_recorded(
     client = await hass_client_no_auth()
     with patch("custom_components.surveillance_station.views.fetch_snapshot", AsyncMock(return_value=None)):
         assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
+
+
+async def test_thumbnail_surveillance_station_unreachable(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
+    client = await hass_client_no_auth()
+    down = AsyncMock(side_effect=SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None))
+    with patch("custom_components.surveillance_station.views.fetch_snapshot", down):
+        assert (await client.get(url)).status == HTTPStatus.BAD_GATEWAY
+
+
+async def test_thumbnail_surveillance_station_error(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
+    client = await hass_client_no_auth()
+    failed = AsyncMock(side_effect=SSError("SYNO.SurveillanceStation.Recording", "Download", 119))
+    with patch("custom_components.surveillance_station.views.fetch_snapshot", failed):
+        assert (await client.get(url)).status == HTTPStatus.BAD_GATEWAY
+
+
+async def test_vod_segment_surveillance_station_unreachable(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": T0, "end": T0 + 60})
+    base = (await ws.receive_json())["result"]["url"].rsplit("/", 1)[0]
+    client = await hass_client_no_auth()
+    down = AsyncMock(side_effect=SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None))
+    with patch("custom_components.surveillance_station.views.fetch_segment", down):
+        assert (await client.get(f"{base}/init/0.mp4")).status == HTTPStatus.BAD_GATEWAY
+
+
+async def test_vod_segment_surveillance_station_error(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": T0, "end": T0 + 60})
+    base = (await ws.receive_json())["result"]["url"].rsplit("/", 1)[0]
+    client = await hass_client_no_auth()
+    failed = AsyncMock(side_effect=SSError("SYNO.SurveillanceStation.Recording", "Download", 119))
+    with patch("custom_components.surveillance_station.views.fetch_segment", failed):
+        assert (await client.get(f"{base}/seg/0.m4s")).status == HTTPStatus.BAD_GATEWAY
 
 
 async def test_recording_in_progress(
