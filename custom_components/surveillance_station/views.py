@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import glob
 import logging
 import os
 import secrets
@@ -33,7 +34,8 @@ from .api import SSError, SurveillanceStationClient
 from .const import (
     MAX_PARALLEL_FETCHES,
     REMUX_TIMEOUT_SECONDS,
-    SEGMENT_CACHE_SIZE,
+    SEGMENT_CACHE_BYTES,
+    TEMP_PREFIX,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
@@ -76,7 +78,12 @@ class VodManager:
         # fragment timestamps depend on it, so only reloads of the same window
         # share entries.
         self._cache: OrderedDict[tuple, tuple[bytes, bytes]] = OrderedDict()
+        self._cache_bytes = 0
         self._inflight: dict[tuple, asyncio.Task] = {}
+        # Requests currently waiting on each in-flight fetch, and the fetches
+        # that got past the queue (those always finish, into the cache).
+        self._waiters: dict[tuple, int] = {}
+        self._started: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
 
     def create_session(self, session: VodSession) -> str:
@@ -134,7 +141,7 @@ class VodManager:
             self._cache.move_to_end(key)
             return self._cache[key]
         task = self._inflight.get(key)
-        if task is None:
+        if task is None or task.cancelling():
             # The fetch runs as its own task so a client abort (hls.js aborts
             # on every seek) neither kills the work nor the other requests
             # waiting for the same segment; a retry then finds it cached.
@@ -144,43 +151,59 @@ class VodManager:
             )
             task.add_done_callback(_retrieve_exception)
             self._inflight[key] = task
-        return await asyncio.shield(task)
+        self._waiters[key] = self._waiters.get(key, 0) + 1
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if left := self._waiters.pop(key) - 1:
+                self._waiters[key] = left
+            elif not task.done() and task not in self._started:
+                # Everyone gave up on it before it reached the NAS (a seek, a
+                # camera taken off the grid): don't let it hold up the queue
+                # for the segments that are wanted now.
+                task.cancel()
 
     async def _fetch_and_cache(self, key: tuple, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
+        me = asyncio.current_task()
         try:
-            result = await self._fetch_uncached(entry_id, seg)
+            async with self._sem:
+                self._started.add(me)
+                result = await self._fetch_uncached(entry_id, seg)
         finally:
-            self._inflight.pop(key, None)
+            self._started.discard(me)
+            if self._inflight.get(key) is me:
+                del self._inflight[key]
         self._cache[key] = result
-        while len(self._cache) > SEGMENT_CACHE_SIZE:
-            self._cache.popitem(last=False)
+        self._cache_bytes += len(result[0]) + len(result[1])
+        while self._cache_bytes > SEGMENT_CACHE_BYTES and len(self._cache) > 1:
+            _, (init, media) = self._cache.popitem(last=False)
+            self._cache_bytes -= len(init) + len(media)
         return result
 
     async def _fetch_uncached(self, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
         client = self.clients.get(entry_id)
         if client is None:
             raise SSError("vod", "fetch", None, "Surveillance Station entry is not loaded")
-        async with self._sem:
-            started = time.monotonic()
-            # Ask for a little extra; SS rounds to keyframes and ffmpeg -t trims.
-            raw = await client.download(
-                seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000) + 1000
-            )
-            fetched = time.monotonic()
-            data = await self._remux(raw, seg)
-            init, media = split_fmp4(data)
-            if not init or not media:
-                raise SSError("remux", "split", None, f"empty output for segment {seg.index}")
-            _LOGGER.debug(
-                "segment %s rec=%s off=%sms dur=%.1fs: download %.2fs (%d KB), remux %.2fs",
-                seg.index, seg.recording_id, seg.offset_ms, seg.duration,
-                fetched - started, len(raw) // 1024, time.monotonic() - fetched,
-            )
-            return init, media
+        started = time.monotonic()
+        # Ask for a little extra; SS rounds to keyframes and ffmpeg -t trims.
+        raw = await client.download(
+            seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000) + 1000
+        )
+        fetched = time.monotonic()
+        data = await self._remux(raw, seg)
+        init, media = split_fmp4(data)
+        if not init or not media:
+            raise SSError("remux", "split", None, f"empty output for segment {seg.index}")
+        _LOGGER.debug(
+            "segment %s rec=%s off=%sms dur=%.1fs: download %.2fs (%d KB), remux %.2fs",
+            seg.index, seg.recording_id, seg.offset_ms, seg.duration,
+            fetched - started, len(raw) // 1024, time.monotonic() - fetched,
+        )
+        return init, media
 
     async def _remux(self, raw: bytes, seg: Segment) -> bytes:
         # SS puts the moov box at the end, so ffmpeg needs a seekable file.
-        fd, path = tempfile.mkstemp(prefix="ss_vod_", suffix=".mp4")
+        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
         proc = None
         try:
             await self.hass.async_add_executor_job(_write_and_close, fd, raw)
@@ -207,6 +230,21 @@ class VodManager:
             await self.hass.async_add_executor_job(_unlink, path)
 
 
+def remove_stale_temp_files() -> int:
+    """Delete scratch files a crash (or a killed container) left behind.
+
+    Every remux unlinks its file when done, so at startup none can be in use.
+    """
+    removed = 0
+    for path in glob.glob(os.path.join(tempfile.gettempdir(), f"{TEMP_PREFIX}*.mp4")):
+        try:
+            os.unlink(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def to_recordings(infos) -> list[Recording]:
     return [Recording(r.id, r.start, r.end, r.mount_id, r.live, r.hevc) for r in infos]
 
@@ -227,6 +265,12 @@ def _unlink(path: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+
+
+# Every session has its own URLs, so a cached segment is never asked for again
+# once its session is gone; storing it would only fill the client's disk cache
+# (~2 GB per hour of a 4-camera grid). hls.js keeps what it needs in memory.
+_NO_STORE = {"Cache-Control": "no-store"}
 
 
 class _VodBaseView(HomeAssistantView):
@@ -278,7 +322,7 @@ class VodInitView(_VodBaseView):
     async def get(self, request: web.Request, token: str, index: str) -> web.Response:
         session = self._session(token)
         init, _ = await self._get_parts(session, self._segment(session, index))
-        return web.Response(body=init, content_type="video/mp4", headers={"Cache-Control": "private, max-age=3600"})
+        return web.Response(body=init, content_type="video/mp4", headers=_NO_STORE)
 
 
 class VodSegmentView(_VodBaseView):
@@ -288,4 +332,4 @@ class VodSegmentView(_VodBaseView):
     async def get(self, request: web.Request, token: str, index: str) -> web.Response:
         session = self._session(token)
         _, media = await self._get_parts(session, self._segment(session, index))
-        return web.Response(body=media, content_type="video/iso.segment", headers={"Cache-Control": "private, max-age=3600"})
+        return web.Response(body=media, content_type="video/iso.segment", headers=_NO_STORE)

@@ -21,7 +21,7 @@ from homeassistant.helpers.typing import ConfigType
 from . import websocket
 from .api import SSAuthError, SSError, SurveillanceStationClient
 from .const import CARD_FILENAME, CONF_VERIFY_SSL, DOMAIN, STATIC_URL
-from .views import VodInitView, VodManager, VodPlaylistView, VodSegmentView
+from .views import VodInitView, VodManager, VodPlaylistView, VodSegmentView, remove_stale_temp_files
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +35,8 @@ def _version() -> str:
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Register the parts shared by all entries: views, WS commands, the card."""
     manager = VodManager(hass)
+    if removed := await hass.async_add_executor_job(remove_stale_temp_files):
+        _LOGGER.info("Removed %d stale remux scratch files", removed)
     hass.data[DOMAIN] = manager
     for view in (VodPlaylistView, VodInitView, VodSegmentView):
         hass.http.register_view(view(manager))

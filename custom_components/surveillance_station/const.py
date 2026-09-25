@@ -15,8 +15,11 @@ VOD_SESSION_TTL_SECONDS = 4 * 3600
 VOD_MAX_SESSIONS = 64
 # Longest window one playlist may cover (the card asks for much less).
 VOD_MAX_WINDOW_SECONDS = 24 * 3600
-# Remuxed segments kept in memory (~6.5 MB each for a 4K H.265 stream).
-SEGMENT_CACHE_SIZE = 12
-# Parallel Download+remux jobs against the NAS.
+# Remuxed segments kept in memory, by size: a 10 s segment is 3.5-6.5 MB for
+# these 4K H.265 streams, so this holds ~20 of them (a few per camera in a grid).
+SEGMENT_CACHE_BYTES = 96 * 1024 * 1024
+# Scratch files ffmpeg reads from (SS puts the moov box at the end).
+TEMP_PREFIX = "ss_vod_"
 REMUX_TIMEOUT_SECONDS = 30
+# Parallel Download+remux jobs against the NAS.
 MAX_PARALLEL_FETCHES = 4
