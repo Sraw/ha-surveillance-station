@@ -18,4 +18,5 @@ VOD_MAX_WINDOW_SECONDS = 24 * 3600
 # Remuxed segments kept in memory (~6.5 MB each for a 4K H.265 stream).
 SEGMENT_CACHE_SIZE = 12
 # Parallel Download+remux jobs against the NAS.
+REMUX_TIMEOUT_SECONDS = 30
 MAX_PARALLEL_FETCHES = 4

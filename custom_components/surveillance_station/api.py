@@ -55,6 +55,10 @@ class SSAuthError(SSError):
     """Credentials were rejected."""
 
 
+class SSConnectionError(SSError):
+    """Surveillance Station could not be reached."""
+
+
 @dataclass(frozen=True)
 class Camera:
     id: int
@@ -102,8 +106,13 @@ class SurveillanceStationClient:
         self._sid: str | None = None
         self._login_lock = asyncio.Lock()
 
-    async def login(self) -> None:
+    async def login(self, stale_sid: str | None = None) -> None:
+        """Log in. With ``stale_sid``, skip if another caller already replaced it."""
         async with self._login_lock:
+            if stale_sid is not None and self._sid not in (None, stale_sid):
+                return
+            # POST so the password never sits in a URL (URLs end up in
+            # exception text and logs).
             data = await self._raw_json(
                 "auth.cgi",
                 {
@@ -115,10 +124,12 @@ class SurveillanceStationClient:
                     "session": "SurveillanceStation",
                     "format": "sid",
                 },
+                post=True,
             )
             if not data.get("success"):
                 code = data.get("error", {}).get("code")
-                raise SSAuthError("SYNO.API.Auth", "login", code)
+                cls = SSAuthError if code in AUTH_FAILED_ERRORS else SSError
+                raise cls("SYNO.API.Auth", "login", code)
             self._sid = data["data"]["sid"]
 
     async def logout(self) -> None:
@@ -130,32 +141,48 @@ class SurveillanceStationClient:
                 {"api": "SYNO.API.Auth", "method": "logout", "version": 6,
                  "session": "SurveillanceStation", "_sid": self._sid},
             )
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except SSError:
             pass
         self._sid = None
 
-    async def _raw_json(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        async with self._session.get(
-            f"{self._base}/{path}", params=params, timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
-            resp.raise_for_status()
-            return await resp.json(content_type=None)
+    async def _request(self, path: str, params: dict[str, Any], post: bool, timeout: float) -> tuple[bytes, str]:
+        """One HTTP round trip; errors never carry the URL (it holds the sid)."""
+        url = f"{self._base}/{path}"
+        kwargs = {"data": params} if post else {"params": params}
+        api, method = params.get("api", path), params.get("method", "")
+        try:
+            async with self._session.request(
+                "POST" if post else "GET", url, timeout=aiohttp.ClientTimeout(total=timeout), **kwargs
+            ) as resp:
+                if resp.status >= 400:
+                    raise SSError(api, method, None, f"HTTP {resp.status}")
+                return await resp.read(), resp.headers.get("Content-Type", "")
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise SSConnectionError(api, method, None, type(err).__name__) from None
+
+    async def _raw_json(self, path: str, params: dict[str, Any], post: bool = False) -> dict[str, Any]:
+        body, _ = await self._request(path, params, post, 30)
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise SSError(params.get("api", path), params.get("method", ""), None, "non-JSON reply") from None
 
     async def _call(self, api: str, method: str, version: int, **params: Any) -> dict[str, Any]:
         """entry.cgi call with one transparent re-login on session errors."""
         for attempt in (1, 2):
             if self._sid is None:
                 await self.login()
+            sid = self._sid
             data = await self._raw_json(
                 "entry.cgi",
-                {"api": api, "method": method, "version": version, "_sid": self._sid, **params},
+                {"api": api, "method": method, "version": version, "_sid": sid, **params},
             )
             if data.get("success"):
                 return data.get("data") or {}
             code = data.get("error", {}).get("code")
             if code in SESSION_ERRORS and attempt == 1:
                 _LOGGER.debug("Session error %s on %s.%s, logging in again", code, api, method)
-                self._sid = None
+                await self.login(stale_sid=sid)
                 continue
             raise SSError(api, method, code, data.get("error"))
         raise AssertionError("unreachable")
@@ -247,18 +274,14 @@ class SurveillanceStationClient:
         for attempt in (1, 2):
             if self._sid is None:
                 await self.login()
+            sid = self._sid
             params = {
                 "api": "SYNO.SurveillanceStation.Recording", "method": "Download", "version": 6,
                 "id": recording_id, "mountId": mount_id,
                 "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
-                "_sid": self._sid,
+                "_sid": sid,
             }
-            async with self._session.get(
-                f"{self._base}/entry.cgi", params=params, timeout=aiohttp.ClientTimeout(total=60)
-            ) as resp:
-                resp.raise_for_status()
-                body = await resp.read()
-                ctype = resp.headers.get("Content-Type", "")
+            body, ctype = await self._request("entry.cgi", params, False, 60)
             if "json" not in ctype and not body.startswith(b"{"):
                 return body
             try:
@@ -267,7 +290,7 @@ class SurveillanceStationClient:
                 err = {}
             code = err.get("error", {}).get("code")
             if code in SESSION_ERRORS and attempt == 1:
-                self._sid = None
+                await self.login(stale_sid=sid)
                 continue
             raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
         raise AssertionError("unreachable")

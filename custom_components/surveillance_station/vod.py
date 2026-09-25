@@ -87,6 +87,8 @@ def plan_segments(
     for rec in sorted(recordings, key=lambda r: r.start):
         rec_end = min(rec.end, now - LIVE_MARGIN_SECONDS) if rec.live else rec.end
         lo = max(start, rec.start)
+        if prev_end is not None:
+            lo = max(lo, prev_end)  # overlapping recordings: never play a moment twice
         hi = min(end, rec_end)
         t = lo
         while hi - t >= MIN_SEGMENT_SECONDS:
@@ -120,6 +122,16 @@ def plan_segments(
     return segments
 
 
+def live_edge(now: float, segment_seconds: int = SEGMENT_SECONDS) -> float:
+    """Last grid line that is safely behind real time.
+
+    A live playlist only ever publishes segments that end on this edge (or at
+    a recording boundary), so a segment never changes once published: a later
+    re-plan over a longer window yields the old segments as an exact prefix.
+    """
+    return math.floor((now - LIVE_MARGIN_SECONDS) / segment_seconds) * segment_seconds
+
+
 def runs_from_segments(segments: list[Segment]) -> list[Run]:
     """Collapse contiguous segments into wall-clock <-> media-time runs."""
     runs: list[Run] = []
@@ -140,9 +152,11 @@ def _pdt(ts: float) -> str:
     )
 
 
-def render_playlist(segments: list[Segment]) -> str:
-    """Render an HLS v7 VOD media playlist with fMP4 segments.
+def render_playlist(segments: list[Segment], live: bool = False) -> str:
+    """Render an HLS v7 media playlist with fMP4 segments.
 
+    ``live`` renders an EVENT playlist without ENDLIST, which players re-fetch
+    to pick up appended segments; otherwise a closed VOD playlist.
     URIs are relative to the playlist: ``init/<index>.mp4`` (the init
     segment derived from segment <index>) and ``seg/<index>.m4s``.
     """
@@ -152,7 +166,7 @@ def render_playlist(segments: list[Segment]) -> str:
         "#EXT-X-VERSION:7",
         f"#EXT-X-TARGETDURATION:{target}",
         "#EXT-X-MEDIA-SEQUENCE:0",
-        "#EXT-X-PLAYLIST-TYPE:VOD",
+        f"#EXT-X-PLAYLIST-TYPE:{'EVENT' if live else 'VOD'}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
     ]
     for seg in segments:
@@ -164,7 +178,8 @@ def render_playlist(segments: list[Segment]) -> str:
             lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{_pdt(seg.wall_start)}")
         lines.append(f"#EXTINF:{seg.duration:.3f},")
         lines.append(f"seg/{seg.index}.m4s")
-    lines.append("#EXT-X-ENDLIST")
+    if not live:
+        lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines) + "\n"
 
 

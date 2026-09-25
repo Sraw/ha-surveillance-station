@@ -71,6 +71,39 @@ class PlanSegments(unittest.TestCase):
         self.assertEqual(vod.plan_segments([rec], 20.0, 30.0, NOW), [])
 
 
+    def test_overlapping_recordings_play_each_moment_once(self):
+        a = Recording(id=1, start=0.0, end=60.0)
+        b = Recording(id=2, start=40.0, end=100.0)
+        segs = vod.plan_segments([a, b], 0.0, 100.0, NOW)
+        walls = [(s.wall_start, s.wall_start + s.duration) for s in segs]
+        for (s1, e1), (s2, _) in zip(walls, walls[1:]):
+            self.assertGreaterEqual(s2, e1)
+        self.assertEqual(sum(s.duration for s in segs), 100.0)
+        self.assertEqual(segs[-1].recording_id, 2)
+
+
+class LivePlanning(unittest.TestCase):
+    def test_live_edge_is_on_the_grid_behind_the_margin(self):
+        self.assertEqual(vod.live_edge(1000.0), 990.0)
+        self.assertEqual(vod.live_edge(1005.0), 1000.0)
+        self.assertEqual(vod.live_edge(1004.9), 990.0)
+
+    def test_replanning_a_live_window_keeps_published_segments(self):
+        """A later, longer plan must start with the earlier plan unchanged,
+        across a recording rollover that happens in between."""
+        start = 903.0
+        first_now = 1000.0
+        early = [Recording(id=1, start=0.0, end=first_now, live=True)]
+        old = vod.plan_segments(early, start, vod.live_edge(first_now), first_now)
+        later_now = 1100.0
+        # Recording 1 closed at 1003.7 (off-grid), recording 2 is live since.
+        late = [Recording(id=1, start=0.0, end=1003.7), Recording(id=2, start=1003.7, end=later_now, live=True)]
+        new = vod.plan_segments(late, start, vod.live_edge(later_now), later_now)
+        self.assertEqual(new[: len(old)], old)
+        self.assertGreater(len(new), len(old))
+        self.assertTrue(all(s.duration >= vod.MIN_SEGMENT_SECONDS for s in new))
+
+
 class Playlist(unittest.TestCase):
     def test_render(self):
         a = Recording(id=1, start=0.0, end=20.0)
@@ -81,6 +114,16 @@ class Playlist(unittest.TestCase):
         self.assertIn("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init/2.mp4\"\n#EXT-X-PROGRAM-DATE-TIME:1970-01-01T00:00:40.000Z", text)
         self.assertEqual(text.count("#EXTINF:10.000,"), 4)
         self.assertTrue(text.rstrip().endswith("#EXT-X-ENDLIST"))
+
+
+    def test_live_playlist_is_an_open_event_playlist(self):
+        segs = vod.plan_segments([Recording(id=1, start=0.0, end=30.0)], 0.0, 30.0, NOW)
+        live = vod.render_playlist(segs, live=True)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", live)
+        self.assertNotIn("#EXT-X-ENDLIST", live)
+        closed = vod.render_playlist(segs)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", closed)
+        self.assertTrue(closed.rstrip().endswith("#EXT-X-ENDLIST"))
 
 
 class Boxes(unittest.TestCase):

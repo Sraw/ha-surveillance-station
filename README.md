@@ -41,14 +41,22 @@ span: 3600            # optional: timeline width in seconds
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.
 
+A window that reaches the present is **live**: its playlist is an HLS EVENT
+playlist that grows as SS records (segments are only published once they end
+on the 10 s grid behind real time, so they never change afterwards). "Latest"
+therefore plays continuously about 20 s behind real time. Older windows are
+closed VOD playlists. When one ends, the card looks up the next recording and
+carries on.
+
 ## Security model
 
 The playlist and segment URLs carry a random 256-bit token and need no HA auth
 header, because hls.js cannot add one. The token is issued only to an
 authenticated WebSocket client (`surveillance_station/vod`). It is scoped to one
-camera and one time window, and expires after 4 hours (at most 64 live
-sessions). DSM credentials stay in the config entry. Browsers never see them or
-the SS session id.
+camera and one time window, and expires 4 hours after its last use (at most
+64 sessions, least recently used evicted first). DSM credentials stay in the
+config entry. Login is a POST, and errors are rebuilt without request URLs, so
+neither the password nor the SS session id reaches logs or browsers.
 
 ## Surveillance Station API notes (verified on SS 9.x, DSM 7)
 
@@ -60,9 +68,11 @@ the SS session id.
 - Bookmarks are embedded in `Recording.List` **v5** results (`bookmark[]`, with
   `timestamp`/`endtime`). There is no list method on `Recording.Bookmark`.
 - `Recording.Download` v6 with `offsetTimeMs` + `playTimeMs` returns an MP4 of
-  that range, rounded out to keyframes (10 s asked → ~11–12 s). It is
-  second-accurate, works on the file still being recorded, and puts moov at the
-  end with no Range support. Errors come back as JSON with HTTP 200.
+  that range. The start is floored to the keyframe (1 s GOP here: offsets of
+  20.0, 20.5 and 20.9 s give identical cuts), and the end runs past the request
+  (3 s asked → 4.9 s). It works on the file still being recorded, and puts moov
+  at the end with no Range support. Errors come back as JSON with HTTP 200.
+  Planning therefore uses whole-second boundaries, and ffmpeg `-t` trims the tail.
 
 ## ffmpeg / browser traps found while building this
 
@@ -83,3 +93,12 @@ the SS session id.
 ```
 python3 -m unittest discover -s tests -v
 ```
+
+Unit tests cover the pure planning/playlist logic. The endpoints and the card
+were verified against a live HA 2026.9 + SS setup:
+- ffprobe read the playlists: timestamps were continuous across recording
+  rollovers, and a live playlist grew with its published prefix unchanged.
+- The burned-in camera clock (OSD) matched the requested wall time.
+- A Playwright run of the card played real footage (segments transcoded to
+  H.264 in the test harness only, because headless Chromium has no HEVC). It
+  covered URL-parameter start, in-window seeking, and 45 s of live playback.

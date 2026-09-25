@@ -32,26 +32,37 @@ from homeassistant.core import HomeAssistant
 from .api import SSError, SurveillanceStationClient
 from .const import (
     MAX_PARALLEL_FETCHES,
+    REMUX_TIMEOUT_SECONDS,
     SEGMENT_CACHE_SIZE,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
-from .vod import Segment, ffmpeg_remux_args, render_playlist, split_fmp4
+from .vod import Recording, Segment, ffmpeg_remux_args, live_edge, plan_segments, render_playlist, split_fmp4
 
 _LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(slots=True)
 class VodSession:
     entry_id: str
     camera_id: int
+    window_start: float
     segments: list[Segment]
     expires: float
-    playlist: str = field(init=False)
+    # A live session reaches the present; its playlist is an EVENT playlist
+    # that grows (see VodManager.extend) until max_end.
+    live: bool = False
+    max_end: float = 0.0
+    planned_end: float = 0.0
+    playlist: str = field(init=False, default="")
+    lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
-        self.playlist = render_playlist(self.segments)
+        self.render()
+
+    def render(self) -> None:
+        self.playlist = render_playlist(self.segments, live=self.live)
 
 
 class VodManager:
@@ -61,56 +72,95 @@ class VodManager:
         self.hass = hass
         self.clients: dict[str, SurveillanceStationClient] = {}
         self._sessions: OrderedDict[str, VodSession] = OrderedDict()
-        # key -> (init, media); key identifies the cut, not the session, so
-        # two sessions over the same moment share work.
+        # key -> (init, media). media_start is part of the key because the
+        # fragment timestamps depend on it, so only reloads of the same window
+        # share entries.
         self._cache: OrderedDict[tuple, tuple[bytes, bytes]] = OrderedDict()
-        self._inflight: dict[tuple, asyncio.Future] = {}
+        self._inflight: dict[tuple, asyncio.Task] = {}
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
 
-    def create_session(self, entry_id: str, camera_id: int, segments: list[Segment]) -> str:
+    def create_session(self, session: VodSession) -> str:
         now = time.time()
         for token in [t for t, s in self._sessions.items() if s.expires < now]:
             del self._sessions[token]
         while len(self._sessions) >= VOD_MAX_SESSIONS:
-            self._sessions.popitem(last=False)
+            self._sessions.popitem(last=False)  # least recently used
         token = secrets.token_urlsafe(32)
-        self._sessions[token] = VodSession(entry_id, camera_id, segments, now + VOD_SESSION_TTL_SECONDS)
+        self._sessions[token] = session
         return token
 
     def get_session(self, token: str) -> VodSession | None:
         session = self._sessions.get(token)
-        if session is None or session.expires < time.time():
+        now = time.time()
+        if session is None or session.expires < now:
             return None
+        # Sessions in use stay alive and at the back of the eviction queue.
+        session.expires = now + VOD_SESSION_TTL_SECONDS
+        self._sessions.move_to_end(token)
         return session
+
+    async def extend(self, session: VodSession) -> None:
+        """Append the segments recorded since the live playlist was last planned."""
+        if not session.live:
+            return
+        async with session.lock:
+            now = time.time()
+            new_end = min(live_edge(now), session.max_end)
+            if new_end <= session.planned_end:
+                return
+            client = self.clients.get(session.entry_id)
+            if client is None:
+                return
+            try:
+                infos = await client.recordings(session.camera_id, int(session.window_start), int(new_end) + 1)
+            except SSError as err:
+                _LOGGER.debug("Live playlist not extended: %s", err)
+                return
+            segments = plan_segments(to_recordings(infos), session.window_start, new_end, now)
+            old = session.segments
+            if segments[: len(old)] != old:
+                # Should not happen (see vod.live_edge); never rewrite what a
+                # player may already have fetched.
+                _LOGGER.warning("Live re-plan changed published segments; keeping the old playlist")
+                return
+            session.segments = segments
+            session.planned_end = new_end
+            if new_end >= session.max_end:
+                session.live = False
+            session.render()
 
     async def fetch(self, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
         key = (session.entry_id, seg.recording_id, seg.offset_ms, round(seg.duration, 3), round(seg.media_start, 3))
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-        if key in self._inflight:
-            return await self._inflight[key]
-        fut: asyncio.Future = self.hass.loop.create_future()
-        self._inflight[key] = fut
+        task = self._inflight.get(key)
+        if task is None:
+            # The fetch runs as its own task so a client abort (hls.js aborts
+            # on every seek) neither kills the work nor the other requests
+            # waiting for the same segment; a retry then finds it cached.
+            task = self.hass.async_create_background_task(
+                self._fetch_and_cache(key, session.entry_id, seg),
+                f"surveillance_station segment {seg.recording_id}@{seg.offset_ms}",
+            )
+            task.add_done_callback(_retrieve_exception)
+            self._inflight[key] = task
+        return await asyncio.shield(task)
+
+    async def _fetch_and_cache(self, key: tuple, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
         try:
-            result = await self._fetch_uncached(session.entry_id, seg)
-        except asyncio.CancelledError:
-            fut.cancel()
-            raise
-        except Exception as err:
-            fut.set_exception(err)
-            fut.exception()  # mark retrieved; waiters re-raise it
-            raise
+            result = await self._fetch_uncached(entry_id, seg)
         finally:
             self._inflight.pop(key, None)
-        fut.set_result(result)
         self._cache[key] = result
         while len(self._cache) > SEGMENT_CACHE_SIZE:
             self._cache.popitem(last=False)
         return result
 
     async def _fetch_uncached(self, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
-        client = self.clients[entry_id]
+        client = self.clients.get(entry_id)
+        if client is None:
+            raise SSError("vod", "fetch", None, "Surveillance Station entry is not loaded")
         async with self._sem:
             started = time.monotonic()
             # Ask for a little extra; SS rounds to keyframes and ffmpeg -t trims.
@@ -132,21 +182,40 @@ class VodManager:
     async def _remux(self, raw: bytes, seg: Segment) -> bytes:
         # SS puts the moov box at the end, so ffmpeg needs a seekable file.
         fd, path = tempfile.mkstemp(prefix="ss_vod_", suffix=".mp4")
+        proc = None
         try:
             await self.hass.async_add_executor_job(_write_and_close, fd, raw)
             proc = await asyncio.create_subprocess_exec(
                 *ffmpeg_remux_args(
                     get_ffmpeg_manager(self.hass).binary, path, seg.duration, seg.media_start, seg.hevc
                 ),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            out, err = await proc.communicate()
+            try:
+                async with asyncio.timeout(REMUX_TIMEOUT_SECONDS):
+                    out, err = await proc.communicate()
+            except TimeoutError:
+                raise SSError("ffmpeg", "remux", None, "timed out") from None
             if proc.returncode != 0:
                 raise SSError("ffmpeg", "remux", proc.returncode, err.decode(errors="replace")[-400:])
             return out
         finally:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
             await self.hass.async_add_executor_job(_unlink, path)
+
+
+def to_recordings(infos) -> list[Recording]:
+    return [Recording(r.id, r.start, r.end, r.mount_id, r.live, r.hevc) for r in infos]
+
+
+def _retrieve_exception(task: asyncio.Task) -> None:
+    # Everyone waiting may have gone away; don't log "never retrieved".
+    if not task.cancelled():
+        task.exception()
 
 
 def _write_and_close(fd: int, data: bytes) -> None:
@@ -184,9 +253,9 @@ class _VodBaseView(HomeAssistantView):
     async def _get_parts(self, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
         try:
             return await self.manager.fetch(session, seg)
-        except SSError as err:
+        except SSError as err:  # includes connection errors, see api.py
             _LOGGER.warning("Segment %s of recording %s failed: %s", seg.index, seg.recording_id, err)
-            raise web.HTTPBadGateway() from err
+            raise web.HTTPBadGateway() from None
 
 
 class VodPlaylistView(_VodBaseView):
@@ -195,6 +264,7 @@ class VodPlaylistView(_VodBaseView):
 
     async def get(self, request: web.Request, token: str) -> web.Response:
         session = self._session(token)
+        await self.manager.extend(session)
         return web.Response(
             text=session.playlist,
             content_type="application/vnd.apple.mpegurl",

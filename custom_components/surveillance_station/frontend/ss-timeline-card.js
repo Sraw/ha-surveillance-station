@@ -15,7 +15,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.1.1";
+const CARD_VERSION = "0.2.0";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -175,7 +175,6 @@ class SSTimelineCard extends HTMLElement {
 
   disconnectedCallback() {
     clearInterval(this._refresh);
-    clearTimeout(this._nextTimer);
     if (this._session) this._resumeAt = this._currentWall();
     this._playSeq++;
     this._destroyPlayer();
@@ -302,7 +301,10 @@ class SSTimelineCard extends HTMLElement {
       this._onTime();
     });
     v.addEventListener("waiting", () => this._setStatus("Buffering…"));
-    v.addEventListener("playing", () => this._setStatus(""));
+    v.addEventListener("playing", () => {
+      this._expiredRetry = false;
+      this._setStatus("");
+    });
     v.addEventListener("play", () => this._playIcon.setAttribute("icon", "mdi:pause"));
     v.addEventListener("pause", () => this._playIcon.setAttribute("icon", "mdi:play"));
     v.addEventListener("ended", () => this._continue());
@@ -474,8 +476,10 @@ class SSTimelineCard extends HTMLElement {
   _seek(t, autoplay) {
     t = Math.min(t, nowS() - LIVE_LAG);
     const s = this._session;
-    if (s && this._mediaReady && t >= s.start && t < s.end - 1) {
-      const m = this._wallToMedia(t);
+    // A live session's playlist keeps growing, so its end is "now".
+    const end = s?.live ? nowS() - LIVE_LAG : (s?.end ?? 0) - 1;
+    if (s && this._mediaReady && t >= s.start && t < end) {
+      const m = this._wallToMedia(t) ?? (s.live ? this._wallToMediaLive(t) : null);
       if (m != null) {
         this._target = t;
         this._video.currentTime = m;
@@ -487,9 +491,19 @@ class SSTimelineCard extends HTMLElement {
     this._loadWindow(t, autoplay);
   }
 
-  async _loadWindow(t, autoplay) {
+  /** Past the last run of a live session, media time continues that run. */
+  _wallToMediaLive(t) {
+    const r = this._session?.runs?.at(-1);
+    return r && t >= r.wall_start ? r.media_start + (t - r.wall_start) : null;
+  }
+
+  /**
+   * Load a playback window around wall time t.
+   * `after`: when continuing past the end of a window, the wall time the new
+   * window must get beyond; otherwise playback stops instead of looping.
+   */
+  async _loadWindow(t, autoplay, after = null) {
     const seq = ++this._playSeq;
-    clearTimeout(this._nextTimer);
     const now = nowS();
     t = Math.min(t, now - LIVE_LAG);
     this._target = t;
@@ -508,20 +522,21 @@ class SSTimelineCard extends HTMLElement {
       return;
     }
     if (seq !== this._playSeq) return;
-    if (!res.url) {
+    const stop = (text) => {
       this._destroyPlayer();
       this._session = null;
-      this._setStatus("No recording at this time", true);
-      return;
-    }
+      this._setStatus(text, true);
+    };
+    if (!res.url) return stop("No recording at this time");
+    if (after != null && res.end <= after + 1) return stop("No later recording");
+    this._session = res;
+    let start = this._wallToMedia(t);
+    if (start == null && res.live) start = this._wallToMediaLive(t);
+    if (start == null) return stop(`No recording after ${fmtTime(t)}`);
+    if (t < res.runs[0].wall_start - 1) this._target = res.runs[0].wall_start; // started in a gap
     const Hls = await loadHls();
     if (seq !== this._playSeq) return;
     this._destroyPlayer();
-    this._session = res;
-    const start = this._wallToMedia(t) ?? 0;
-    if (start > 0 && t < res.runs[0].wall_start - 1) {
-      this._target = res.runs[0].wall_start;
-    }
     const v = this._video;
     v.playbackRate = v.defaultPlaybackRate = this._rate;
 
@@ -532,6 +547,7 @@ class SSTimelineCard extends HTMLElement {
         v.addEventListener(
           "loadedmetadata",
           () => {
+            if (seq !== this._playSeq) return;
             v.currentTime = start;
             if (autoplay) v.play().catch(() => {});
           },
@@ -562,30 +578,53 @@ class SSTimelineCard extends HTMLElement {
         hls.recoverMediaError();
         return;
       }
+      const wall = this._currentWall();
+      this._destroyPlayer();
+      this._session = null;
+      // 404: the session expired or was evicted; start a fresh one once.
+      if (d.response?.code === 404 && !this._expiredRetry) {
+        this._expiredRetry = true;
+        this._loadWindow(wall, !v.paused || autoplay);
+        return;
+      }
       const codec = /codec/i.test(d.details) || d.details === "manifestIncompatibleCodecsError";
       this._setStatus(
         codec ? "This browser can't decode H.265 (HEVC) video" : `Playback error: ${d.details}`,
         true
       );
-      hls.destroy();
-      if (this._hls === hls) this._hls = null;
     });
     hls.loadSource(res.url);
     hls.attachMedia(v);
   }
 
-  /** At the end of a window, carry on into whatever was recorded next. */
-  _continue() {
+  /** At the end of a (non-live) window, carry on into whatever was recorded next. */
+  async _continue() {
     const s = this._session;
-    if (!s) return;
+    if (!s || s.live) return;
+    const seq = this._playSeq;
     const next = s.end;
-    const ready = nowS() - LIVE_LAG - 10;
-    if (ready >= next) {
-      this._loadWindow(next, true);
-    } else {
-      this._setStatus("Waiting for new footage…");
-      this._nextTimer = setTimeout(() => this._continue(), (next - ready) * 1000 + 500);
+    this._setStatus("Looking for the next recording…");
+    let recs;
+    try {
+      recs = (
+        await this._ws({
+          type: "surveillance_station/recordings",
+          camera_id: this._cameraId,
+          start: Math.floor(next),
+          end: Math.ceil(nowS()),
+        })
+      ).recordings;
+    } catch (e) {
+      if (seq === this._playSeq) this._setStatus(`Playback failed: ${errText(e)}`, true);
+      return;
     }
+    if (seq !== this._playSeq) return;
+    const rec = recs.find((r) => (r.live ? nowS() : r.end) > next + 1);
+    if (!rec) {
+      this._setStatus("No later recording", true);
+      return;
+    }
+    this._loadWindow(Math.max(rec.start, next), true, next);
   }
 
   // ---- timeline ---------------------------------------------------------

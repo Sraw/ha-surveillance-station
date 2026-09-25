@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
-
-import aiohttp
 
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
@@ -63,7 +60,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await client.login()
     except SSAuthError as err:
         raise ConfigEntryAuthFailed(str(err)) from err
-    except (SSError, aiohttp.ClientError, asyncio.TimeoutError) as err:
+    except SSError as err:
         raise ConfigEntryNotReady(str(err)) from err
     hass.data[DOMAIN].clients[entry.entry_id] = client
     return True

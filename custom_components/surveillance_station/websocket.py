@@ -5,16 +5,18 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import aiohttp
 import voluptuous as vol
 
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
-from .api import SSError, SurveillanceStationClient
-from .const import DOMAIN, VOD_MAX_WINDOW_SECONDS, VOD_URL
-from .views import VodManager
-from .vod import Recording, plan_segments, runs_from_segments
+from .api import SSConnectionError, SSError, SurveillanceStationClient
+from .const import DOMAIN, VOD_MAX_WINDOW_SECONDS, VOD_SESSION_TTL_SECONDS, VOD_URL
+from .views import VodManager, VodSession, to_recordings
+from .vod import live_edge, plan_segments, runs_from_segments
+
+# A window whose end is at least this close to now becomes a live session.
+LIVE_THRESHOLD_SECONDS = 60
 
 ERR_SS = "surveillance_station_error"
 
@@ -50,7 +52,10 @@ async def _run(connection: websocket_api.ActiveConnection, msg: dict[str, Any], 
         connection.send_result(msg["id"], await coro)
     except (KeyError, ValueError) as err:
         connection.send_error(msg["id"], websocket_api.ERR_INVALID_FORMAT, str(err))
-    except (SSError, aiohttp.ClientError, TimeoutError) as err:
+    except SSConnectionError:
+        connection.send_error(msg["id"], ERR_SS, "Surveillance Station is unreachable")
+    except SSError as err:
+        # SSError text is built from API names and SS error codes only.
         connection.send_error(msg["id"], ERR_SS, str(err))
 
 
@@ -117,24 +122,34 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
 
     ``runs`` maps playlist time to wall-clock time (a new run starts after
     every gap in the recordings), so the card can show and seek by clock time.
+    A window reaching the present is ``live``: its playlist keeps growing,
+    and media time past the last run continues that run linearly.
     """
 
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
         start, end = _range(msg)
+        # Whole seconds: SS floors cut offsets to a keyframe (1 s GOP), so a
+        # fractional start would begin the first segment early.
+        start = float(int(start))
         now = time.time()
-        end = min(end, now, start + VOD_MAX_WINDOW_SECONDS)
+        max_end = start + VOD_MAX_WINDOW_SECONDS
+        live = end >= now - LIVE_THRESHOLD_SECONDS and now < max_end
+        end = min(live_edge(now) if live else min(end, now), max_end)
         if end <= start:
             raise ValueError("window is in the future")
         infos = await client.recordings(msg["camera_id"], int(start), int(end) + 1)
-        segments = plan_segments(
-            [Recording(r.id, r.start, r.end, r.mount_id, r.live, r.hevc) for r in infos], start, end, now
-        )
+        segments = plan_segments(to_recordings(infos), start, end, now)
         if not segments:
-            return {"url": None, "runs": [], "start": start, "end": end}
-        token = _manager(hass).create_session(entry_id, msg["camera_id"], segments)
+            return {"url": None, "runs": [], "start": start, "end": end, "live": False}
+        session = VodSession(
+            entry_id, msg["camera_id"], start, segments, now + VOD_SESSION_TTL_SECONDS,
+            live=live, max_end=max_end, planned_end=end,
+        )
+        token = _manager(hass).create_session(session)
         return {
             "url": f"{VOD_URL}/{token}/index.m3u8",
+            "live": live,
             "start": segments[0].wall_start,
             "end": segments[-1].wall_start + segments[-1].duration,
             "runs": [
