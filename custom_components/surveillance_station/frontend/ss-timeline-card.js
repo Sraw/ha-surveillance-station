@@ -22,17 +22,21 @@
  * a link asked for.
  *
  * Card options (all optional):
- *   cameras:  names or ids to show (default: all); the viewer's last choice
+ *   cameras:  names or ids in the grid (default: all); the viewer's last choice
  *             (the camera chips) wins
  *   camera:   name or id of the camera to start on (the master)
+ *   view:     "single" to start on one camera instead of the grid; the
+ *             viewer's last choice wins
  *   span:     timeline width in seconds (default 3600); the viewer's last choice wins
- *   clock:    false hides the time overlay; the viewer's last choice wins
+ *   clock:    false hides the time on the video; the viewer's last choice wins
+ *   live_badge:   false hides the LIVE badge on the video; likewise
+ *   camera_names: false hides the camera names in grid cells; likewise
  *   entry_id: which Surveillance Station entry, if there is more than one
  * URL parameters override on load: ?ss_camera=<name|id>&ss_time=<epoch seconds>
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.8.0";
+const CARD_VERSION = "0.8.1";
 
 const SPANS = [
   [900, "15m"],
@@ -54,13 +58,19 @@ const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
 const BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 const THUMB_RETRY_MS = 30_000;
 const EVENT_PAGE = 30; // events per page of the list; more load as it scrolls
-// The list (and its thumbnail links, valid ~24 h) is reloaded after this long.
+// The list (and its thumbnail links, valid 24-48 h) is reloaded after this long.
 const EVENT_LIST_MAX_AGE_MS = 12 * 3600 * 1000;
 const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
 // One colour per camera (chip, cell label, timeline pins, event rows); these
 // read on both light and dark backgrounds.
 const CAM_COLORS = ["#4f8ff7", "#f5a623", "#2dbd8f", "#e5534b", "#a371f7", "#e05aa8", "#1fb5c6", "#c9a227"];
 const MIN_STAGE_HEIGHT = 160; // px; below this the page scrolls instead
+// What's laid over the video and can be hidden: [pref key and card option, label].
+const SHOWS = [
+  ["clock", "Time"],
+  ["live_badge", "Live badge"],
+  ["camera_names", "Camera names"],
+];
 // Grid sync: how often followers correct, and how.
 const SYNC_MS = 500;
 // HLS followers, seconds off:
@@ -256,7 +266,7 @@ const STYLE = `
   .stage.single .label { display: none; }
   .clock { position: absolute; top: 6px; left: 6px; z-index: 3; padding: 1px 6px; border-radius: 4px;
     background: rgba(0,0,0,.45); color: #fff; font-variant-numeric: tabular-nums; font-size: 12px; pointer-events: none; }
-  .stage.noclock .clock { display: none; }
+  .stage.noclock .clock, .stage.nolive .livetag, .stage.nonames .label { display: none; }
   .livetag { position: absolute; top: 6px; right: 6px; z-index: 3; padding: 1px 7px; border-radius: 4px; font-size: 11px;
     font-weight: 600; letter-spacing: .04em; color: #fff; background: #d93025; pointer-events: none; }
 
@@ -322,6 +332,11 @@ const STYLE = `
     border: 1px solid var(--divider-color); box-shadow: 0 4px 16px rgba(0,0,0,.25); }
   .jump .when { flex: 1 1 auto; min-width: 0; }
   .jump button { flex: none; }
+  .jump.shows { flex-direction: column; gap: 2px; padding: 6px; }
+  .shows button { justify-content: flex-start; border: none; border-radius: 8px; padding: 0 10px 0 6px; }
+  .shows button ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text-color); }
+  .shows button.on ha-icon { color: var(--primary-color); }
+  .shows button.on { background: transparent; }
   @container (max-width: 520px) {
     .controls .wide { display: none; }
     .controls .live .txt { display: none; }
@@ -1892,7 +1907,8 @@ class SSTimelineCard extends HTMLElement {
     this._tlSeq = 0;
     this._followPausedUntil = 0;
     this._shown = []; // camera ids on screen, in camera order
-    this._prevShown = null; // what the grid button goes back to
+    this._grid = true; // grid mode: chips add / remove cameras; else they switch the one shown
+    this._gridSet = []; // the grid's cameras, kept while one camera is shown
     this._evItems = []; // event list: bookmarks of the shown cameras, newest first, as loaded
     this._evSeq = 0;
     this._drag = false;
@@ -1912,10 +1928,11 @@ class SSTimelineCard extends HTMLElement {
     // dashboards usually rebuild their cards on reconnect (this one is then
     // disconnected by the time the timer fires); a card that stays catches up.
     this._onReconnect = () => setTimeout(() => this._reconnected(), 1000);
-    // The date/time popover closes on Escape or a tap anywhere else.
+    // The popovers (date/time, what's shown) close on Escape or a tap anywhere else.
     this._onDocDown = (e) => {
-      if (this._jumpBox && !this._jumpBox.hidden && !e.composedPath().some((n) => n.classList?.contains("jumpwrap")))
-        this._jumpBox.hidden = true;
+      const path = e.composedPath();
+      for (const [box, wrap] of [[this._jumpBox, "jumpwrap"], [this._showsBox, "showwrap"]])
+        if (box && !box.hidden && !path.some((n) => n.classList?.contains(wrap))) box.hidden = true;
     };
   }
 
@@ -1949,7 +1966,8 @@ class SSTimelineCard extends HTMLElement {
     this._span = SPANS.map(([v]) => v).reduce((a, b) => (Math.abs(b - span) < Math.abs(a - span) ? b : a));
     const end = nowS() + this._span * 0.05;
     this._view = { start: end - this._span, end };
-    this._showClock = prefs.get("clock", this._config.clock !== false);
+    // What's laid over the video; each can be hidden (see SHOWS).
+    this._shows = Object.fromEntries(SHOWS.map(([k]) => [k, prefs.get(k, this._config[k] !== false)]));
   }
 
   set hass(hass) {
@@ -2038,11 +2056,16 @@ class SSTimelineCard extends HTMLElement {
     }
     this._stageMessage("");
     const params = new URLSearchParams(location.search);
-    this._shown = this._initialShown();
-    this._prevShown = prefs.get("cameras_prev", null);
-    // A camera asked for (e.g. by a notification link) is added to the shown ones.
+    const view = this._initialView();
+    this._gridSet = view.cameras;
+    this._grid = view.grid && this._cameras.length > 1;
+    // A camera asked for (e.g. by a notification link) is added to the grid,
+    // or is the one shown; else the one watched last.
     const asked = this._findCamera(params.get("ss_camera") ?? this._config.camera);
-    const cam = asked ?? this._cameras.find((c) => this._shown.includes(c.id));
+    const last = this._findCamera(prefs.get("camera", null));
+    const cam =
+      asked ?? (last && (!this._grid || this._gridSet.includes(last.id)) ? last : this._findCamera(this._gridSet[0]));
+    this._shown = this._grid ? [...this._gridSet] : [cam.id];
     const t = Number(params.get("ss_time"));
     this._renderCameras();
     this._cameraId = cam.id;
@@ -2067,15 +2090,27 @@ class SSTimelineCard extends HTMLElement {
     return this._cameras.find((c) => String(c.id) === w || c.name.toLowerCase() === w) ?? null;
   }
 
-  /** Cameras shown: the viewer's last pick, else the `cameras` option, else all. */
-  _initialShown() {
-    const known = (ids) => ids.filter((id) => this._cameras.some((c) => c.id === id));
-    const saved = prefs.get("cameras", null);
-    let ids = Array.isArray(saved) ? known(saved) : [];
+  /**
+   * The grid's cameras (the viewer's last pick, else the `cameras` option,
+   * else all) and whether the grid is on (the viewer's, else `view`).
+   */
+  _initialView() {
+    const known = (ids) => (Array.isArray(ids) ? ids.filter((id) => this._cameras.some((c) => c.id === id)) : []);
+    let ids = known(prefs.get("cameras", null));
+    let grid = prefs.get("grid", null);
+    if (grid === null && ids.length === 1) {
+      // Before 0.8.1 one camera shown was the single view, and the grid's
+      // cameras were kept aside.
+      grid = false;
+      prefs.set("camera", ids[0]);
+      ids = known(prefs.get("cameras_prev", null));
+      prefs.set("grid", false);
+      if (ids.length) prefs.set("cameras", ids);
+    }
     if (!ids.length && Array.isArray(this._config.cameras)) {
       ids = this._config.cameras.map((x) => this._findCamera(x)?.id).filter((id) => id != null);
     }
-    return ids.length ? ids : this._cameras.map((c) => c.id);
+    return { cameras: ids.length ? ids : this._cameras.map((c) => c.id), grid: grid ?? this._config.view !== "single" };
   }
 
   _cameraName(id) {
@@ -2132,7 +2167,12 @@ class SSTimelineCard extends HTMLElement {
                 </span>
               </span>
               <button class="icon" data-act="solo">${icon("mdi:view-grid-outline")}</button>
-              <button class="icon" data-act="clock" title="Show / hide the time on the video">${icon("mdi:clock-outline")}</button>
+              <span class="showwrap">
+                <button class="icon" data-act="shows" title="What's shown on the video">${icon("mdi:eye-outline")}</button>
+                <span class="jump shows" hidden>
+                  ${SHOWS.map(([k, label]) => `<button data-show="${k}" aria-pressed="true">${icon("mdi:checkbox-marked")}<span>${label}</span></button>`).join("")}
+                </span>
+              </span>
               <button class="icon" data-act="mute" title="Sound">${icon("mdi:volume-off")}</button>
               <button class="icon" data-act="fs" title="Fullscreen">${icon("mdi:fullscreen")}</button>
             </div>
@@ -2176,7 +2216,8 @@ class SSTimelineCard extends HTMLElement {
     this._evItemsEl = $(".ev-items");
     this._evFoot = $(".ev-foot");
     this._when = $(".when");
-    this._jumpBox = $(".jump");
+    this._jumpBox = $(".jump:not(.shows)");
+    this._showsBox = $(".shows");
 
     if (hevcSupport() === false) {
       $(".warn").textContent =
@@ -2242,12 +2283,13 @@ class SSTimelineCard extends HTMLElement {
     );
     this._evObserver.observe(this._evFoot);
     this._evNodes.clear(); // they belonged to the old list element
-    this._jumpBox.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") this._jumpBox.hidden = true;
-    });
+    for (const box of [this._jumpBox, this._showsBox])
+      box.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") box.hidden = true;
+      });
 
     this._markSpan();
-    this._applyClock();
+    this._applyShows();
     this._resizeObs.observe(this);
   }
 
@@ -2314,8 +2356,8 @@ class SSTimelineCard extends HTMLElement {
     this._setMaster(this._cameraId);
     for (const b of this.shadowRoot.querySelectorAll('[data-act="solo"]')) {
       b.hidden = this._cameras.length < 2;
-      b.title = n > 1 ? "Only this camera" : "Back to the grid";
-      b.querySelector("ha-icon").setAttribute("icon", n > 1 ? "mdi:square-outline" : "mdi:view-grid-outline");
+      b.title = this._grid ? "One camera (the chips switch it)" : "Grid (the chips add and remove cameras)";
+      b.querySelector("ha-icon").setAttribute("icon", this._grid ? "mdi:square-outline" : "mdi:view-grid-outline");
     }
     return added;
   }
@@ -2332,6 +2374,7 @@ class SSTimelineCard extends HTMLElement {
     const muted = old && old !== p ? old.video.muted : p.video.muted;
     this._master = p;
     this._cameraId = id;
+    prefs.set("camera", id);
     for (const q of this._players.values()) {
       q.el.classList.toggle("master", q === p);
       if (q !== p) q.video.muted = true;
@@ -2373,7 +2416,10 @@ class SSTimelineCard extends HTMLElement {
     this._shown = [...new Set([...ids, master])];
     this._cameraId = master;
     const added = this._buildPlayers();
-    prefs.set("cameras", this._shown);
+    if (this._grid) {
+      this._gridSet = this._shown;
+      prefs.set("cameras", this._shown);
+    }
     for (const p of this._players.values()) p.zoom.reset(); // the cell size changed
     // New cells start empty. Moving a video element in the DOM pauses it:
     // the master resumes here, followers through follow().
@@ -2388,7 +2434,12 @@ class SSTimelineCard extends HTMLElement {
     }
   }
 
-  /** Chip: show / hide a camera. The last one stays. */
+  /** Chip: in the grid, show / hide a camera (the last one stays); else show that one instead. */
+  _chip(id) {
+    if (this._grid) this._toggleCamera(id);
+    else if (id !== this._cameraId) this._setShown([id], id);
+  }
+
   _toggleCamera(id) {
     if (!this._shown.includes(id)) return this._setShown([...this._shown, id]);
     if (this._shown.length === 1) return;
@@ -2396,22 +2447,21 @@ class SSTimelineCard extends HTMLElement {
     this._setShown(rest, id === this._cameraId ? rest[0] : this._cameraId);
   }
 
-  /** Just the master, or back to the cameras shown before (else all). */
-  _toggleSolo() {
-    if (this._shown.length > 1) {
-      this._prevShown = this._shown;
-      prefs.set("cameras_prev", this._prevShown);
-      this._setShown([this._cameraId]);
-    } else {
-      const back = this._prevShown?.filter((id) => this._cameras.some((c) => c.id === id));
-      this._setShown(back?.length > 1 ? back : this._cameras.map((c) => c.id));
-    }
+  /** Grid <-> one camera (the master; back in the grid, the grid's cameras). */
+  _toggleGrid() {
+    this._grid = !this._grid;
+    prefs.set("grid", this._grid);
+    if (!this._grid) return this._setShown([this._cameraId]);
+    const set = this._gridSet.filter((id) => this._cameras.some((c) => c.id === id));
+    const ids = set.length ? set : this._cameras.map((c) => c.id);
+    this._setShown(ids, ids.includes(this._cameraId) ? this._cameraId : ids[0]);
   }
 
   /** Make a camera the master (showing it if needed) and go to t. */
   _selectCamera(id, t, autoplay) {
     if (this._shown.includes(id)) this._setMaster(id);
-    else this._setShown([...this._shown, id], id, t, autoplay); // _seekAll then finds it loading there
+    // _seekAll then finds it loading there.
+    else this._setShown(this._grid ? [...this._shown, id] : [id], id, t, autoplay);
     this._centerOn(t);
     this._loadTimeline();
     this._seekAll(t, autoplay);
@@ -2453,7 +2503,7 @@ class SSTimelineCard extends HTMLElement {
       if (double) {
         // Double tap a cell: that camera alone.
         this._setMaster(player.cameraId);
-        this._toggleSolo();
+        this._toggleGrid();
       } else this._setMaster(player.cameraId);
     } else if (double) {
       player.zoom.toggleAt(x, y);
@@ -2472,9 +2522,17 @@ class SSTimelineCard extends HTMLElement {
     this.shadowRoot.querySelector('[data-act="mute"] ha-icon')?.setAttribute("icon", muted ? "mdi:volume-off" : "mdi:volume-high");
   }
 
-  _applyClock() {
-    this._stage.classList.toggle("noclock", !this._showClock);
-    this.shadowRoot.querySelector('.controls [data-act="clock"]')?.classList.toggle("on", this._showClock);
+  _applyShows() {
+    const cls = { clock: "noclock", live_badge: "nolive", camera_names: "nonames" };
+    for (const [k] of SHOWS) {
+      this._stage.classList.toggle(cls[k], !this._shows[k]);
+      const b = this.shadowRoot.querySelector(`[data-show="${k}"]`);
+      b?.classList.toggle("on", this._shows[k]);
+      b?.setAttribute("aria-pressed", String(this._shows[k]));
+      b?.querySelector("ha-icon").setAttribute("icon", this._shows[k] ? "mdi:checkbox-marked" : "mdi:checkbox-blank-outline");
+    }
+    const all = SHOWS.every(([k]) => this._shows[k]);
+    this.shadowRoot.querySelector('[data-act="shows"] ha-icon')?.setAttribute("icon", all ? "mdi:eye-outline" : "mdi:eye-off-outline");
   }
 
   // ---- fullscreen -----------------------------------------------------------
@@ -2542,13 +2600,28 @@ class SSTimelineCard extends HTMLElement {
     const m = this._master;
     if (b.dataset.cam) {
       const id = Number(b.dataset.cam);
-      this._toggleCamera(id);
+      this._chip(id);
       return;
     }
     if (b.dataset.act === "events") {
       const open = this._layoutEl.classList.toggle("noside") === false;
       prefs.set("events", open);
       this._fit();
+      return;
+    }
+    // What's shown on the video: CSS only, no player needed.
+    if (b.dataset.show) {
+      const k = b.dataset.show;
+      this._shows[k] = !this._shows[k];
+      prefs.set(k, this._shows[k]);
+      this._applyShows();
+      return;
+    }
+    if (b.dataset.act === "shows") {
+      this._jumpBox.hidden = true;
+      this._showsBox.hidden = !this._showsBox.hidden;
+      // Into the list, so Escape (and the keyboard) work there straight away.
+      if (!this._showsBox.hidden) this._showsBox.querySelector("button")?.focus();
       return;
     }
     if (!m) {
@@ -2597,6 +2670,7 @@ class SSTimelineCard extends HTMLElement {
         break;
       }
       case "jump":
+        this._showsBox.hidden = true;
         this._jumpBox.hidden = !this._jumpBox.hidden;
         if (!this._jumpBox.hidden) {
           this._when.value = toLocalInput(m.wall());
@@ -2624,12 +2698,7 @@ class SSTimelineCard extends HTMLElement {
         this._syncMuteIcon();
         break;
       case "solo":
-        this._toggleSolo();
-        break;
-      case "clock":
-        this._showClock = !this._showClock;
-        prefs.set("clock", this._showClock);
-        this._applyClock();
+        this._toggleGrid();
         break;
       case "fs":
         this._toggleFullscreen();

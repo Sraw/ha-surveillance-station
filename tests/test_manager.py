@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,7 +11,8 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from synology_ss_playback import Segment, SSConnectionError, SSError
 
 from custom_components.surveillance_station import views
-from custom_components.surveillance_station.views import DATA_MANAGER, VodSession
+from custom_components.surveillance_station.thumbnail_store import ThumbnailStore
+from custom_components.surveillance_station.views import DATA_MANAGER, VodManager, VodSession
 from homeassistant.core import HomeAssistant
 
 from .conftest import T0
@@ -229,3 +232,139 @@ async def test_unload_answers_waiting_requests(hass: HomeAssistant, setup_integr
         manager.drop_entry(entry_id)
         results = await asyncio.gather(*waiting, return_exceptions=True)
     assert all(type(r) is SSError for r in results), results
+
+
+async def test_thumbnails_outlive_a_restart(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, thumbnail_dir: Path
+) -> None:
+    """Made once, kept on disk: a new manager (HA restarted) serves it without the NAS, under the same URL."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    url = manager.sign_thumbnail(entry_id, 6, T0)
+    snap = AsyncMock(side_effect=[b"j" * 400, None])
+    with patch.object(views, "fetch_snapshot", snap):
+        assert await manager.thumbnail(entry_id, 6, T0) == b"j" * 400
+        assert await manager.thumbnail(entry_id, 6, T0 + 1) is None
+    await manager.disk.settle()
+    assert (thumbnail_dir / entry_id / "6" / f"{T0}.jpg").read_bytes() == b"j" * 400
+    assert not (thumbnail_dir / entry_id / "6" / f"{T0 + 1}.jpg").exists()  # a miss isn't kept
+
+    again = VodManager(hass)
+    await again.async_load()
+    assert again.stats()["disk_thumbnails"] == 1
+    assert again.sign_thumbnail(entry_id, 6, T0) == url  # the browser's copy stays good
+    with patch.object(views, "fetch_snapshot", AsyncMock(side_effect=AssertionError)):
+        assert await again.thumbnail(entry_id, 6, T0) == b"j" * 400
+
+
+async def test_disk_thumbnails_are_bounded(hass: HomeAssistant, tmp_path: Path) -> None:
+    """Over the cap the least recently used go, also in the order read back after a restart."""
+    store = ThumbnailStore(hass, str(tmp_path), 1000)
+    for ts in (1, 2, 3):
+        store.put(("E", 6, ts), b"x" * 400)
+        await store.settle()
+    assert len(store) == 2 and store.bytes == 800
+    assert not (tmp_path / "E" / "6" / "1.jpg").exists()
+    assert await store.get(("E", 6, 2)) == b"x" * 400  # now the most recently used
+    os.utime(tmp_path / "E" / "6" / "3.jpg", (1, 1))
+    (tmp_path / "E" / "6" / "9.jpg.123.tmp").write_bytes(b"half")  # a write cut short
+
+    restarted = ThumbnailStore(hass, str(tmp_path), 1000)
+    await restarted.load()
+    assert restarted.bytes == 800
+    assert not (tmp_path / "E" / "6" / "9.jpg.123.tmp").exists()
+    restarted.put(("E", 6, 4), b"x" * 400)
+    await restarted.settle()
+    assert not (tmp_path / "E" / "6" / "3.jpg").exists()  # the one used longest ago
+    assert (tmp_path / "E" / "6" / "2.jpg").exists()
+    (tmp_path / "E" / "6" / "2.jpg").unlink()  # gone underneath: a miss
+    assert await restarted.get(("E", 6, 2)) is None
+    assert len(restarted) == 1
+
+
+async def test_disk_thumbnail_paths_are_safe(hass: HomeAssistant, tmp_path: Path) -> None:
+    store = ThumbnailStore(hass, str(tmp_path / "t"), 1000)
+    store.put(("../x", 6, 1), b"j")
+    store.put(("E", 6, 1), b"j")
+    await store.settle()
+    assert [p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.jpg")] == ["t/E/6/1.jpg"]
+
+
+async def test_removing_the_entry_deletes_its_thumbnails(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, thumbnail_dir: Path
+) -> None:
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    with patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j")):
+        await manager.thumbnail(entry_id, 6, T0)
+    assert (thumbnail_dir / entry_id).is_dir()
+    await hass.config_entries.async_remove(entry_id)
+    await hass.async_block_till_done()
+    assert not (thumbnail_dir / entry_id).exists()
+    assert manager.stats()["disk_thumbnails"] == 0
+
+
+async def test_thumbnail_kept_even_if_nobody_waits_any_more(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, thumbnail_dir: Path
+) -> None:
+    """Made, then abandoned (scrolled past) while being written: on disk and in the index, never half."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    gate = __import__("threading").Event()
+    real_write = __import__("custom_components.surveillance_station.thumbnail_store", fromlist=["_write"])._write
+
+    def slow_write(path, data):
+        gate.wait(5)
+        real_write(path, data)
+
+    with (
+        patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j" * 400)),
+        patch("custom_components.surveillance_station.thumbnail_store._write", slow_write),
+    ):
+        req = asyncio.create_task(manager.thumbnail(entry_id, 6, T0))
+        await asyncio.sleep(0.05)
+        req.cancel()
+        gate.set()
+        await manager.disk.settle()
+    assert (thumbnail_dir / entry_id / "6" / f"{T0}.jpg").read_bytes() == b"j" * 400
+    assert manager.stats()["disk_thumbnails"] == 1
+    assert manager.stats()["disk_thumbnail_bytes"] == 400
+    assert not list(thumbnail_dir.rglob("*.tmp"))
+
+
+async def test_unwritable_thumbnail_dir(hass: HomeAssistant, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Can't write: nothing indexed, a warning, and the rest carries on."""
+    (tmp_path / "file").write_bytes(b"")
+    store = ThumbnailStore(hass, str(tmp_path / "file" / "t"), 1000)  # under a file: never a directory
+    store.put(("E", 6, 1), b"j")
+    await store.settle()
+    assert len(store) == 0 and store.bytes == 0
+    assert await store.get(("E", 6, 1)) is None
+    assert "Can't keep thumbnails" in caplog.text
+
+
+async def test_evicted_while_written_is_removed(hass: HomeAssistant, tmp_path: Path) -> None:
+    store = ThumbnailStore(hass, str(tmp_path), 500)
+    store.put(("E", 6, 1), b"x" * 400)
+    store.put(("E", 6, 2), b"x" * 400)  # evicts 1, still being written
+    await store.settle()
+    assert sorted(p.name for p in tmp_path.rglob("*.jpg")) == ["2.jpg"]
+    assert store.bytes == 400
+
+
+async def test_bad_stored_key_is_replaced(hass: HomeAssistant, hass_storage: dict) -> None:
+    hass_storage["surveillance_station.thumbnail_key"] = {"version": 1, "key": "surveillance_station.thumbnail_key", "data": {"key": ""}}
+    manager = VodManager(hass)
+    await manager.async_load()
+    assert len(manager._thumb_key) == 32
+    await hass.async_block_till_done()
+
+
+async def test_dropping_an_entry_waits_for_its_writes(hass: HomeAssistant, tmp_path: Path) -> None:
+    store = ThumbnailStore(hass, str(tmp_path), 1000)
+    store.put(("E", 6, 1), b"j")
+    await store.drop_entry("E")  # the write was still going on
+    store.put(("E", 6, 2), b"j")  # a job finishing late: refused
+    await store.settle()
+    assert not (tmp_path / "E").exists()
+    assert len(store) == 0

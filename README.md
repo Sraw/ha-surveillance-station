@@ -44,11 +44,17 @@ synology-ss-playback`, and restart HA.
 
 ```yaml
 type: custom:ss-timeline-card
-cameras: [Drive Way, Front Door]   # optional: cameras shown (default: all)
+cameras: [Drive Way, Front Door]   # optional: the grid's cameras (default: all)
 camera: Drive Way     # optional: the one to start on
+view: single          # optional: start on one camera rather than the grid
 span: 3600            # optional: timeline width in seconds (15m .. 7d)
-clock: false          # optional: hide the date/time overlay
+clock: false          # optional: hide the date/time on the video
+live_badge: false     # optional: hide the LIVE badge on the video
+camera_names: false   # optional: hide the camera names in grid cells
 ```
+
+The eye button in the controls hides or shows each of those three; the
+viewer's choice is remembered in the browser and wins over the options.
 
 - **Opens playing**: live (about 1 s behind real time, marked LIVE), or the
   moment a link asked for. Coming back to the view resumes live if it was live.
@@ -57,19 +63,20 @@ clock: false          # optional: hide the date/time overlay
   narrower when full width would be too tall). Narrow cards (phones) get one
   compact row of controls: the ±30 s buttons and the time labels are dropped.
 
-- **Cameras shown**: one camera is the single view, several are a grid
-  (2 side by side, 3-4 in 2x2, more in 3 columns). The camera chips add or
-  remove one (tinted = shown, a ring in the camera's colour = the master; the
-  last one stays). Each camera has a colour, used for its chip, its cell
-  label, its timeline pins and its event rows. The
-  square button shows just the master, and switches back to the previous set.
-  Double-tapping a grid cell does the same for that camera. The chips' choice
-  is remembered per browser (`localStorage`) and wins over `cameras`.
+- **Grid or one camera**: the square / grid button in the controls switches
+  between the two. In the grid (2 side by side, 3-4 in 2x2, more in 3
+  columns) the camera chips add or remove a camera (tinted = shown, a ring
+  in the camera's colour = the master; the last one stays). With one camera
+  the chips switch which one, and the grid keeps its cameras for when it
+  comes back. Double-tapping a grid cell shows that camera alone. Each camera
+  has a colour, used for its chip, its cell label, its timeline pins and its
+  event rows. The mode, the grid's cameras and the camera watched are
+  remembered per browser (`localStorage`) and win over `view` / `cameras` /
+  `camera`.
 - **Master**: tap a cell. It has the sound and the clock, and the others
-  follow it every 500 ms: a drift over 2 s (more at 4x/8x) is a seek, a smaller
-  one over 0.1 s nudges `playbackRate` by up to ±20 %. A camera with no
-  recording at that time pauses under a "No recording" veil. Seek / skip /
-  Live apply to all cameras.
+  follow its wall-clock time (see *Grid* below). A camera with no recording
+  at that time holds under a "No recording" veil. Seek / skip / Live apply to
+  all cameras.
 - **Timeline and Events cover the cameras shown**: recording bars are the time
   where any of them recorded, and the bookmarks on the timeline and in the
   list come from the same list, so they always agree. To see another camera's
@@ -153,7 +160,7 @@ were kept in step by seeking into those segments.
 
 ## Resource use
 
-Nothing is written to disk for good, and every buffer has a cap:
+Every buffer has a cap, and the only thing kept on disk is thumbnails:
 
 | Where | What | Bound |
 |---|---|---|
@@ -165,8 +172,9 @@ Nothing is written to disk for good, and every buffer has a cap:
 | HA | live relays | pass-through (a slow viewer slows the read from SS, nothing queues in HA); 16 at most |
 | Browser memory | each stream | 8-20 s behind the playhead, trimmed as it goes; ahead, live 0.8 s (a backlog of 90 fragments drops to the next keyframe), recordings at most ~4 s (then SS is paused) |
 | HA memory | event thumbnails (JPEG, 320 px, 10-20 KB) | 16 MB LRU (+256 B per entry, so "nothing recorded" answers count too; those expire after 5 min); 2 made at a time, one job per frame however many ask, cancelled once nobody waits for it |
+| HA disk | event thumbnails, `<config>/.cache/surveillance_station/thumbnails/` (left out of HA backups) | 64 MB, least recently used removed first; kept across restarts, so a thumbnail is made from the recording once; an entry's are deleted with the entry |
 | HA memory | the bookmark list of each entry | re-read after 15 s; one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
-| Browser disk | thumbnails | `private, max-age=86400` (a thumbnail of a past moment never changes) |
+| Browser disk | thumbnails | `private, max-age=172800, immutable` (a thumbnail of a past moment never changes, and its URL stays the same all day and across HA restarts) |
 | Browser disk | segments | none: served `Cache-Control: no-store` (the URLs are per-session, so a cached copy would never be used again) |
 
 On the NAS, every segment download adds a line to the Surveillance Station
@@ -193,8 +201,9 @@ neither the password nor the SS session id reaches logs or browsers.
 
 Event thumbnail URLs (`/api/surveillance_station/thumbnail/…`) work the same
 way, since an `<img>` can't send a header either: the WebSocket hands out URLs
-carrying an expiry (about 24 h) and an HMAC-SHA256 of the path and expiry,
-under a key made at startup. Each opens one JPEG of one camera at one moment.
+carrying an expiry (the end of the next UTC day) and an HMAC-SHA256 of the
+path and expiry, under a key made once and kept in HA's storage
+(`surveillance_station.thumbnail_key`), so the URLs survive restarts. Each opens one JPEG of one camera at one moment.
 Anything unsigned, tampered with or expired is a **404**. HA's own signed
 paths (`async_sign_path`) were used at first and dropped: HA answers a stale
 one (after every HA restart, or after a day) with 401, and counts every 401 as

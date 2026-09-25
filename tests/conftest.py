@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,13 @@ T0 = 1_790_000_000
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
     """Load custom_components/ in every test."""
+
+
+@pytest.fixture(autouse=True)
+def thumbnail_dir(hass: HomeAssistant, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """HA's cache directory in a fresh temp dir, where thumbnails are kept."""
+    monkeypatch.setattr(hass.config, "cache_path", lambda *p: str(tmp_path.joinpath(".cache", *p)))
+    return tmp_path / ".cache" / DOMAIN / "thumbnails"
 
 
 @pytest.fixture

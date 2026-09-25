@@ -53,6 +53,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if removed := await hass.async_add_executor_job(remove_stale_temp_files):
         _LOGGER.info("Removed %d stale remux scratch files", removed)
     manager = VodManager(hass)
+    await manager.async_load()
     hass.data[DATA_MANAGER] = manager
     for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LiveStreamView):
         hass.http.register_view(view(manager))
@@ -140,7 +141,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> None:
-    """Take the card's Lovelace resource away with the last entry."""
+    """Delete the entry's stored thumbnails; take the card's Lovelace resource away with the last entry."""
+    if (manager := hass.data.get(DATA_MANAGER)) is not None:
+        await manager.disk.drop_entry(entry.entry_id)
     if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
         return
     if (resources := _storage_resources(hass)) is None:

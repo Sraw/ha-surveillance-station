@@ -33,13 +33,16 @@ MAX_LIVE_STREAMS = 16
 THUMBNAIL_URL = "/api/surveillance_station/thumbnail"
 # Event thumbnails (~10-20 KB each) kept in memory, by size.
 THUMBNAIL_CACHE_BYTES = 16 * 1024 * 1024
+# ...and on disk (under HA's cache directory), so they outlive a restart.
+THUMBNAIL_DISK_BYTES = 64 * 1024 * 1024
 # What a cached thumbnail costs besides its bytes, so misses (b"") count too.
 THUMBNAIL_ENTRY_BYTES = 256
 # "Nothing recorded then" is re-checked after this long.
 THUMBNAIL_MISS_SECONDS = 300
 # Parallel thumbnail jobs: fewer than playback's, which must not wait on them.
 MAX_PARALLEL_THUMBNAILS = 2
-# How long a signed thumbnail URL handed to the card stays valid.
+# A signed thumbnail URL handed to the card stays valid this long past the
+# end of the current (UTC) day, so it's the same URL all day.
 THUMBNAIL_URL_TTL_HOURS = 24
 # Largest page of the event list.
 BOOKMARK_PAGE_MAX = 100

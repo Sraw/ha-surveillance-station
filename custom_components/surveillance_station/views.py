@@ -48,6 +48,7 @@ from homeassistant.components.ffmpeg import get_ffmpeg_manager
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.util.hass_dict import HassKey
 
 from .const import (
@@ -62,6 +63,7 @@ from .const import (
     MAX_PARALLEL_THUMBNAILS,
     SEGMENT_CACHE_BYTES,
     THUMBNAIL_CACHE_BYTES,
+    THUMBNAIL_DISK_BYTES,
     THUMBNAIL_ENTRY_BYTES,
     THUMBNAIL_MISS_SECONDS,
     THUMBNAIL_URL,
@@ -70,6 +72,7 @@ from .const import (
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
+from .thumbnail_store import ThumbnailStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,8 +125,12 @@ class VodManager:
         self._thumb_tasks: dict[tuple[str, int, int], asyncio.Task] = {}
         self._thumb_waiters: dict[tuple[str, int, int], int] = {}
         self._thumb_sem = asyncio.Semaphore(MAX_PARALLEL_THUMBNAILS)
-        # Thumbnail URLs carry an HMAC under this key (see sign_thumbnail).
+        self.disk = ThumbnailStore(hass, hass.config.cache_path(DOMAIN, "thumbnails"), THUMBNAIL_DISK_BYTES)
+        # Thumbnail URLs carry an HMAC under this key (see sign_thumbnail),
+        # kept across restarts (async_load) so the URLs, and the browser's
+        # cached copies, stay good.
         self._thumb_key = secrets.token_bytes(32)
+        self._key_store: Store[dict[str, str]] = Store(hass, 1, f"{DOMAIN}.thumbnail_key", private=True)
         # entry_id -> (fetched at, every bookmark newest first, or the error),
         # and the one fetch per entry that every request waits on.
         self._bookmarks: dict[str, tuple[float, list[Bookmark] | SSError]] = {}
@@ -132,6 +139,19 @@ class VodManager:
         # the relays running (entry_id, browser socket).
         self._live_tokens: dict[str, tuple[str, int, float | None, float]] = {}
         self.live_streams: set[tuple[str, web.WebSocketResponse]] = set()
+
+    async def async_load(self) -> None:
+        """Load the thumbnail signing key (made on first use) and the disk cache's index."""
+        data = await self._key_store.async_load()
+        try:
+            key = bytes.fromhex(data["key"])  # type: ignore[index]
+        except (TypeError, KeyError, ValueError):
+            key = b""
+        if len(key) == 32:
+            self._thumb_key = key
+        else:  # none yet, or not one of ours
+            await self._key_store.async_save({"key": self._thumb_key.hex()})
+        await self.disk.load()
 
     def client(self, entry_id: str) -> SurveillanceStationClient | None:
         """The logged-in client of a loaded entry."""
@@ -181,6 +201,8 @@ class VodManager:
             "fetches_in_flight": len(self._inflight),
             "cached_thumbnails": len(self._thumbs),
             "cached_thumbnail_bytes": self._thumbs_bytes,
+            "disk_thumbnails": len(self.disk),
+            "disk_thumbnail_bytes": self.disk.bytes,
             "live_streams": len(self.live_streams),
         }
 
@@ -222,16 +244,17 @@ class VodManager:
         return found
 
     def sign_thumbnail(self, entry_id: str, camera_id: int, ts: int) -> str:
-        """A URL for the frame of camera_id at ts, valid for about a day.
+        """A URL for the frame of camera_id at ts, valid for one to two days.
 
         An HMAC of our own rather than HA's async_sign_path: HA answers an
         expired or foreign signature (after every HA restart, as its signing
         key lives in memory) with 401, and counts each 401 as a failed login,
         so a long-open card would get its device IP-banned. A bad signature
-        here is a plain 404. The expiry is rounded to the hour so the URL (and
-        the browser's cached copy) stays the same between list refreshes.
+        here is a plain 404. The expiry is the end of the (UTC) day plus a
+        day, so the URL (and the browser's cached copy) is the same all day,
+        across list refreshes and HA restarts.
         """
-        exp = (int(time.time()) // 3600 + 1 + THUMBNAIL_URL_TTL_HOURS) * 3600
+        exp = (int(time.time()) // 86400 + 1) * 86400 + THUMBNAIL_URL_TTL_HOURS * 3600
         path = f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}.jpg"
         return f"{path}?exp={exp}&sig={self._thumbnail_sig(path, exp)}"
 
@@ -281,19 +304,23 @@ class VodManager:
         me = asyncio.current_task()
         entry_id, camera_id, ts = key
         try:
-            client = self.client(entry_id)
-            if client is None:
-                raise SSError("thumbnail", "fetch", None, "Surveillance Station entry is not loaded")
-            async with self._thumb_sem:
-                try:
-                    jpg = await fetch_snapshot(client, camera_id, ts, get_ffmpeg_manager(self.hass).binary)
-                except SSError as err:
-                    self.track(entry_id, err)
-                    raise
+            # Made before (even before a restart): no need for the NAS.
+            if (jpg := await self.disk.get(key)) is None:
+                client = self.client(entry_id)
+                if client is None:
+                    raise SSError("thumbnail", "fetch", None, "Surveillance Station entry is not loaded")
+                async with self._thumb_sem:
+                    try:
+                        jpg = await fetch_snapshot(client, camera_id, ts, get_ffmpeg_manager(self.hass).binary)
+                    except SSError as err:
+                        self.track(entry_id, err)
+                        raise
+                self.track(entry_id, None)
+                if jpg:  # "nothing recorded" is only remembered in memory, briefly
+                    self.disk.put(key, jpg)
         finally:
             if self._thumb_tasks.get(key) is me:
                 del self._thumb_tasks[key]
-        self.track(entry_id, None)
         self._drop_thumbnail(key)
         data = jpg or b""
         self._thumbs[key] = (time.monotonic(), data)
@@ -657,5 +684,8 @@ class ThumbnailView(HomeAssistantView):
             raise web.HTTPBadGateway() from None
         if jpg is None:
             raise web.HTTPNotFound()
-        # The URL names a fixed moment: the image never changes.
-        return web.Response(body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+        # The URL names a fixed moment: the image never changes (and the URL
+        # itself is good for at most two days).
+        return web.Response(
+            body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=172800, immutable"}
+        )
