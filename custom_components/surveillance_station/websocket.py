@@ -112,7 +112,14 @@ async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveCon
     await _run(connection, msg, go())
 
 
-@websocket_api.websocket_command({vol.Required("type"): "surveillance_station/bookmarks", **_RANGE_SCHEMA})
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "surveillance_station/bookmarks",
+        **{k: v for k, v in _RANGE_SCHEMA.items() if k != "camera_id"},
+        # Omitted: every camera (the card's event list).
+        vol.Optional("camera_id"): vol.Coerce(int),
+    }
+)
 @websocket_api.async_response
 async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
     async def go():
@@ -120,8 +127,11 @@ async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConn
         start, end = _range(msg)
         return {
             "bookmarks": [
-                {"id": b.id, "name": b.name, "comment": b.comment, "start": b.start, "end": b.end}
-                for b in await client.bookmarks(msg["camera_id"], start, end)
+                {
+                    "id": b.id, "camera_id": b.camera_id, "name": b.name,
+                    "comment": b.comment, "start": b.start, "end": b.end,
+                }
+                for b in await client.bookmarks(msg.get("camera_id"), start, end)
             ]
         }
 

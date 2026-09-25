@@ -15,7 +15,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.2.5";
+const CARD_VERSION = "0.3.1";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -30,6 +30,12 @@ const WINDOW_AHEAD = 3600; // seconds after the target included in a new window
 const LIVE_LAG = 20; // "live" plays this far behind now (segments close at now-5)
 const REFRESH_MS = 60_000;
 const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
+// Event list ranges: [seconds, label].
+const EVENT_RANGES = [
+  [86400, "24h"],
+  [3 * 86400, "3d"],
+  [7 * 86400, "7d"],
+];
 const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600];
 
 let hlsPromise;
@@ -128,11 +134,25 @@ const STYLE = `
   .hover[hidden] { display: none; }
   .legend { display: flex; gap: 12px; padding: 4px 12px 0; font-size: 12px; color: var(--secondary-text-color); }
   .legend i { display: inline-block; width: 10px; height: 10px; margin-right: 4px; border-radius: 2px; vertical-align: -1px; }
-  .bmlist { max-height: 220px; overflow-y: auto; padding: 8px 12px 12px; }
-  .bmlist .item { display: flex; width: 100%; text-align: left; border-radius: 8px; margin-bottom: 4px; gap: 8px; }
-  .bmlist .t { font-variant-numeric: tabular-nums; color: var(--secondary-text-color); }
-  .bmlist .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .bmlist .empty { font-size: 13px; color: var(--secondary-text-color); }
+  /* Event list: bookmarks of every camera, newest first, grouped by day. */
+  .events { border-top: 1px solid var(--divider-color); margin-top: 10px; padding: 10px 12px 12px; }
+  .ev-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .ev-title { font-weight: 500; margin-right: 4px; }
+  .ev-head button { min-height: 28px; padding: 2px 10px; font-size: 13px; }
+  .ev-list { max-height: 420px; overflow-y: auto; }
+  .ev-day { position: sticky; top: 0; z-index: 1; padding: 6px 2px 4px; font-size: 12px; font-weight: 500;
+    color: var(--secondary-text-color); background: var(--card-background-color, var(--ha-card-background, #fff)); }
+  .ev { display: grid; grid-template-columns: auto 1fr auto; align-items: center; column-gap: 10px; row-gap: 2px;
+    width: 100%; text-align: left; border-radius: 10px; margin-bottom: 4px; padding: 6px 10px; }
+  .ev.on { color: var(--primary-text-color); border-color: var(--primary-color);
+    background: color-mix(in srgb, var(--primary-color) 14%, var(--secondary-background-color)); }
+  .ev .t { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--secondary-text-color); grid-row: span 2; }
+  .ev .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .c { grid-column: 2 / 4; font-size: 12px; color: var(--secondary-text-color); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .ev .cam { font-size: 12px; padding: 1px 8px; border-radius: 10px; white-space: nowrap;
+    background: color-mix(in srgb, var(--primary-color) 18%, transparent); }
+  .ev-empty { font-size: 13px; color: var(--secondary-text-color); padding: 6px 2px; }
   .jump { display: inline-flex; gap: 4px; }
 `;
 
@@ -152,6 +172,10 @@ class SSTimelineCard extends HTMLElement {
     this._playSeq = 0;
     this._tlSeq = 0;
     this._followPausedUntil = 0;
+    this._events = []; // bookmarks of all cameras, newest first
+    this._evRange = EVENT_RANGES[0][0];
+    this._evCamera = null; // list filter; null = all
+    this._evSeq = 0;
     this._drag = false;
   }
 
@@ -291,7 +315,15 @@ class SSTimelineCard extends HTMLElement {
           <span><i style="background: color-mix(in srgb, var(--primary-color) 45%, transparent)"></i>Recording</span>
           <span><i style="background: var(--accent-color, #ff9800)"></i>Bookmark</span>
         </div>
-        <div class="bmlist"></div>
+        <div class="events">
+          <div class="ev-head">
+            <span class="ev-title">Events</span>
+            <span class="chips ev-cams"></span>
+            <span class="spacer"></span>
+            ${EVENT_RANGES.map(([s, l]) => `<button data-evrange="${s}">${l}</button>`).join("")}
+          </div>
+          <div class="ev-list"></div>
+        </div>
       </ha-card>`;
 
     const $ = (s) => root.querySelector(s);
@@ -305,7 +337,7 @@ class SSTimelineCard extends HTMLElement {
     this._ph = $(".ph");
     this._hover = $(".hover");
     this._rangeEl = $(".range");
-    this._bmList = $(".bmlist");
+    this._evList = $(".ev-list");
     this._when = $(".when");
     this._playIcon = $('[data-act="play"] ha-icon');
     this._muteIcon = $('[data-act="mute"] ha-icon');
@@ -386,6 +418,12 @@ class SSTimelineCard extends HTMLElement {
     box.innerHTML = this._cameras
       .map((c) => `<button data-cam="${c.id}"><ha-icon icon="mdi:cctv"></ha-icon>${esc(c.name)}</button>`)
       .join("");
+    this.shadowRoot.querySelector(".ev-cams").innerHTML = [
+      `<button data-evcam="">All</button>`,
+      ...this._cameras.map((c) => `<button data-evcam="${c.id}">${esc(c.name)}</button>`),
+    ].join("");
+    this._markEventFilters();
+    this._loadEvents();
   }
 
   _onClick(e) {
@@ -407,11 +445,21 @@ class SSTimelineCard extends HTMLElement {
       this._loadTimeline();
       return;
     }
-    if (b.dataset.bm) {
-      const t = Number(b.dataset.bm);
-      this._centerOn(t);
-      this._loadTimeline();
-      this._seek(t, true);
+    if (b.dataset.ev) {
+      const ev = this._events.find((x) => String(x.id) === b.dataset.ev);
+      if (ev) this._jumpToEvent(ev);
+      return;
+    }
+    if (b.dataset.evcam !== undefined) {
+      this._evCamera = b.dataset.evcam === "" ? null : Number(b.dataset.evcam);
+      this._markEventFilters();
+      this._drawEvents();
+      return;
+    }
+    if (b.dataset.evrange) {
+      this._evRange = Number(b.dataset.evrange);
+      this._markEventFilters();
+      this._loadEvents();
       return;
     }
     switch (b.dataset.act) {
@@ -756,26 +804,94 @@ class SSTimelineCard extends HTMLElement {
     this._rangeEl.textContent = `${fmtDate(start)} ${fmtTime(start, false)} – ${
       fmtDate(end) === fmtDate(start) ? "" : fmtDate(end) + " "
     }${fmtTime(end, false)}`;
-    this._drawBookmarkList();
     this._paint(this._currentWall());
   }
 
-  _drawBookmarkList() {
-    const { start, end } = this._view;
-    const items = this._bookmarks.filter((b) => b.end >= start && b.start <= end).reverse();
-    if (!items.length) {
-      this._bmList.innerHTML = `<div class="empty">No bookmarks in this range.</div>`;
+  // ---- event list -------------------------------------------------------
+
+  async _loadEvents() {
+    const seq = ++this._evSeq;
+    const end = nowS();
+    let res;
+    try {
+      res = await this._ws({
+        type: "surveillance_station/bookmarks",
+        start: Math.floor(end - this._evRange),
+        end: Math.ceil(end),
+      });
+    } catch (e) {
+      if (seq === this._evSeq) this._evList.innerHTML = `<div class="ev-empty">Couldn't load events: ${esc(errText(e))}</div>`;
       return;
     }
-    this._bmList.innerHTML = items
-      .map((b) => {
-        const dur = b.end > b.start ? ` · ${fmtDur(b.end - b.start)}` : "";
-        return `<button class="item" data-bm="${b.start - 3}" title="${esc(b.comment)}">
-          <span class="t">${fmtDate(b.start)} ${fmtTime(b.start)}</span>
-          <span class="n">${esc(b.name || "(unnamed)")}</span>
-          <span class="t">${dur}</span></button>`;
-      })
-      .join("");
+    if (seq !== this._evSeq) return;
+    this._events = res.bookmarks.reverse(); // newest first
+    this._drawEvents();
+  }
+
+  _markEventFilters() {
+    const root = this.shadowRoot;
+    for (const b of root.querySelectorAll("[data-evcam]")) {
+      b.classList.toggle("on", (b.dataset.evcam === "" ? null : Number(b.dataset.evcam)) === this._evCamera);
+    }
+    for (const b of root.querySelectorAll("[data-evrange]")) {
+      b.classList.toggle("on", Number(b.dataset.evrange) === this._evRange);
+    }
+  }
+
+  _drawEvents() {
+    const items = this._events.filter((e) => this._evCamera == null || e.camera_id === this._evCamera);
+    if (!items.length) {
+      const label = EVENT_RANGES.find(([s]) => s === this._evRange)?.[1] ?? "";
+      this._evList.innerHTML = `<div class="ev-empty">No bookmarks in the last ${label}.</div>`;
+      return;
+    }
+    const camName = (id) => this._cameras.find((c) => c.id === id)?.name ?? `Camera ${id}`;
+    const today = new Date().toDateString();
+    const yesterday = new Date(Date.now() - 86400000).toDateString();
+    let html = "";
+    let day = null;
+    for (const e of items) {
+      const d = new Date(e.start * 1000).toDateString();
+      if (d !== day) {
+        day = d;
+        html += `<div class="ev-day">${d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start)}</div>`;
+      }
+      const dur = e.end > e.start ? fmtDur(e.end - e.start) : "";
+      html += `<button class="ev" data-ev="${e.id}">
+          <span class="t">${fmtTime(e.start)}</span>
+          <span class="n">${esc(e.name || "(unnamed)")}${dur ? ` <span class="t">· ${dur}</span>` : ""}</span>
+          <span class="cam">${esc(camName(e.camera_id))}</span>
+          ${e.comment ? `<span class="c">${esc(e.comment)}</span>` : ""}
+        </button>`;
+    }
+    this._evList.innerHTML = html;
+    this._activeEvent = undefined;
+    this._markActiveEvent(this._currentWall());
+  }
+
+  /** Highlight the event the playhead is in (on the camera being watched). */
+  _markActiveEvent(t) {
+    if (!this._evList) return;
+    const cur = this._events.find(
+      (e) => e.camera_id === this._cameraId && t >= e.start - 3 && t <= Math.max(e.end, e.start + 10)
+    );
+    const id = cur ? String(cur.id) : null;
+    if (id === this._activeEvent) return;
+    this._activeEvent = id;
+    for (const b of this._evList.querySelectorAll(".ev")) b.classList.toggle("on", b.dataset.ev === id);
+  }
+
+  _jumpToEvent(ev) {
+    const t = ev.start - 3; // a little lead-in
+    if (ev.camera_id !== this._cameraId) {
+      this._selectCamera(ev.camera_id, t, true);
+    } else {
+      this._centerOn(t);
+      this._loadTimeline();
+      this._seek(t, true);
+    }
+    // On a phone the list is below the fold; bring the video back into view.
+    this._wrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
   _timeAt(e) {
@@ -807,6 +923,7 @@ class SSTimelineCard extends HTMLElement {
     if (document.activeElement !== this._when && this.shadowRoot.activeElement !== this._when) {
       this._when.value = toLocalInput(t);
     }
+    this._markActiveEvent(t);
   }
 
   _onTime() {
@@ -826,6 +943,7 @@ class SSTimelineCard extends HTMLElement {
 
   _periodic() {
     if (this._view.end > nowS() - this._span) this._loadTimeline();
+    this._loadEvents();
   }
 
   /**

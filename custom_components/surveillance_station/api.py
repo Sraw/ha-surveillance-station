@@ -249,16 +249,17 @@ class SurveillanceStationClient:
         out.sort(key=lambda r: r.start)
         return out
 
-    async def bookmarks(self, camera_id: int, start: int, end: int) -> list[Bookmark]:
-        """Bookmarks of one camera that overlap [start, end], oldest first."""
+    async def bookmarks(self, camera_id: int | None, start: int, end: int) -> list[Bookmark]:
+        """Bookmarks overlapping [start, end], oldest first; all cameras if camera_id is None."""
         seen: set[int] = set()
         out: list[Bookmark] = []
         offset = 0
+        cameras = {} if camera_id is None else {"cameraIds": str(camera_id)}
         while True:
             data = await self._call(
                 "SYNO.SurveillanceStation.Recording", "List", 5,
-                cameraIds=str(camera_id), fromTime=int(start) - RECORDING_LOOKBACK_SECONDS,
-                toTime=int(end), offset=offset, limit=200,
+                **cameras, fromTime=int(start) - RECORDING_LOOKBACK_SECONDS,
+                toTime=int(end), offset=offset, limit=500,
             )
             events = data.get("events", [])
             for e in events:
@@ -270,7 +271,7 @@ class SurveillanceStationClient:
         return out
 
     @staticmethod
-    def _bookmarks_of(e: dict[str, Any], camera_id: int, start: int, end: int, seen: set[int]):
+    def _bookmarks_of(e: dict[str, Any], camera_id: int | None, start: int, end: int, seen: set[int]):
         for b in e.get("bookmark") or []:
             bid = int(b["id"])
             ts = int(b.get("timestamp") or 0)
@@ -280,7 +281,7 @@ class SurveillanceStationClient:
             seen.add(bid)
             yield Bookmark(
                 id=bid,
-                camera_id=int(b.get("cameraId") or camera_id),
+                camera_id=int(b.get("cameraId") or e.get("cameraId") or camera_id),
                 name=b.get("name") or "",
                 comment=b.get("comment") or "",
                 start=ts,

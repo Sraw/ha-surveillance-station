@@ -38,6 +38,14 @@ camera: Drive Way     # optional: name or id to start on
 span: 3600            # optional: timeline width in seconds
 ```
 
+Below the timeline, the **Events** list shows the SS bookmarks of every camera
+(last 24 h / 3 d / 7 d, filterable by camera, grouped by day). Tapping one
+switches to that camera and plays from 3 s before it. The event being
+watched is highlighted. SS's own motion detections are not exposed by any
+documented API (in continuous mode every `Event` is a recording file), so
+bookmarks are the event source; the detection pipeline writes one per
+detection through an SS webhook.
+
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.
 
