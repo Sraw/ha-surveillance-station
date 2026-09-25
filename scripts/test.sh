@@ -5,9 +5,12 @@
 # tree (PYTHONPATH), so nothing is written into the repo.
 #   scripts/test.sh              # everything
 #   scripts/test.sh -k config    # extra pytest arguments
+# The container is capped at 4 GB (no extra swap) and pytest at 10 min, so a
+# runaway or hung test dies on its own instead of dragging the host into swap.
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 exec docker run --rm -t \
+  --memory=4g --memory-swap=4g \
   -v "$here:/src" -w /src \
   -v ss-playback-test-venv:/venv \
   -e UV_LINK_MODE=copy -e PYTHONDONTWRITEBYTECODE=1 \
@@ -22,5 +25,5 @@ exec docker run --rm -t \
     if [ "$(cat $stamp 2>/dev/null)" != "$want" ]; then
       uv pip install -q -r requirements_test.txt && echo "$want" > $stamp
     fi
-    python -m pytest -p no:cacheprovider "$@"
+    exec timeout -k 10 600 python -m pytest -p no:cacheprovider "$@"
   ' sh "$@"
