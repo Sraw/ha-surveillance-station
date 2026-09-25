@@ -1,12 +1,13 @@
 """SurveillanceStationClient.open_live: re-login on refusal, errors without the sid."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 
 from synology_ss_playback import SSConnectionError, SSError, SurveillanceStationClient
+from synology_ss_playback import client as client_mod
 
 DATA = aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"\x00\x00\x00\x08info", None)
 CLOSED = aiohttp.WSMessage(aiohttp.WSMsgType.CLOSE, 1000, None)
@@ -79,4 +80,19 @@ async def test_cancelled_while_waiting_closes_the_socket() -> None:
     client, _ = _client([ws])
     with pytest.raises(asyncio.CancelledError):
         await client.open_live(10)
+    ws.close.assert_awaited()
+
+
+async def test_no_data_within_the_timeout_closes_the_socket() -> None:
+    """A connect that never sends anything (SS wedged) doesn't hang forever."""
+    ws = _ws(DATA)  # never actually returned: wait_for times out first
+
+    async def timed_out(coro, timeout):
+        coro.close()  # never awaited otherwise
+        raise TimeoutError
+
+    client, _ = _client([ws])
+    with patch.object(client_mod.asyncio, "wait_for", timed_out):
+        with pytest.raises(SSConnectionError, match="no data"):
+            await client.open_live(10)
     ws.close.assert_awaited()
