@@ -80,7 +80,9 @@ viewer's choice is remembered in the browser and wins over the options.
 - **Timeline and Events cover the cameras shown**: recording bars are the time
   where any of them recorded, and the bookmarks on the timeline and in the
   list come from the same list, so they always agree. To see another camera's
-  events, show it. Timeline spans: 15 min to 7 days.
+  events, show it. Timeline spans: 15 min to 7 days. Watching live, the
+  timeline scrolls with the present (held still while the pointer is on it,
+  and for 15 s after a pan).
 - **Bookmark pins** on the timeline open their event when tapped, exactly like
   tapping the event in the list.
 - **Clock**: the overlay button toggles it; remembered per browser.
@@ -348,4 +350,5 @@ the card were verified against a live HA 2026.9 + SS setup:
   jumps, speed changes, pause and a master change; a follower's 72-minute gap
   and a gap the master lands in; gaps all cameras share; a 29 s hole inside a
   recording file (bridged in ~1.5 s); sound kept within ~0.1 s of the video;
-  the no-MSE path (native HLS) on a phone-sized viewport.
+  the no-MSE path (native HLS) on a phone-sized viewport; the live timeline
+  scrolling with the present.

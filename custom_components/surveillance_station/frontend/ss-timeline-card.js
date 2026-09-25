@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.8.1";
+const CARD_VERSION = "0.8.2";
 
 const SPANS = [
   [900, "15m"],
@@ -2212,6 +2212,7 @@ class SSTimelineCard extends HTMLElement {
     this._ph = $(".ph");
     this._hover = $(".hover");
     this._rangeEl = $(".range");
+    this._range = null;
     this._evList = $(".ev-list");
     this._evItemsEl = $(".ev-items");
     this._evFoot = $(".ev-foot");
@@ -2255,7 +2256,9 @@ class SSTimelineCard extends HTMLElement {
       this._drag = false;
       this._hover.hidden = true;
     });
+    tr.addEventListener("pointerenter", () => (this._overTrack = true));
     tr.addEventListener("pointerleave", () => {
+      this._overTrack = false;
       if (!this._drag) this._hover.hidden = true;
     });
 
@@ -2804,9 +2807,10 @@ class SSTimelineCard extends HTMLElement {
         : a.getMonth() === z.getMonth()
           ? `${fmtDay(start)}–${z.getDate()}`
           : `${fmtDay(start)}–${fmtDay(end)}`;
-    this._rangeEl.innerHTML = `<span class="long">${fmtDay(start)} ${fmtTime(start, false)} – ${
+    const range = `<span class="long">${fmtDay(start)} ${fmtTime(start, false)} – ${
       fmtDay(end) === fmtDay(start) ? "" : fmtDay(end) + " "
     }${fmtTime(end, false)}</span><span class="short">${short}</span>`;
+    if (range !== this._range) this._rangeEl.innerHTML = this._range = range;
     this._paint(this._currentWall());
   }
 
@@ -3103,7 +3107,24 @@ class SSTimelineCard extends HTMLElement {
     const t = m.wall();
     m.target = t;
     const { start, end } = this._view;
-    if (!this._drag && Date.now() > this._followPausedUntil && (t < start || t > end)) {
+    const following = !this._drag && Date.now() > this._followPausedUntil;
+    // Live: the timeline scrolls along with now, kept near the right edge
+    // (redrawn once it has moved about a pixel), rather than sitting still
+    // until now runs off it. Not under the pointer: the bars would be replaced
+    // under a tooltip and the hover time would go stale. A bigger move (back
+    // from a pan) is a new range to fetch; small ones are covered by the
+    // minute's refresh.
+    if (following && !this._overTrack && this._isLive(t)) {
+      const e = nowS() + this._span * 0.05;
+      const shift = Math.abs(e - end);
+      if (shift > this._span / Math.max(this._track.clientWidth, 200)) {
+        this._view = { start: e - this._span, end: e };
+        if (shift > this._span * 0.1) this._loadTimeline();
+        else this._drawTimeline(); // paints t too
+        return;
+      }
+    }
+    if (following && (t < start || t > end)) {
       const s = t - this._span * 0.2;
       const e = Math.min(s + this._span, nowS() + this._span * 0.05);
       this._view = { start: e - this._span, end: e };
