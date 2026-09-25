@@ -53,3 +53,7 @@ BOOKMARK_CACHE_SECONDS = 15
 BOOKMARK_ERROR_SECONDS = 5
 # Longest time range the timeline may ask for (the card's widest span is 7 d).
 MAX_QUERY_WINDOW_SECONDS = 8 * 86400
+# SS moves a recording-in-progress's end forward about every 10 s; one whose
+# end is older than this has stopped, whatever its flag still says. (NAS and
+# HA clocks agree to within a second, both on NTP.)
+LIVE_END_STALE_SECONDS = 15

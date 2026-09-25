@@ -23,6 +23,7 @@ from homeassistant.core import HomeAssistant, callback
 from .const import (
     BOOKMARK_PAGE_MAX,
     DOMAIN,
+    LIVE_END_STALE_SECONDS,
     LIVE_URL,
     MAX_QUERY_WINDOW_SECONDS,
     VOD_MAX_WINDOW_SECONDS,
@@ -140,10 +141,12 @@ async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveCon
         _, client = _client(hass, msg.get("entry_id"))
         start, end = _range(msg)
         recs = await client.recordings(msg["camera_id"], start, end)
+        now = time.time()
         return {
-            "now": time.time(),
+            "now": now,
             "recordings": [
-                {"id": r.id, "start": r.start, "end": r.end, "live": r.live} for r in recs
+                {"id": r.id, "start": r.start, "end": r.end, "live": r.live and now - r.end <= LIVE_END_STALE_SECONDS}
+                for r in recs
             ],
         }
 

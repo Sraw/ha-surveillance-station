@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
-from synology_ss_playback import SSConnectionError
+from synology_ss_playback import RecordingInfo, SSConnectionError
 
 from homeassistant.core import HomeAssistant
 
@@ -225,3 +225,22 @@ async def test_thumbnail_nothing_recorded(
     client = await hass_client_no_auth()
     with patch("custom_components.surveillance_station.views.fetch_snapshot", AsyncMock(return_value=None)):
         assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
+
+
+async def test_recording_in_progress(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Still live while SS keeps moving its end forward; stopped once it doesn't."""
+    now = 2_000_000_000
+    mock_client.recordings.return_value = [
+        RecordingInfo(id=1, camera_id=6, start=now - 900, end=now - 8, mount_id=1, live=True, hevc=True),
+        RecordingInfo(id=2, camera_id=6, start=now - 900, end=now - 40, mount_id=1, live=True, hevc=True),
+    ]
+    ws = await hass_ws_client(hass)
+    with patch("custom_components.surveillance_station.websocket.time.time", return_value=now):
+        await ws.send_json_auto_id(
+            {"type": "surveillance_station/recordings", "camera_id": 6, "start": now - 3600, "end": now}
+        )
+        msg = await ws.receive_json()
+    assert msg["success"]
+    assert [r["live"] for r in msg["result"]["recordings"]] == [True, False]

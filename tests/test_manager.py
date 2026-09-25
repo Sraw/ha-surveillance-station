@@ -297,6 +297,7 @@ async def test_removing_the_entry_deletes_its_thumbnails(
     entry_id = setup_integration.entry_id
     with patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j")):
         await manager.thumbnail(entry_id, 6, T0)
+    await manager.disk.settle()  # the write runs in the background
     assert (thumbnail_dir / entry_id).is_dir()
     await hass.config_entries.async_remove(entry_id)
     await hass.async_block_till_done()

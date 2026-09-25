@@ -12,6 +12,50 @@ for (let i = 0; i < 4; i++) {
   console.log(ok ? "ok  " : "FAIL", `view end now+${v.ahead.toFixed(1)}s (span ${v.span}), playhead at ${v.ph.toFixed(2)}%`);
   await sleep(5000);
 }
+// A recording in progress is looked at again every ~5 s. Its end as SS moves
+// it (up to ~10 s behind) is still drawn to now; one HA says has stopped (SS
+// no longer moves its end) stops at that end instead of growing.
+const recEnd = () => ev((c) => {
+  const w = c._track.getBoundingClientRect().width;
+  const ends = [...c._bars.querySelectorAll(".rec")].map((r) => (r.offsetLeft + r.offsetWidth) / w);
+  return { end: Math.max(...ends) * c._span + c._view.start - Date.now() / 1000, calls: c._recCalls };
+});
+await ev((c) => {
+  c._recCalls = 0;
+  c._realWs = c._ws;
+  c._ws = async (m) => {
+    const r = await c._realWs(m);
+    if (m.type !== "surveillance_station/recordings") return r;
+    c._recCalls++;
+    if (c._frozen == null) return r;
+    const at = Date.now() / 1000 - c._frozen;
+    return { ...r, recordings: r.recordings.map((x) => (x.live ? { ...x, end: at, live: c._frozen <= 15 } : x)) };
+  };
+});
+await sleep(12000);
+let r = await recEnd();
+let ok2 = r.calls >= 2 && Math.abs(r.end) < 3;
+if (!ok2) failed = true;
+console.log(ok2 ? "ok  " : "FAIL", `recordings fetched ${r.calls}x in 12 s; bar ends now${r.end.toFixed(1)}s`);
+await ev((c) => (c._frozen = 10));
+await sleep(7000);
+r = await recEnd();
+ok2 = Math.abs(r.end) < 3;
+if (!ok2) failed = true;
+console.log(ok2 ? "ok  " : "FAIL", `SS end 10 s behind, still recording: bar ends now${r.end.toFixed(1)}s`);
+await ev((c) => (c._frozen = 40));
+await sleep(7000);
+r = await recEnd();
+ok2 = r.end < -38 && r.end > -42;
+if (!ok2) failed = true;
+console.log(ok2 ? "ok  " : "FAIL", `stopped 40 s ago: bar ends now${r.end.toFixed(1)}s`);
+await ev((c) => { c._ws = c._realWs; });
+await sleep(8000);
+r = await recEnd();
+ok2 = Math.abs(r.end) < 3;
+if (!ok2) failed = true;
+console.log(ok2 ? "ok  " : "FAIL", `back to real data: bar ends now${r.end.toFixed(1)}s`);
+
 await card.locator('[data-act="pan-back"]').click();
 await sleep(3000);
 const p = await at();

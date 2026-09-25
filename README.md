@@ -222,6 +222,9 @@ entities; there is no per-user camera permission.
 - **`fromTime`/`toTime` filter on a recording's start time, not overlap**, for
   both `Event.List` and `Recording.List`. A 5-minute window in the middle of a
   30-minute file returns nothing. Queries reach back 4 h and filter by overlap.
+- A recording in progress has its `stopTime` moved forward about every 10 s
+  (0-10 s behind now). HA reports one whose end is over 15 s old as no longer
+  in progress, whatever `recording` still says.
 - Real-time stream: `ws(s)://<nas>/ss_webstream_task/?camId=<id>&_sid=<sid>`
   (documented on the API reference's "Liveview / Playback" page). Messages: a
   4-byte big-endian header end, a query-string header, then fMP4. The first
@@ -278,7 +281,9 @@ entities; there is no per-user camera permission.
   two (SS lists bookmark times as local times without an offset).
 - The timeline re-lists every shown camera's recordings for the whole span
   once a minute while it follows the present; at 7 d that is a few `Event.List`
-  pages per camera.
+  pages per camera. Watching live on a span of 1 h or less it does so every 5 s
+  (~40 ms per camera), so a recording that ends stops growing on the timeline;
+  its bar still overshoots by 15-20 s before drawing back.
 - A card that must fit a short screen (a phone in landscape, 4 cameras) gets
   small cells: the chips, controls and timeline need about 230 px. Fullscreen
   is the way to watch there.

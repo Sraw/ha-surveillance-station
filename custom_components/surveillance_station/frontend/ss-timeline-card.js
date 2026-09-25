@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.8.2";
+const CARD_VERSION = "0.8.3";
 
 const SPANS = [
   [900, "15m"],
@@ -51,6 +51,16 @@ const PRE_ROLL = 30; // seconds before the target included in a new window
 const WINDOW_AHEAD = 3600; // seconds after the target included in a new window
 const LIVE_LAG = 20; // "live" plays this far behind now (segments close at now-5)
 const REFRESH_MS = 60_000;
+// A recording in progress (live: HA drops the flag once SS stops moving its
+// end forward, which it does every ~10 s) is drawn up to now, but never more
+// than LIVE_GROW_MAX past the end SS last reported. Following live on a short
+// span, recordings are refetched every LIVE_RECS_MS: a bar that ended stops
+// growing, and draws back to where it really ended, 15-20 s later; one that
+// starts shows up as quickly. On longer spans the overshoot (up to a minute
+// until the next refresh) is a few pixels at most.
+const LIVE_GROW_MAX = REFRESH_MS / 1000 + 15;
+const LIVE_RECS_MS = 5_000;
+const LIVE_RECS_SPAN = 3600;
 const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
 // A transparent poster: without one, Android WebView (the HA app) paints its
 // default poster, a big grey play arrow, over a video with no frame yet, so
@@ -2733,11 +2743,13 @@ class SSTimelineCard extends HTMLElement {
 
   async _loadTimeline() {
     const seq = ++this._tlSeq;
+    this._tlAt = Date.now();
     const { start, end } = this._view;
     this._drawTimeline();
     if (!this._shown.length) return;
     const shown = [...this._shown];
     const q = { start: Math.floor(start), end: Math.ceil(end) };
+    this._tlBusy = true;
     try {
       // Recordings per camera shown; bookmarks from the same (cached) list
       // the event list pages through, so the two always agree.
@@ -2750,8 +2762,13 @@ class SSTimelineCard extends HTMLElement {
       this._bookmarks = b.bookmarks;
     } catch (e) {
       // Keep the video usable; say it where the timeline is.
-      if (seq === this._tlSeq) this._rangeEl.textContent = `Timeline failed: ${errText(e)}`;
+      if (seq === this._tlSeq) {
+        this._rangeEl.textContent = `Timeline failed: ${errText(e)}`;
+        this._range = null; // put the range back once it works again
+      }
       return;
+    } finally {
+      if (seq === this._tlSeq) this._tlBusy = false;
     }
     this._drawTimeline();
   }
@@ -2776,7 +2793,7 @@ class SSTimelineCard extends HTMLElement {
       html += `<div class="tick" style="left:${x(t)}%">${room ? `<span>${label}</span>` : ""}</div>`;
     }
     // With several cameras: time where any of them recorded.
-    for (const [s, e] of unionOf(this._recs.map((r) => [r.start, r.live ? now : r.end]))) {
+    for (const [s, e] of unionOf(this._recs.map((r) => [r.start, r.live ? Math.max(r.end, Math.min(now, r.end + LIVE_GROW_MAX)) : r.end]))) {
       if (e < start || s > end) continue;
       const a = Math.max(x(s), 0);
       const b = Math.min(x(e), 100);
@@ -3112,14 +3129,15 @@ class SSTimelineCard extends HTMLElement {
     // (redrawn once it has moved about a pixel), rather than sitting still
     // until now runs off it. Not under the pointer: the bars would be replaced
     // under a tooltip and the hover time would go stale. A bigger move (back
-    // from a pan) is a new range to fetch; small ones are covered by the
-    // minute's refresh.
+    // from a pan) is a new range to fetch, and so is what's recording, every
+    // few seconds (_liveRecsDue).
     if (following && !this._overTrack && this._isLive(t)) {
       const e = nowS() + this._span * 0.05;
       const shift = Math.abs(e - end);
-      if (shift > this._span / Math.max(this._track.clientWidth, 200)) {
+      const due = this._liveRecsDue();
+      if (due || shift > this._span / Math.max(this._track.clientWidth, 200)) {
         this._view = { start: e - this._span, end: e };
-        if (shift > this._span * 0.1) this._loadTimeline();
+        if (due || shift > this._span * 0.1) this._loadTimeline();
         else this._drawTimeline(); // paints t too
         return;
       }
@@ -3132,6 +3150,18 @@ class SSTimelineCard extends HTMLElement {
       return;
     }
     this._paint(t);
+  }
+
+  // Following live on a short span: time to look again what is recording
+  // (not while a load is still out: a slow SS would get them piling up, each
+  // one discarding the last).
+  _liveRecsDue() {
+    return (
+      this._span <= LIVE_RECS_SPAN &&
+      !document.hidden &&
+      !this._tlBusy &&
+      Date.now() - (this._tlAt || 0) > LIVE_RECS_MS
+    );
   }
 
   _periodic() {
