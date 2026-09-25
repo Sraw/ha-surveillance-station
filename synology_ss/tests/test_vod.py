@@ -69,6 +69,14 @@ class PlanSegments(unittest.TestCase):
         self.assertEqual(vod.plan_segments([rec], 20.0, 30.0, NOW), [])
 
 
+    def test_segment_seconds_below_the_minimum_stops_rather_than_looping(self):
+        """A degenerate grid (segment_seconds < MIN_SEGMENT_SECONDS): the
+        planner stops instead of emitting a zero/negative-length segment."""
+        rec = Recording(id=1, start=0.0, end=100.0)
+        segs = vod.plan_segments([rec], 0.0, 100.0, NOW, segment_seconds=0.9)
+        self.assertLess(sum(s.duration for s in segs), 100.0)
+        self.assertTrue(all(s.duration >= vod.MIN_SEGMENT_SECONDS - 1e-9 for s in segs))
+
     def test_overlapping_recordings_play_each_moment_once(self):
         a = Recording(id=1, start=0.0, end=60.0)
         b = Recording(id=2, start=40.0, end=100.0)
@@ -166,6 +174,23 @@ class Boxes(unittest.TestCase):
     def test_truncated_box_stops_cleanly(self):
         data = box("ftyp") + struct.pack(">I4s", 100, b"moov") + b"short"
         self.assertEqual(list(t for t, _ in vod.iter_boxes(data)), ["ftyp"])
+
+    def test_largesize_box(self):
+        # size == 1: the real (64-bit) size follows the type as a big-endian Q.
+        payload = b"x" * 20
+        data = struct.pack(">I4sQ", 1, b"mdat", 16 + len(payload)) + payload
+        [(typ, raw)] = list(vod.iter_boxes(data))
+        self.assertEqual((typ, raw), ("mdat", data))
+
+    def test_truncated_largesize_header_stops_cleanly(self):
+        data = box("ftyp") + struct.pack(">I4s", 1, b"mdat") + b"short"
+        self.assertEqual(list(t for t, _ in vod.iter_boxes(data)), ["ftyp"])
+
+    def test_zero_size_box_extends_to_the_end(self):
+        # size == 0: the last box in the file, extending to its end.
+        data = box("ftyp") + struct.pack(">I4s", 0, b"mdat") + b"tail-data"
+        types_and_ends = [(t, len(raw)) for t, raw in vod.iter_boxes(data)]
+        self.assertEqual(types_and_ends, [("ftyp", 8), ("mdat", 8 + len(b"tail-data"))])
 
     def test_ffmpeg_args_tag_only_hevc(self):
         self.assertIn("hvc1", vod.ffmpeg_remux_args("ffmpeg", "in.mp4", 10, 0, hevc=True))
