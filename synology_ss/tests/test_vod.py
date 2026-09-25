@@ -70,12 +70,16 @@ class PlanSegments(unittest.TestCase):
 
 
     def test_segment_seconds_below_the_minimum_stops_rather_than_looping(self):
-        """A degenerate grid (segment_seconds < MIN_SEGMENT_SECONDS): the
-        planner stops instead of emitting a zero/negative-length segment."""
+        """A degenerate grid (segment_seconds < MIN_SEGMENT_SECONDS): every
+        sliver folds into the next, doubling the grid to 1.8 s; float drift
+        against the fixed grid eventually makes one too short, and the
+        planner stops there rather than looping over the rest of the window."""
         rec = Recording(id=1, start=0.0, end=100.0)
         segs = vod.plan_segments([rec], 0.0, 100.0, NOW, segment_seconds=0.9)
-        self.assertLess(sum(s.duration for s in segs), 100.0)
+        self.assertEqual(len(segs), 12)
         self.assertTrue(all(s.duration >= vod.MIN_SEGMENT_SECONDS - 1e-9 for s in segs))
+        self.assertAlmostEqual(sum(s.duration for s in segs), 21.6)
+        self.assertLess(segs[-1].wall_start + segs[-1].duration, 100.0)
 
     def test_overlapping_recordings_play_each_moment_once(self):
         a = Recording(id=1, start=0.0, end=60.0)
