@@ -290,7 +290,7 @@ class SurveillanceStationClient:
                 await self.login(stale_sid=sid)
                 continue
             raise SSError(api, method, code, data.get("error"))
-        raise AssertionError("unreachable")
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def info(self) -> SSInfo:
         data = await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)
@@ -465,7 +465,7 @@ class SurveillanceStationClient:
                 await self.login(stale_sid=sid)
                 continue
             raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
-        raise AssertionError("unreachable")
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _quoted(text: str) -> str:
