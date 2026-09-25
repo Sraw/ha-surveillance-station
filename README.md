@@ -17,8 +17,8 @@ written as SS bookmarks through the documented `ThirdParty.Bookmark.Create`.
 |---|---|
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics |
-| `…/views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…`: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
-| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/vod`, `/vod_runs` |
+| `…/views.py` | HLS VOD endpoints `/api/surveillance_station/vod/<token>/…`: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…`; the live-stream relay `/api/surveillance_station/live/<token>` |
+| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use real-time stream URL), `/vod`, `/vod_runs` |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. Uses hls.js 1.7.3 (Apache-2.0, vendored) |
 
 ## Install
@@ -50,7 +50,7 @@ span: 3600            # optional: timeline width in seconds (15m .. 7d)
 clock: false          # optional: hide the date/time overlay
 ```
 
-- **Opens playing**: live (about 20 s behind real time, marked LIVE), or the
+- **Opens playing**: live (about 1 s behind real time, marked LIVE), or the
   moment a link asked for. Coming back to the view resumes live if it was live.
 - **Fits the screen**: from the camera chips to the timeline, the card sizes
   the video so it all fits in the window (cells stay 16:9; the grid gets
@@ -103,12 +103,27 @@ bookmarks are the event source.
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.
 
-A window that reaches the present is **live**: its playlist is an HLS EVENT
+**Live** is Surveillance Station's real-time stream, not a recording: SS's
+documented WebSocket stream (`/ss_webstream_task/`, fragmented MP4), relayed
+by HA and fed to the `<video>` through MSE. The card keeps 0.8 s buffered
+ahead of the playhead as a jitter margin (Wi-Fi cameras deliver frames in
+bursts), holding it by nudging the speed ±7-10 % and jumping if it falls more
+than a few seconds behind, so live is about 1 s behind real time. Sound, when
+unmuted, comes from the master only, through its own `<audio>` (a video that
+waited for audio would stall on every burst). Pausing live holds the frame;
+playing again catches up to now. Anything earlier than ~20 s ago (a skip back,
+a timeline tap, an event) plays the recordings.
+
+Recordings play as HLS. A window that reaches the recent past is an HLS EVENT
 playlist that grows as SS records (segments are only published once they end
-on the 10 s grid behind real time, so they never change afterwards). "Live"
-therefore plays continuously about 20 s behind real time. Older windows are
-closed VOD playlists. When one ends, the card looks up the next recording and
-carries on.
+on the 10 s grid behind real time, so they never change afterwards); older
+windows are closed VOD playlists. When one ends, the card looks up the next
+recording and carries on.
+
+Before 0.7 live was that growing playlist, 20 s behind. On Wi-Fi cameras it
+buffered often: SS reports a live recording's end as the last data it wrote,
+which lags on Wi-Fi, so the playlist grew in late, uneven steps (a 10 s slot
+arrived as 8 + 2 or 3 + 7 s) and the few seconds buffered ran out.
 
 ## Resource use
 
@@ -121,6 +136,8 @@ Nothing is written to disk for good, and every buffer has a cap:
 | HA memory | downloads being remuxed | 4 at a time (`MAX_PARALLEL_FETCHES`) |
 | HA memory | queued segment fetches | cancelled once every client that asked has gone (hls.js aborts on each seek), unless already downloading |
 | HA `/tmp` | one scratch file per remux (ffmpeg needs a seekable input) | deleted when the remux ends; `ss_vod_*.mp4` left by a crash are swept at startup |
+| HA | live relays | pass-through (a slow viewer slows the read from SS, nothing queues in HA); 16 at most |
+| Browser memory | live stream | about 20 s behind the playhead, trimmed as it goes; a backlog of 90 fragments drops to the next keyframe |
 | Browser memory | hls.js buffers | master 30 s ahead + 30 s behind, others 12 + 10 s; about 90 MB for a 4-camera grid |
 | HA memory | event thumbnails (JPEG, 320 px, 10-20 KB) | 16 MB LRU (+256 B per entry, so "nothing recorded" answers count too; those expire after 5 min); 2 made at a time, one job per frame however many ask, cancelled once nobody waits for it |
 | HA memory | the bookmark list of each entry | re-read after 15 s; one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
@@ -132,6 +149,12 @@ log (an hour of a 4-camera grid is ~1400 lines); SS's own log retention
 setting bounds it.
 
 ## Security model
+
+Live streams: `surveillance_station/live` returns a single-use URL (a random
+256-bit token, valid 30 s) for one camera; HA opens SS's stream with its own
+session and relays it, so the SS session id never reaches the browser. The
+browser can only send keep-alives through it. At most 16 streams at once;
+unloading the entry closes them.
 
 The playlist and segment URLs carry a random 256-bit token and need no HA auth
 header, because hls.js cannot add one. The token is issued only to an
@@ -161,6 +184,23 @@ entities; there is no per-user camera permission.
 - **`fromTime`/`toTime` filter on a recording's start time, not overlap**, for
   both `Event.List` and `Recording.List`. A 5-minute window in the middle of a
   30-minute file returns nothing. Queries reach back 4 h and filter by overlap.
+- Real-time stream: `ws(s)://<nas>/ss_webstream_task/?camId=<id>&_sid=<sid>`
+  (documented on the API reference's "Liveview / Playback" page). Messages: a
+  4-byte big-endian header end, a query-string header, then fMP4. The first
+  says `vdoCodec=H265&adoCodec=MPEG4-GENERIC`, then per stream `ftyp`, `moov`
+  (sample entry `hev1`) and one `moof`+`mdat` per frame, with `mediaType`
+  (1 video, 2 audio), `key` and `msec` (the frame's epoch ms). A bad or expired
+  sid gets the socket closed at once, with nothing sent. Measured here: first
+  frame 0.13 s after connecting, frames ~0.1 s behind real time.
+- The same socket plays recordings with `&time=`. **A bare local time is read
+  one hour off during DST** (`2026-09-24T16:40:58` started at 17:40:58);
+  with an offset (`…-07:00`), `…Z` or epoch seconds it starts at the keyframe
+  before the time, 0.07 s after connecting. `speed=4` plays at 4x. Not used
+  yet: recordings still play as HLS.
+- `ThirdParty/SnapShot/Take` ignores `time=` for recent or future times (it
+  returns the live frame) and fails (400) for older ones, so thumbnails come
+  from `Recording.Download` + ffmpeg. `ThirdParty/Recording/Download` returns a
+  zip, whole seconds only, so segments use `Recording.Download` v6 (ms offsets).
 - Bookmarks: the documented `ThirdParty.Bookmark.List` v1 ([SS 9.3 Web API
   reference](https://surveillance-api.synology.com/)) returns every bookmark of
   the given `camIds`, newest first, times as **NAS-local ISO strings without

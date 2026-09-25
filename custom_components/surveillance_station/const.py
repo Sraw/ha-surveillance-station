@@ -21,6 +21,15 @@ SEGMENT_CACHE_BYTES = 96 * 1024 * 1024
 # Parallel Download+remux jobs against the NAS.
 MAX_PARALLEL_FETCHES = 4
 
+LIVE_URL = "/api/surveillance_station/live"
+# A live-stream token must be used (the socket opened) within this long.
+LIVE_TOKEN_TTL_SECONDS = 30
+# A live relay whose browser sent nothing (the card keeps alive every 10 s)
+# for this long is closed.
+LIVE_IDLE_SECONDS = 90
+# Live streams relayed at once (each is one camera's ~4-5 Mbps).
+MAX_LIVE_STREAMS = 16
+
 THUMBNAIL_URL = "/api/surveillance_station/thumbnail"
 # Event thumbnails (~10-20 KB each) kept in memory, by size.
 THUMBNAIL_CACHE_BYTES = 16 * 1024 * 1024

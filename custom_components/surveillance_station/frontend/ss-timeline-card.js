@@ -3,9 +3,12 @@
  * scrubbable wall-clock timeline and the SS bookmarks laid on top of it.
  *
  * Talks to the surveillance_station integration over the HA WebSocket:
- *   surveillance_station/cameras | recordings | bookmarks | vod | vod_runs
- * `vod` returns an HLS playlist URL plus `runs`, the map between playlist time
- * and wall-clock time (a new run starts after every gap in the recordings).
+ *   surveillance_station/cameras | recordings | bookmarks | bookmark_page |
+ *   live | vod | vod_runs
+ * Live is SS's real-time stream (`live`: a single-use WebSocket URL, played
+ * through MSE by LiveFeed). Recordings are HLS: `vod` returns a playlist URL
+ * plus `runs`, the map between playlist time and wall-clock time (a new run
+ * starts after every gap in the recordings).
  *
  * One Player per camera shown; one camera shown is the single view, several
  * are the grid. One player is the master: it has the sound and the clock and
@@ -28,7 +31,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.6.2";
+const CARD_VERSION = "0.7.0";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -85,6 +88,16 @@ const loadHls = () =>
 const nowS = () => Date.now() / 1000;
 const pad = (n) => String(n).padStart(2, "0");
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+// Asking for "now" (the Live button, opening the card, a tap past the
+// recorded edge) plays the real-time stream. Any earlier time is a recording
+// (recordings reach up to about LIVE_LAG behind now), so an event from a few
+// seconds ago still plays the event.
+const isLiveTime = (t) => t >= nowS() - 2;
+// Past the newest recording: that means live.
+const liveIfRecent = (t) => (t >= nowS() - LIVE_LAG ? nowS() : t);
+// MSE for the real-time stream: iOS Safari (17.1+) only has ManagedMediaSource.
+// Without either, live falls back to the newest recordings (HLS, ~20 s behind).
+const MSE = window.MediaSource ?? window.ManagedMediaSource;
 const esc = (s) =>
   String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const errText = (e) => e?.message ?? e?.code ?? String(e);
@@ -529,12 +542,412 @@ class Zoom {
  * Plays one camera: its own HLS session over a window of wall-clock time,
  * loading veil, and the wall <-> media mapping for that session.
  */
+// ---- real-time stream ------------------------------------------------------
+
+// Seconds of video held ahead of the playhead on a live stream: the jitter
+// margin (Wi-Fi cameras deliver frames in bursts). Latency is about this.
+const LIVE_TARGET = 0.8;
+const LIVE_JUMP = 2.5; // further behind than target + this: jump to the edge
+const LIVE_QUEUE_MAX = 90; // fragments waiting to be appended: drop to the next keyframe
+
+/** Parse one SS stream message: 4-byte header end, query-string header, payload. */
+function readStreamMsg(buf) {
+  const b = new Uint8Array(buf);
+  if (b.length <= 4) return null;
+  const end = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
+  const head = {};
+  for (const pair of String.fromCharCode(...b.subarray(4, end)).split("&")) {
+    const i = pair.indexOf("=");
+    if (i > 0) head[pair.slice(0, i)] = pair.slice(i + 1);
+  }
+  return { head, data: b.subarray(end) };
+}
+
+/** RFC 6381 codec string from an init segment (moov with hvcC / avcC), or null. */
+function codecOf(moov) {
+  const find = (tag) => findBox(moov, tag);
+  const hex = (n) => n.toString(16).toUpperCase();
+  let i = find("hvcC");
+  if (i > 0) {
+    const c = moov.subarray(i + 4);
+    const space = ["", "A", "B", "C"][c[1] >> 6];
+    const tier = c[1] & 0x20 ? "H" : "L";
+    const profile = c[1] & 0x1f;
+    let compat = ((c[2] << 24) | (c[3] << 16) | (c[4] << 8) | c[5]) >>> 0;
+    let rev = 0; // the flags are written bit-reversed
+    for (let k = 0; k < 32; k++) rev = (rev << 1) | ((compat >>> k) & 1);
+    const cons = [...c.subarray(6, 12)];
+    while (cons.length && !cons.at(-1)) cons.pop();
+    const fourcc = find("hev1") > 0 ? "hev1" : "hvc1";
+    return [fourcc, `${space}${profile}`, hex(rev >>> 0), `${tier}${c[12]}`, ...cons.map(hex)].join(".");
+  }
+  i = find("avcC");
+  if (i > 0) {
+    const c = moov.subarray(i + 4);
+    return "avc1." + [c[1], c[2], c[3]].map((x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  return null;
+}
+
+/**
+ * One MediaSource + SourceBuffer fed fragment by fragment.
+ * onAppended(meta): a fragment pushed with meta is in the buffer.
+ * trimEnd(t): how much of the played part may go, for a removal at playhead
+ *   t (remove() takes everything up to the next keyframe: video passes the
+ *   last keyframe before t - 8).
+ * onError(): the source failed (a decode error, or it was closed under us).
+ */
+class MseSink {
+  constructor(el, { onAppended, trimEnd, onError } = {}) {
+    this.el = el;
+    this.onAppended = onAppended;
+    this.trimEnd = trimEnd ?? ((t) => t - 8);
+    this.onError = onError;
+    this.queue = [];
+    this.sb = null;
+    this.pending = null;
+    this.ms = new MSE();
+    // A ManagedMediaSource only streams to an element that can't be AirPlayed.
+    if (MSE !== window.MediaSource) el.disableRemotePlayback = true;
+    this.url = URL.createObjectURL(this.ms);
+    el.src = this.url;
+    this.opened = new Promise((r) => this.ms.addEventListener("sourceopen", r, { once: true }));
+    this.ms.addEventListener("sourceended", () => this.fail());
+    this.ms.addEventListener("sourceclose", () => this.fail());
+  }
+
+  fail() {
+    if (this.closed) return;
+    this.closed = true;
+    this.queue = [];
+    this.onError?.();
+  }
+
+  /** Create the buffer and append the init segment (ftyp, moov). */
+  async init(parts, mime) {
+    await this.opened;
+    if (this.closed || this.sb || this.ms.readyState !== "open") return false;
+    try {
+      this.ms.duration = Infinity;
+      this.sb = this.ms.addSourceBuffer(mime);
+    } catch (e) {
+      this.fail();
+      return false;
+    }
+    // SS's fragment timestamps don't survive reconnects or Wi-Fi hiccups;
+    // appended in order, each fragment follows the last.
+    this.sb.mode = "sequence";
+    this.sb.addEventListener("updateend", () => this.pump());
+    this.sb.addEventListener("error", () => this.fail());
+    for (const part of parts) this.push(part, null);
+    return true;
+  }
+
+  push(data, meta) {
+    if (this.closed) return;
+    this.queue.push([data, meta]);
+    this.pump();
+  }
+
+  pump() {
+    const sb = this.sb;
+    if (!sb || sb.updating || this.closed || this.ms.readyState !== "open") return;
+    if (this.pending) {
+      const meta = this.pending;
+      this.pending = null;
+      this.onAppended?.(meta);
+    }
+    // Drop what the playhead left behind, now and then.
+    const b = sb.buffered;
+    const t = this.el.currentTime;
+    if (b.length && t - b.start(0) > 20) {
+      const end = this.trimEnd(t);
+      if (end > b.start(0) + 1) {
+        sb.remove(b.start(0), end);
+        return;
+      }
+    }
+    const next = this.queue.shift();
+    if (!next) return;
+    try {
+      this.pending = next[1];
+      sb.appendBuffer(next[0]);
+    } catch (e) {
+      this.pending = null;
+      if (e.name === "QuotaExceededError") {
+        this.queue = [];
+        this.overflow = true; // the feed starts over at a keyframe
+      } else this.fail();
+    }
+  }
+
+  end() {
+    const b = this.sb?.buffered;
+    return b?.length ? b.end(b.length - 1) : 0;
+  }
+
+  close() {
+    this.closed = true;
+    this.queue = [];
+    URL.revokeObjectURL(this.url);
+  }
+}
+
+/**
+ * A camera's real-time stream (SS's WebSocket stream relayed by HA) played
+ * through MSE into the player's <video>. Keeps LIVE_TARGET seconds ahead of
+ * the playhead, gently (playback speed) or, when far behind, by jumping.
+ * Sound, only when wanted, goes through its own <audio>: a video that waits
+ * for audio would stall on every burst.
+ */
+class LiveFeed {
+  constructor(player, url, { onStart, onEnd }) {
+    this.player = player;
+    this.video = player.video;
+    this.onStart = onStart;
+    this.onEnd = onEnd;
+    this.map = []; // per video fragment: [media start, media end, wall time of its frame]
+    this.keys = []; // media start of each keyframe fragment
+    this.waitKey = true; // dropping until the next keyframe
+    this.audio = null;
+    this.audioInit = null;
+    this.audioCodecOk = true;
+    this.sink = new MseSink(this.video, {
+      onAppended: (meta) => this.appended(meta),
+      trimEnd: (t) => this.keyBefore(t - 8),
+      onError: () => this.end("error"),
+    });
+    // Attaching reset the rate to the card's playback speed; live runs at 1x.
+    this.video.defaultPlaybackRate = this.video.playbackRate = 1;
+    this.events = new AbortController();
+    const on = (type, fn) => this.video.addEventListener(type, fn, { signal: this.events.signal });
+    on("error", () => this.end("error"));
+    // Paused live: the sound pauses too; playing again catches both up.
+    on("pause", () => this.audio?.el.pause());
+    on("play", () => this.resumeAudio());
+    this.ws = new WebSocket(url);
+    this.ws.binaryType = "arraybuffer";
+    this.ws.onmessage = (e) => this.message(e.data);
+    this.ws.onclose = () => this.end("closed");
+    this.ws.onerror = () => {};
+    this.keepAlive = setInterval(() => this.ws.readyState === 1 && this.ws.send("keepAlive"), 10000);
+    this.control = setInterval(() => this.steer(), 500);
+  }
+
+  /** The stream is over (closed, refused, undecodable); the player decides what next. */
+  end(why, detail) {
+    if (this.closed || this.ended) return;
+    this.ended = true;
+    this.onEnd?.(why, detail);
+  }
+
+  message(buf) {
+    const msg = readStreamMsg(buf);
+    if (!msg || this.closed || this.ended) return;
+    const { head, data } = msg;
+    if (head.close) return this.end("closed");
+    if (head.vdoCodec || head.adoCodec) {
+      if (head.vdoCodec && !/^(H26[45]|AVC1)$/i.test(head.vdoCodec)) return this.end("codec", head.vdoCodec);
+      this.audioCodecOk = /^(MPEG4-GENERIC|MP4A-LATM)$/i.test(head.adoCodec ?? ""); // AAC
+      return;
+    }
+    const video = head.mediaType === "1";
+    const box = String.fromCharCode(...data.subarray(4, 8));
+    if (box === "ftyp") {
+      this[video ? "vFtyp" : "aFtyp"] = data.slice();
+      return;
+    }
+    if (box === "moov") {
+      if (!video) {
+        this.audioInit = [this.aFtyp, data.slice()];
+        if (this.audio && !this.audio.inited) this.initAudio();
+        return;
+      }
+      // A new init mid-stream (e.g. the camera changed resolution): start over.
+      if (this.videoInit) return this.end("error");
+      this.videoInit = true;
+      this.initVideo(this.vFtyp, data.slice());
+      return;
+    }
+    if (!video) {
+      const a = this.audio;
+      if (a?.sink.sb && !this.video.paused) {
+        if (a.sink.queue.length >= LIVE_QUEUE_MAX) a.sink.queue = [];
+        a.sink.push(data.slice(), {});
+      }
+      return;
+    }
+    if (!this.sink.sb) return;
+    const key = head.key === "1";
+    // Paused, or the browser fell behind: skip to the next keyframe.
+    if (this.video.paused && this.started) this.waitKey = true;
+    if (this.sink.queue.length >= LIVE_QUEUE_MAX || this.sink.overflow) {
+      this.sink.queue = [];
+      this.sink.overflow = false;
+      this.waitKey = true;
+    }
+    // (Before the first frame the video is paused: that's not a pause.)
+    if (this.waitKey && !(key && (!this.started || !this.video.paused))) return;
+    this.waitKey = false;
+    this.sink.push(data.slice(), { wall: Math.min(Number(head.msec) / 1000, nowS()), key });
+  }
+
+  async initVideo(ftyp, moov) {
+    let codec = codecOf(moov);
+    let mime = `video/mp4; codecs="${codec}"`;
+    if (!MSE.isTypeSupported(mime) && codec?.startsWith("hev1")) {
+      // Some browsers only take HEVC as hvc1; SS's hvcC carries the
+      // parameter sets, so relabelling the sample entry is enough.
+      const alt = codec.replace("hev1", "hvc1");
+      if (MSE.isTypeSupported(`video/mp4; codecs="${alt}"`)) {
+        const i = findBox(moov, "hev1");
+        if (i > 0) moov.set([0x68, 0x76, 0x63, 0x31], i);
+        codec = alt;
+        mime = `video/mp4; codecs="${alt}"`;
+      }
+    }
+    if (!codec || !MSE.isTypeSupported(mime)) return this.end("codec", codec);
+    await this.sink.init([ftyp, moov], mime);
+  }
+
+  appended(meta) {
+    const end = this.sink.end();
+    // In sequence mode a fragment starts where the previous one ended.
+    const start = this.map.at(-1)?.[1] ?? Math.max(0, end - 0.1);
+    this.map.push([start, end, meta.wall]);
+    if (meta.key) this.keys.push(start);
+    if (this.map.length > 600) this.map.splice(0, this.map.length - 600);
+    if (this.keys.length > 200) this.keys.splice(0, this.keys.length - 200);
+    if (!this.started && end > LIVE_TARGET) {
+      this.started = true;
+      this.video.currentTime = Math.max(0, end - LIVE_TARGET);
+      this.onStart?.();
+    }
+  }
+
+  /** The last keyframe at or before media time t (or -Infinity). */
+  keyBefore(t) {
+    for (let i = this.keys.length - 1; i >= 0; i--) if (this.keys[i] <= t) return this.keys[i];
+    return -Infinity;
+  }
+
+  /** Wall time shown at media time m (from the frames' own timestamps). */
+  wall(m) {
+    const map = this.map;
+    if (!map.length) return null;
+    // The fragment holding m: the last one starting at or before it.
+    let lo = 0;
+    let hi = map.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (map[mid][0] <= m) lo = mid;
+      else hi = mid - 1;
+    }
+    const [start, , wall] = map[lo];
+    return wall + Math.max(0, m - start);
+  }
+
+  /** Hold the target margin: nudge the speed, jump if far behind. */
+  steer() {
+    const hold = (el, sink) => {
+      const ahead = sink.end() - el.currentTime;
+      let rate = 1;
+      if (ahead > LIVE_TARGET + LIVE_JUMP) el.currentTime = sink.end() - LIVE_TARGET;
+      else if (ahead > LIVE_TARGET + 0.3) rate = 1.1;
+      else if (ahead < LIVE_TARGET - 0.3) rate = 0.93;
+      if (el.playbackRate !== rate) el.playbackRate = rate;
+    };
+    const v = this.video;
+    if (this.started && !v.paused && !v.seeking) hold(v, this.sink);
+    const a = this.audio;
+    if (a?.started && !a.el.paused && !a.el.seeking) hold(a.el, a.sink);
+  }
+
+  /** Sound on (the master, unmuted) or off. */
+  setAudio(on) {
+    if (on && !this.audio && this.audioCodecOk) this.startAudio();
+    if (!on && this.audio) this.stopAudio();
+  }
+
+  /**
+   * Runs inside the tap that unmuted (or picked the master): play() is asked
+   * for now, while the browser allows it (Safari needs the tap), and starts
+   * once there is sound to play.
+   */
+  startAudio() {
+    const el = document.createElement("audio");
+    const a = (this.audio = { el, started: false, inited: false });
+    a.sink = new MseSink(el, {
+      onAppended: () => this.audioAppended(a),
+      onError: () => this.audio === a && this.stopAudio(),
+    });
+    el.play().catch(() => {});
+    if (this.audioInit) this.initAudio();
+  }
+
+  async initAudio() {
+    const a = this.audio;
+    if (!a || a.inited) return;
+    a.inited = true;
+    const mime = 'audio/mp4; codecs="mp4a.40.2"';
+    const ok = MSE.isTypeSupported(mime) && (await a.sink.init(this.audioInit, mime));
+    if (!ok && this.audio === a) this.stopAudio();
+  }
+
+  audioAppended(a) {
+    if (a.started || a.sink.end() <= LIVE_TARGET) return;
+    a.started = true;
+    a.el.currentTime = Math.max(0, a.sink.end() - LIVE_TARGET);
+    if (!this.video.paused) a.el.play().catch(() => {});
+  }
+
+  resumeAudio() {
+    const a = this.audio;
+    if (!a?.started) return;
+    a.el.currentTime = Math.max(0, a.sink.end() - LIVE_TARGET);
+    a.el.play().catch(() => {});
+  }
+
+  stopAudio() {
+    const a = this.audio;
+    if (!a) return;
+    this.audio = null;
+    a.sink.close();
+    a.el.pause();
+    a.el.removeAttribute("src");
+    a.el.load();
+  }
+
+  close() {
+    this.closed = true;
+    this.events.abort();
+    clearInterval(this.keepAlive);
+    clearInterval(this.control);
+    this.ws.onmessage = this.ws.onclose = null;
+    try {
+      this.ws.close();
+    } catch (e) {
+      /* already closed */
+    }
+    this.stopAudio();
+    this.sink.close();
+  }
+}
+
+function findBox(buf, tag) {
+  const t = [...tag].map((c) => c.charCodeAt(0));
+  for (let i = 4; i + 4 <= buf.length; i++)
+    if (buf[i] === t[0] && buf[i + 1] === t[1] && buf[i + 2] === t[2] && buf[i + 3] === t[3]) return i;
+  return -1;
+}
+
 class Player {
   constructor(card, cameraId) {
     this.card = card;
     this.cameraId = cameraId;
     this.hls = null;
-    this.session = null; // last vod response for the loaded window
+    this.feed = null; // the real-time stream, when playing live
+    this.session = null; // last vod response for the loaded window ({live, ws} for the stream)
     this.mediaReady = false;
     this.target = nowS() - LIVE_LAG; // wall time we want / are at when nothing is playing
     this.seq = 0;
@@ -659,6 +1072,7 @@ class Player {
   }
 
   wall() {
+    if (this.feed) return (this.mediaReady && !this.loading && this.feed.wall(this.video.currentTime)) || this.target;
     // In a gap the media sits at the next run's start; the time is target.
     if (this.session && this.mediaReady && !this.loading && !this.gap) return this.mediaToWall(this.video.currentTime) ?? this.target;
     return this.target;
@@ -676,6 +1090,10 @@ class Player {
   }
 
   destroyMedia() {
+    if (this.feed) {
+      this.feed.close();
+      this.feed = null;
+    }
     if (this.hls) {
       this.hls.destroy();
       this.hls = null;
@@ -689,6 +1107,7 @@ class Player {
 
   destroy() {
     this.seq++;
+    this.goingLive = false;
     clearTimeout(this.bufTimer);
     this.destroyMedia();
     this.session = null;
@@ -711,6 +1130,16 @@ class Player {
   }
 
   seek(t, autoplay) {
+    if (MSE && isLiveTime(t)) {
+      // Already live (or connecting): just the play intent.
+      if (this.feed || this.goingLive) {
+        this.autoplay = autoplay;
+        if (!this.loading) autoplay ? this.video.play().catch(() => {}) : this.video.pause();
+        return;
+      }
+      return this.goLive(autoplay);
+    }
+    if (this.feed || this.goingLive) return this.load(t, autoplay); // back to recordings
     t = Math.min(t, nowS() - LIVE_LAG);
     const s = this.session;
     if (this.loading) {
@@ -750,6 +1179,8 @@ class Player {
    * window must get beyond; otherwise playback stops instead of looping.
    */
   async load(t, autoplay, after = null) {
+    if (MSE && after == null && isLiveTime(t)) return this.goLive(autoplay);
+    this.goingLive = false;
     const seq = ++this.seq;
     const card = this.card;
     const now = nowS();
@@ -875,6 +1306,81 @@ class Player {
     hls.attachMedia(v);
   }
 
+  /** Play the camera's real-time stream (see LiveFeed). */
+  async goLive(autoplay) {
+    const seq = ++this.seq;
+    const card = this.card;
+    this.target = nowS();
+    this.autoplay = autoplay;
+    this.lastLoad = { at: Date.now(), wall: this.target };
+    if (card._master === this) card._paint(this.target);
+    this.freeze();
+    this.video.pause();
+    this.setStatus("Connecting", "loading", `${card._cameraName(this.cameraId)} · Live`);
+    this.loading = true;
+    this.goingLive = true;
+    let res;
+    try {
+      res = await card._ws({ type: "surveillance_station/live", camera_id: this.cameraId });
+    } catch (e) {
+      if (seq === this.seq) {
+        this.loading = this.goingLive = false;
+        this.setStatus("Live view failed", "error", errText(e), () => this.goLive(true));
+      }
+      return;
+    }
+    if (seq !== this.seq) return;
+    this.destroyMedia();
+    this.gap = false;
+    this.session = { live: true, ws: true };
+    const url = card._hass.hassUrl(res.url).replace(/^http/, "ws");
+    const feed = new LiveFeed(this, url, {
+      onStart: () => {
+        if (feed !== this.feed) return;
+        this.loading = this.goingLive = false;
+        this.liveStartedAt = Date.now();
+        if (this.autoplay) this.video.play().catch(() => {});
+      },
+      onEnd: (why, detail) => {
+        if (feed !== this.feed) return;
+        const playing = this.intendsPlay();
+        const started = feed.started;
+        this.destroyMedia();
+        this.loading = this.goingLive = false;
+        this.session = null;
+        const retry = () => {
+          this.liveDrops = 0;
+          this.liveFailed = false;
+          this.goLive(true);
+        };
+        if (why === "codec") {
+          this.liveFailed = true;
+          this.setStatus("This browser can't decode this camera's video", "error", detail ?? "", retry);
+          return;
+        }
+        // A dropped stream reconnects, backing off (1, 2, 4 s) while it keeps
+        // failing straight away, or never starts (refused, SS unreachable).
+        const quick = !started || Date.now() - this.liveStartedAt < 10000;
+        this.liveDrops = quick ? (this.liveDrops ?? 0) + 1 : 1;
+        if (this.liveDrops > 3) {
+          this.liveFailed = true;
+          this.setStatus("Live view unavailable", "error", this.card._cameraName(this.cameraId), retry);
+          return;
+        }
+        this.setStatus("Reconnecting", "loading", `${this.card._cameraName(this.cameraId)} · Live`);
+        const at = this.seq;
+        setTimeout(() => at === this.seq && this.goLive(playing), 1000 * 2 ** (this.liveDrops - 1));
+      },
+    });
+    this.feed = feed;
+    this.syncAudio();
+  }
+
+  /** Live sound: from the master, when not muted. */
+  syncAudio() {
+    this.feed?.setAudio(this.card._master === this && !this.video.muted);
+  }
+
   /** At the end of a window, carry on into whatever was recorded next. */
   async continue() {
     // "ended" means the playlist is closed: an old window, or a live one that
@@ -913,8 +1419,26 @@ class Player {
    * nudging the speed, large drift by seeking; a moment this camera has no
    * footage for pauses it behind a "No recording" veil.
    */
-  follow(wall, playing, rate, stalled = false) {
+  follow(wall, playing, rate, stalled = false, masterLive = false) {
     if (this.loading) return;
+    if (masterLive) {
+      // The master is on the real-time stream: so is this camera, each
+      // keeping its own margin; only play / pause is shared.
+      if (!this.feed) {
+        const last = this.lastLoad;
+        const wasLive = last && isLiveTime(last.wall + (Date.now() - last.at) / 1000);
+        if (!this.liveFailed && (!last || Date.now() - last.at > 5000 || !wasLive)) this.goLive(playing);
+        return;
+      }
+      const v = this.video;
+      if (playing && v.paused) v.play().catch(() => {});
+      else if (!playing && !v.paused) v.pause();
+      return;
+    }
+    if (this.feed) {
+      this.load(wall, playing);
+      return;
+    }
     const s = this.session;
     const inWindow = s && wall >= Math.min(s.start, s.reqStart ?? s.start) - 1 && (s.live || wall < s.end);
     if (!inWindow) {
@@ -1010,7 +1534,7 @@ class SSTimelineCard extends HTMLElement {
       return;
     }
     const t = this._master.wall();
-    const at = this._wantsLive(t) ? nowS() - LIVE_LAG : t;
+    const at = this._wantsLive(t) ? nowS() : t;
     const playing = this._master.intendsPlay();
     this._loadTimeline();
     // New sessions: a seek could stay inside one the server no longer has.
@@ -1057,7 +1581,7 @@ class SSTimelineCard extends HTMLElement {
       // Back on the view: live again if it was live, else where it was.
       const { t, playing, live } = this._resume;
       this._resume = null;
-      const at = live ? nowS() - LIVE_LAG : t;
+      const at = live ? nowS() : t;
       this._centerOn(at);
       this._loadTimeline();
       this._seekAll(at, playing);
@@ -1092,6 +1616,7 @@ class SSTimelineCard extends HTMLElement {
     for (const p of this._players.values()) {
       p.seq++;
       p.loading = false;
+      p.goingLive = false;
       p.destroyMedia();
       p.session = null;
     }
@@ -1130,7 +1655,7 @@ class SSTimelineCard extends HTMLElement {
     this._markCameras();
     this._resetEvents();
     // Opening the card plays: live, or the moment a link asked for.
-    const start = t > 0 ? t : nowS() - LIVE_LAG;
+    const start = t > 0 ? t : nowS();
     this._centerOn(start);
     if (!this.isConnected) {
       // Left the view while the cameras were loading: start on return.
@@ -1202,7 +1727,7 @@ class SSTimelineCard extends HTMLElement {
               <select class="speed" title="Playback speed">
                 ${SPEEDS.map((v) => `<option value="${v}">${v}×</option>`).join("")}
               </select>
-              <button class="live" data-act="live" title="Watch live (about ${LIVE_LAG} s behind)">${icon("mdi:access-point")}<span class="txt">Live</span></button>
+              <button class="live" data-act="live" title="Watch live">${icon("mdi:access-point")}<span class="txt">Live</span></button>
               <span class="spacer"></span>
               <span class="jumpwrap">
                 <button class="icon" data-act="jump" title="Go to a date and time">${icon("mdi:calendar-clock")}</button>
@@ -1288,7 +1813,7 @@ class SSTimelineCard extends HTMLElement {
       const bm = Math.abs(e.clientX - this._down.x) < 6 && this._down.bm;
       const ev = bm && this._bookmarks.find((x) => String(x.id) === bm);
       if (ev) this._jumpToEvent(ev);
-      else this._seekAll(this._timeAt(e), true);
+      else this._seekAll(liveIfRecent(this._timeAt(e)), true);
     });
     tr.addEventListener("pointercancel", () => {
       this._drag = false;
@@ -1418,6 +1943,7 @@ class SSTimelineCard extends HTMLElement {
       q.applyBufferProfile();
     }
     p.video.muted = muted;
+    for (const q of this._players.values()) q.syncAudio();
     // A follower may have been mid-nudge; the master sets the pace.
     p.video.playbackRate = this._rate;
     this._markCameras();
@@ -1503,6 +2029,11 @@ class SSTimelineCard extends HTMLElement {
     const m = this._master;
     if (this._players.size < 2 || !m) return;
     const followers = [...this._players.values()].filter((p) => p !== m);
+    if (m.feed || m.goingLive) {
+      // Live: no waiting for the master's stalls (each stream has its own).
+      for (const p of followers) p.follow(m.wall(), m.intendsPlay(), this._rate, false, true);
+      return;
+    }
     if (m.loading || (m.session && !m.mediaReady && !m.gap)) {
       // Wait where they are; they'll be moved once the master's media is up.
       for (const p of followers) if (!p.loading && !p.video.paused) p.video.pause();
@@ -1631,7 +2162,10 @@ class SSTimelineCard extends HTMLElement {
       return;
     }
     if (b.dataset.skip) {
-      this._seekAll(m.wall() + Number(b.dataset.skip), m.intendsPlay());
+      const d = Number(b.dataset.skip);
+      // Forward past the newest recording: live.
+      const t = d > 0 ? liveIfRecent(m.wall() + d) : m.wall() + d;
+      this._seekAll(t, m.intendsPlay());
       return;
     }
     if (b.dataset.span) {
@@ -1658,7 +2192,7 @@ class SSTimelineCard extends HTMLElement {
         } else for (const p of this._players.values()) p.pause();
         break;
       case "live": {
-        const t = nowS() - LIVE_LAG;
+        const t = nowS();
         this._centerOn(t);
         this._loadTimeline();
         this._seekAll(t, true);
@@ -1688,6 +2222,7 @@ class SSTimelineCard extends HTMLElement {
       }
       case "mute":
         m.video.muted = !m.video.muted;
+        m.syncAudio();
         this._syncMuteIcon();
         break;
       case "solo":
@@ -2056,13 +2591,14 @@ class SSTimelineCard extends HTMLElement {
 
   /** Where to resume: live if it was playing (or about to play) the newest footage. */
   _wantsLive(t) {
-    return this._isLive(t) || (!!this._master?.intendsPlay() && nowS() - t < LIVE_LAG + 20);
+    return this._isLive(t) || !!this._master?.goingLive || (!!this._master?.intendsPlay() && nowS() - t < LIVE_LAG + 20);
   }
 
   /** Playing (close to) the newest footage of a live playlist. */
   _isLive(t) {
     const m = this._master;
-    return !!m?.session?.live && nowS() - t < LIVE_LAG + 20;
+    // With MSE, live is the real-time stream; without, the growing recording.
+    return MSE ? !!m?.feed && nowS() - t < 10 : !!m?.session?.live && nowS() - t < LIVE_LAG + 20;
   }
 
   /**

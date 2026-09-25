@@ -23,6 +23,7 @@ from homeassistant.core import HomeAssistant, callback
 from .const import (
     BOOKMARK_PAGE_MAX,
     DOMAIN,
+    LIVE_URL,
     MAX_QUERY_WINDOW_SECONDS,
     VOD_MAX_WINDOW_SECONDS,
     VOD_SESSION_TTL_SECONDS,
@@ -38,7 +39,7 @@ ERR_SS = "surveillance_station_error"
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_vod, ws_vod_runs):
+    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_live, ws_vod, ws_vod_runs):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -237,6 +238,20 @@ def _bookmark(b: Bookmark, thumbnail: str | None = None) -> dict[str, Any]:
     if thumbnail is not None:
         out["thumbnail"] = thumbnail
     return out
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "surveillance_station/live", vol.Optional("entry_id"): str, vol.Required("camera_id"): vol.Coerce(int)}
+)
+@websocket_api.async_response
+async def ws_live(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """A single-use URL for a camera's real-time stream (a WebSocket, see LiveStreamView)."""
+
+    async def go():
+        entry_id, _ = _client(hass, msg.get("entry_id"))
+        return {"url": f"{LIVE_URL}/{_manager(hass).create_live_token(entry_id, msg['camera_id'])}"}
+
+    await _run(hass, connection, msg, go())
 
 
 @websocket_api.websocket_command({vol.Required("type"): "surveillance_station/vod", **_RANGE_SCHEMA})

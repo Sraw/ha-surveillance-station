@@ -24,6 +24,7 @@ import logging
 import secrets
 import time
 
+import aiohttp
 from aiohttp import web
 from synology_ss_playback import (
     Bookmark,
@@ -49,6 +50,10 @@ from .const import (
     BOOKMARK_CACHE_SECONDS,
     BOOKMARK_ERROR_SECONDS,
     DOMAIN,
+    LIVE_IDLE_SECONDS,
+    LIVE_TOKEN_TTL_SECONDS,
+    LIVE_URL,
+    MAX_LIVE_STREAMS,
     MAX_PARALLEL_FETCHES,
     MAX_PARALLEL_THUMBNAILS,
     SEGMENT_CACHE_BYTES,
@@ -119,6 +124,10 @@ class VodManager:
         # and the one fetch per entry that every request waits on.
         self._bookmarks: dict[str, tuple[float, list[Bookmark] | SSError]] = {}
         self._bookmark_tasks: dict[str, asyncio.Task] = {}
+        # Live streams: unused tokens -> (entry_id, camera_id, expires), and
+        # the relays running (entry_id, browser socket).
+        self._live_tokens: dict[str, tuple[str, int, float]] = {}
+        self.live_streams: set[tuple[str, web.WebSocketResponse]] = set()
 
     def client(self, entry_id: str) -> SurveillanceStationClient | None:
         """The logged-in client of a loaded entry."""
@@ -153,6 +162,10 @@ class VodManager:
                     del tasks[key]
         if (task := self._bookmark_tasks.pop(entry_id, None)) is not None:
             task.cancel()
+        for token in [t for t, v in self._live_tokens.items() if v[0] == entry_id]:
+            del self._live_tokens[token]
+        for stream in [x for x in self.live_streams if x[0] == entry_id]:
+            self.hass.async_create_task(stream[1].close(code=aiohttp.WSCloseCode.GOING_AWAY))
         self._unreachable.discard(entry_id)
         self._bookmarks.pop(entry_id, None)
 
@@ -164,6 +177,7 @@ class VodManager:
             "fetches_in_flight": len(self._inflight),
             "cached_thumbnails": len(self._thumbs),
             "cached_thumbnail_bytes": self._thumbs_bytes,
+            "live_streams": len(self.live_streams),
         }
 
     async def bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
@@ -288,6 +302,21 @@ class VodManager:
         if (old := self._thumbs.pop(key, None)) is not None:
             self._thumbs_bytes -= len(old[1]) + THUMBNAIL_ENTRY_BYTES
 
+    def create_live_token(self, entry_id: str, camera_id: int) -> str:
+        now = time.time()
+        for token in [t for t, v in self._live_tokens.items() if v[2] < now]:
+            del self._live_tokens[token]
+        token = secrets.token_urlsafe(32)
+        self._live_tokens[token] = (entry_id, camera_id, now + LIVE_TOKEN_TTL_SECONDS)
+        return token
+
+    def take_live_token(self, token: str) -> tuple[str, int] | None:
+        """The (entry_id, camera_id) of an unused, unexpired token; it is used up."""
+        found = self._live_tokens.pop(token, None)
+        if found is None or found[2] < time.time():
+            return None
+        return found[0], found[1]
+
     def create_session(self, session: VodSession) -> str:
         now = time.time()
         for token in [t for t, s in self._sessions.items() if s.expires < now]:
@@ -400,6 +429,98 @@ class VodManager:
             raise
         self.track(entry_id, None)
         return result
+
+
+class LiveStreamView(HomeAssistantView):
+    """A camera's real-time stream, relayed from Surveillance Station.
+
+    The browser opens a WebSocket here with a single-use token from the
+    ``surveillance_station/live`` command (the token is the credential, as
+    for the VOD views); HA opens the documented SS stream socket with its own
+    session and passes the messages through unchanged. The SS session id
+    never reaches the browser, and the stream works wherever HA is reachable.
+    Nothing the browser sends is passed on.
+    """
+
+    requires_auth = False
+    url = LIVE_URL + "/{token}"
+    name = "api:surveillance_station:live"
+
+    def __init__(self, manager: VodManager) -> None:
+        self.manager = manager
+
+    async def get(self, request: web.Request, token: str) -> web.StreamResponse:
+        if (found := self.manager.take_live_token(token)) is None:
+            raise web.HTTPNotFound()
+        entry_id, camera_id = found
+        # No heartbeat: video flows all the time, and the browser's
+        # keep-alives (or their absence) tell whether it is still there.
+        browser = web.WebSocketResponse(max_msg_size=4096)
+        if not browser.can_prepare(request).ok:
+            raise web.HTTPBadRequest()
+        client = self.manager.client(entry_id)
+        if client is None:
+            raise web.HTTPNotFound()
+        if len(self.manager.live_streams) >= MAX_LIVE_STREAMS:
+            raise web.HTTPServiceUnavailable()
+        stream = (entry_id, browser)
+        self.manager.live_streams.add(stream)  # holds the slot while connecting
+        upstream = None
+        try:
+            try:
+                upstream, first = await client.open_live(camera_id)
+            except SSError as err:
+                self.manager.track(entry_id, err)
+                _LOGGER.debug("Live stream of camera %s failed: %s", camera_id, err)
+                raise web.HTTPBadGateway() from None
+            self.manager.track(entry_id, None)
+            await browser.prepare(request)
+            await browser.send_bytes(first.data)
+            await _relay(upstream, browser)
+        finally:
+            self.manager.live_streams.discard(stream)
+            if upstream is not None:
+                await upstream.close()
+            if browser.prepared:
+                await browser.close()
+        return browser
+
+
+async def _relay(upstream: aiohttp.ClientWebSocketResponse, browser: web.WebSocketResponse) -> None:
+    """Pass SS's messages on until either side goes.
+
+    HA keeps SS's stream alive itself; the browser's keep-alives only show
+    that it's still there (a phone that dropped off Wi-Fi sends no reset, and
+    the relay would otherwise hold the stream until TCP gives up).
+    """
+
+    async def down() -> None:
+        async for msg in upstream:
+            if msg.type != aiohttp.WSMsgType.BINARY:
+                break
+            # Awaits the browser's socket buffer: a slow viewer slows the
+            # read from SS rather than piling data up in HA.
+            await browser.send_bytes(msg.data)
+
+    async def up() -> None:
+        while True:
+            # Background tabs run timers about once a minute: be generous.
+            msg = await browser.receive(timeout=LIVE_IDLE_SECONDS)
+            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                return
+
+    async def keep_alive() -> None:
+        while True:
+            await asyncio.sleep(10)
+            await upstream.send_str("keepAlive")
+
+    tasks = [asyncio.create_task(down()), asyncio.create_task(up()), asyncio.create_task(keep_alive())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def _join[T](task: asyncio.Task[T], what: str) -> T:

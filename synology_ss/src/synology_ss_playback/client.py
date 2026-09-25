@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import time
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -50,6 +51,9 @@ def _is_hevc(codec: Any) -> bool:
         return codec == VIDEO_CODEC_H265
     return str(codec or "").upper() in ("H265", "HEVC")
 
+
+# A refused live stream re-logs in at most this often (see open_live).
+LIVE_RELOGIN_SECONDS = 60
 
 class SSError(Exception):
     """A Surveillance Station API call failed."""
@@ -125,6 +129,7 @@ class SurveillanceStationClient:
         self._login_lock = asyncio.Lock()
         self._auth_failed: int | None = None
         self._tz: ZoneInfo | None = None
+        self._live_relogin_at = -LIVE_RELOGIN_SECONDS
         # Called when a re-login is refused at runtime (password changed).
         self.on_auth_failed: Callable[[], None] | None = None
 
@@ -180,6 +185,57 @@ class SurveillanceStationClient:
         except SSError:
             pass
         self._sid = None
+
+    async def open_live(
+        self, camera_id: int, heartbeat: float = 30
+    ) -> tuple[aiohttp.ClientWebSocketResponse, aiohttp.WSMessage]:
+        """Connect to a camera's real-time stream; returns the socket and its first message.
+
+        The documented WebSocket stream (``/ss_webstream_task/``, see the SS
+        Web API "Liveview / Playback" page): binary messages of a 4-byte
+        big-endian header end offset, a query-string header (``vdoCodec`` /
+        ``adoCodec`` first, then ``mediaType`` 1 = video / 2 = audio, ``key``,
+        ``msec``), and fragmented MP4 (``ftyp``, ``moov``, then ``moof`` +
+        ``mdat`` per frame). The client sends ``keepAlive`` every 10 s.
+
+        SS answers an unknown or expired sid by closing at once, so a close
+        before any data means: log in again and retry, once. The URL carries
+        the sid and never appears in errors.
+        """
+        base = self._base.removesuffix("/webapi").replace("http", "ws", 1)
+        for attempt in (1, 2):
+            if self._sid is None:
+                await self.login()
+            sid = self._sid
+            try:
+                ws = await self._session.ws_connect(
+                    f"{base}/ss_webstream_task/?camId={int(camera_id)}&_sid={sid}",
+                    heartbeat=heartbeat,
+                    max_msg_size=0,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=5),
+                )
+            except (aiohttp.ClientError, TimeoutError) as err:
+                raise SSConnectionError("ss_webstream_task", "connect", None, type(err).__name__) from None
+            try:
+                first = await asyncio.wait_for(ws.receive(), 15)
+            except TimeoutError:
+                await ws.close()
+                raise SSConnectionError("ss_webstream_task", "receive", None, "no data") from None
+            except BaseException:
+                await ws.close()
+                raise
+            if first.type == aiohttp.WSMsgType.BINARY:
+                return ws, first
+            await ws.close()
+            # Closed before any data: an expired sid, or a camera SS won't
+            # stream (offline, disabled). Log in again at most once a minute,
+            # so a camera that stays refused doesn't mean a DSM login per try.
+            now = time.monotonic()
+            if attempt == 2 or now - self._live_relogin_at < LIVE_RELOGIN_SECONDS:
+                break
+            self._live_relogin_at = now
+            await self.login(stale_sid=sid)
+        raise SSError("ss_webstream_task", "connect", None, f"stream of camera {camera_id} refused")
 
     async def _request(self, path: str, params: dict[str, Any], post: bool, timeout: float) -> tuple[bytes, str]:
         """One HTTP round trip; errors never carry the URL (it holds the sid)."""

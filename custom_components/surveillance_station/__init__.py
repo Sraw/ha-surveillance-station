@@ -27,7 +27,15 @@ from homeassistant.helpers.typing import ConfigType
 
 from . import websocket
 from .const import CARD_FILENAME, CONF_VERIFY_SSL, DOMAIN, STATIC_URL
-from .views import DATA_MANAGER, ThumbnailView, VodInitView, VodManager, VodPlaylistView, VodSegmentView
+from .views import (
+    DATA_MANAGER,
+    LiveStreamView,
+    ThumbnailView,
+    VodInitView,
+    VodManager,
+    VodPlaylistView,
+    VodSegmentView,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +54,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         _LOGGER.info("Removed %d stale remux scratch files", removed)
     manager = VodManager(hass)
     hass.data[DATA_MANAGER] = manager
-    for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView):
+    for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LiveStreamView):
         hass.http.register_view(view(manager))
     websocket.async_register(hass)
     await hass.http.async_register_static_paths(
