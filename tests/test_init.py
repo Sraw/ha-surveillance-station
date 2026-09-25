@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-from synology_ss_playback import SSAuthError, SSConnectionError
+from synology_ss_playback import SSAuthError, SSConnectionError, SSError
 
 from custom_components.surveillance_station.const import CARD_FILENAME, DOMAIN
 from homeassistant.components.lovelace.const import LOVELACE_DATA
@@ -68,6 +68,17 @@ async def test_unreachable_retries(
     hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
 ) -> None:
     mock_client.login.side_effect = SSConnectionError("SYNO.API.Auth", "login", None)
+    mock_config_entry.add_to_hass(hass)
+    await hass.config_entries.async_setup(mock_config_entry.entry_id)
+    await hass.async_block_till_done()
+    assert mock_config_entry.state is ConfigEntryState.SETUP_RETRY
+
+
+async def test_incomplete_info_retries(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """An SS answer without the serial is retried, not a permanent setup error."""
+    mock_client.info.side_effect = SSError("SYNO.SurveillanceStation.Info", "GetInfo", None, "answer without a serial")
     mock_config_entry.add_to_hass(hass)
     await hass.config_entries.async_setup(mock_config_entry.entry_id)
     await hass.async_block_till_done()

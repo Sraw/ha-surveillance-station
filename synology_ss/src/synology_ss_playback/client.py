@@ -294,6 +294,11 @@ class SurveillanceStationClient:
 
     async def info(self) -> SSInfo:
         data = await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)
+        if "serial" not in data:
+            # Seen once (2026-09-25) right after an HA restart: a success
+            # answer without the serial, fine again moments later. An SSError
+            # makes setup retry rather than fail for good.
+            raise SSError("SYNO.SurveillanceStation.Info", "GetInfo", None, "answer without a serial")
         v = data.get("version") or {}
         version = ".".join(str(v[k]) for k in ("major", "minor", "small") if k in v)
         if "build" in v:
