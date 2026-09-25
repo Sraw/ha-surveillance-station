@@ -185,13 +185,21 @@ event list, and in DS cam / the SS client. Every animal is called "Animal".
 - Each new bookmark fires **`surveillance_station_detection`** once, with
   `camera`, `camera_id`, `objects` (as named: `["Person", "Animal"]`),
   `labels` (Frigate's: `["person", "dog"]`), `zones`, `severity`, `start`,
-  `review_id`, `bookmark_id`, `image` (a signed frame of the moment, from SS)
-  and `url` (the card at that moment, if a dashboard path is set). It waits
+  `review_id`, `bookmark_id`, `image` (a signed frame of the moment from SS's
+  main stream, 1280 px wide: Frigate's own snapshots come from its 640x360
+  detect stream), `thumbnail` (the same, 320 px) and `url` (the card at that
+  moment, if a dashboard path is set). It waits
   for SS to have recorded the moment (SS lists recordings 0-10 s behind; at
   most 20 s), so the frame is there when a phone fetches it. The frame is
   the one Frigate picked as showing the object best (`thumb_time`), and it
   is also the bookmark's thumbnail in the card (kept up to date as Frigate
   picks a better one); the link still starts at the review's beginning.
+- **Quiet period** (option, 5 min by default): no event for a review when
+  the same camera had a bookmarked review of the same kinds (Person, Car,
+  Animal) active within it, the dog that wandered off and came back; it is
+  still bookmarked. A new kind (a person joining the dog) is announced.
+  Frigate's own `review.*.cutoff_time` decides when an absence splits a
+  review in the first place (40 / 30 s by default; 120 s here).
 - One event per review, when it first qualifies, with the objects seen by
   then: a car that a person later gets out of was announced as "Car". A
   review bookmarked more than 2 minutes after it began (SS was unreachable,
@@ -242,6 +250,7 @@ Every buffer has a cap, and the only thing kept on disk is thumbnails:
 | Browser memory | each stream | 8-20 s behind the playhead, trimmed as it goes; ahead, live 0.8 s (a backlog of 90 fragments drops to the next keyframe), recordings at most ~4 s (then SS is paused) |
 | HA memory | event thumbnails (JPEG, 320 px, 10-20 KB) | 16 MB LRU (+256 B per entry, so "nothing recorded" answers count too; those expire after 5 min); 2 made at a time, one job per frame however many ask, cancelled once nobody waits for it |
 | HA disk | event thumbnails, `<config>/.cache/surveillance_station/thumbnails/` (left out of HA backups) | 64 MB, least recently used removed first; kept across restarts, so a thumbnail is made from the recording once; an entry's are deleted with the entry |
+| HA disk | notification images (1280 px, from the 4K main stream), `<config>/.cache/surveillance_station/images/` | 128 MB, the same way |
 | HA memory | the bookmark list of each entry | re-read after 15 s; one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
 | Browser disk | thumbnails | `private, max-age=172800, immutable` (a thumbnail of a past moment never changes, and its URL stays the same all day and across HA restarts) |
 | Browser disk | segments | none: served `Cache-Control: no-store` (the URLs are per-session, so a cached copy would never be used again) |

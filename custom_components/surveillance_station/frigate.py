@@ -11,7 +11,8 @@ Frigate cameras are matched to SS cameras by name, ignoring case, spaces and
 punctuation (``drive_way`` is "Drive Way").
 
 A created bookmark is announced as a ``surveillance_station_detection`` event
-(once per review) for automations to notify with, carrying a signed frame of
+(once per review, and not when the camera saw only the same kinds within the
+quiet period) for automations to notify with, carrying a signed frame of
 the moment Frigate saw the object best and, if configured, a link to the card
 at the review's start. The bookmark's thumbnail in the card is that frame too. The event waits for
 SS to have recorded that moment (it lists recordings ~0-10 s behind), at most
@@ -49,6 +50,7 @@ from .const import (
     FRIGATE_EVENT_WAIT_SECONDS,
     FRIGATE_OPEN_BOOKMARK_SECONDS,
     FRIGATE_TRACKED_MAX,
+    LARGE_IMAGE_WIDTH,
 )
 from .views import VodManager
 
@@ -106,6 +108,7 @@ class FrigateBridge:
         topic: str,
         objects: set[str],
         link: str,
+        quiet_minutes: float = 0,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
@@ -114,6 +117,9 @@ class FrigateBridge:
         self.topic = topic.strip("/")
         self.objects = objects
         self.link = link
+        self.quiet = quiet_minutes * 60
+        # (SS camera id, kind) -> when that kind was last active on that camera.
+        self._last_seen: dict[tuple[int, str], float] = {}
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
         self._cameras_at = 0.0
         self._unknown: set[str] = set()  # Frigate cameras warned about
@@ -231,6 +237,11 @@ class FrigateBridge:
         # from the keyframe at or before a second (every second here): rounded
         # up, that keyframe is within a second of Frigate's frame either way.
         frame = math.ceil(float(data["thumb_time"])) if data.get("thumb_time") else None
+        # Seen on this camera lately (before this review): no second notification.
+        now = time.time()
+        repeat = bool(objects) and all(
+            now - self._last_seen.get((camera_id, k), -math.inf) < self.quiet for k in kinds(objects)
+        )
         if tracked is None:
             bm = await self.client.create_bookmark(camera_id, name, start, end, comment)
             tracked = _Tracked(bm.id, camera_id, name, comment, start, end)
@@ -239,12 +250,19 @@ class FrigateBridge:
             # One only heard of at its end (Home Assistant was down), or long
             # after it began (SS was unreachable, a restart mid-review), gets
             # its bookmark, but is old news for a notification.
-            if kind != "end" and time.time() - start <= FRIGATE_ANNOUNCE_MAX_AGE:
+            if kind != "end" and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
                 self._announce(review_id, bm.id, camera_id, camera_name, after, objects, zones, start, frame or start)
         elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
             await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self.manager.forget_bookmarks(self.entry_id)
+        # Bookmarked: its kinds count as seen here (still going on: now;
+        # ended: when last active).
+        active = float(ended) if ended else now
+        for k in kinds(objects):
+            self._last_seen[(camera_id, k)] = max(self._last_seen.get((camera_id, k), 0), active)
+        if len(self._last_seen) > 256:
+            self._last_seen = {k: v for k, v in self._last_seen.items() if now - v < self.quiet}
         if frame is not None and frame != tracked.frame:
             tracked.frame = frame
             self.manager.set_frame(self.entry_id, tracked.bookmark_id, frame)
@@ -303,13 +321,16 @@ class FrigateBridge:
             "labels": list(dict.fromkeys(objects)),
             "zones": zones,
             "start": start,
-            "image": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
+            "image": self.manager.sign_thumbnail(self.entry_id, camera_id, frame, large=True),
+            "thumbnail": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
             "url": self._url(camera_id, start),
         }
 
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
-            await self.manager.thumbnail_when_recorded(self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS)
+            await self.manager.thumbnail_when_recorded(
+                self.entry_id, camera_id, frame, FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
+            )
             self.hass.bus.async_fire(DETECTION_EVENT, payload)
 
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")

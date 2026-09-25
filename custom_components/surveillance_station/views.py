@@ -53,9 +53,11 @@ from homeassistant.util.hass_dict import HassKey
 
 from .const import (
     BOOKMARK_CACHE_SECONDS,
-    BOOKMARK_FRAMES_MAX,
     BOOKMARK_ERROR_SECONDS,
+    BOOKMARK_FRAMES_MAX,
     DOMAIN,
+    LARGE_IMAGE_DISK_BYTES,
+    LARGE_IMAGE_WIDTH,
     LIVE_IDLE_SECONDS,
     LIVE_TOKEN_TTL_SECONDS,
     LIVE_URL,
@@ -69,6 +71,7 @@ from .const import (
     THUMBNAIL_MISS_SECONDS,
     THUMBNAIL_URL,
     THUMBNAIL_URL_TTL_HOURS,
+    THUMBNAIL_WIDTH,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
@@ -124,12 +127,14 @@ class VodManager:
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
         # (entry_id, camera_id, ts) -> (made at, JPEG or b"" for "nothing
         # recorded then"), the jobs making them and how many requests wait on each.
-        self._thumbs: OrderedDict[tuple[str, int, int], tuple[float, bytes]] = OrderedDict()
+        # Keys are (entry_id, camera_id, ts, width).
+        self._thumbs: OrderedDict[tuple[str, int, int, int], tuple[float, bytes]] = OrderedDict()
         self._thumbs_bytes = 0
-        self._thumb_tasks: dict[tuple[str, int, int], asyncio.Task] = {}
-        self._thumb_waiters: dict[tuple[str, int, int], int] = {}
+        self._thumb_tasks: dict[tuple[str, int, int, int], asyncio.Task] = {}
+        self._thumb_waiters: dict[tuple[str, int, int, int], int] = {}
         self._thumb_sem = asyncio.Semaphore(MAX_PARALLEL_THUMBNAILS)
         self.disk = ThumbnailStore(hass, hass.config.cache_path(DOMAIN, "thumbnails"), THUMBNAIL_DISK_BYTES)
+        self.disk_large = ThumbnailStore(hass, hass.config.cache_path(DOMAIN, "images"), LARGE_IMAGE_DISK_BYTES)
         # Thumbnail URLs carry an HMAC under this key (see sign_thumbnail),
         # kept across restarts (async_load) so the URLs, and the browser's
         # cached copies, stay good.
@@ -159,6 +164,7 @@ class VodManager:
         else:  # none yet, or not one of ours
             await self._key_store.async_save({"key": self._thumb_key.hex()})
         await self.disk.load()
+        await self.disk_large.load()
         frames = await self._frame_store.async_load()
         if isinstance(frames, dict):
             self._frames.update((k, v) for k, v in frames.items() if isinstance(v, int))
@@ -228,6 +234,8 @@ class VodManager:
             "cached_thumbnail_bytes": self._thumbs_bytes,
             "disk_thumbnails": len(self.disk),
             "disk_thumbnail_bytes": self.disk.bytes,
+            "disk_images": len(self.disk_large),
+            "disk_image_bytes": self.disk_large.bytes,
             "live_streams": len(self.live_streams),
         }
 
@@ -272,7 +280,9 @@ class VodManager:
         """Changed in SS by us: list them afresh on the next request."""
         self._bookmarks.pop(entry_id, None)
 
-    async def thumbnail_when_recorded(self, entry_id: str, camera_id: int, ts: int, wait: float) -> bytes | None:
+    async def thumbnail_when_recorded(
+        self, entry_id: str, camera_id: int, ts: int, wait: float, width: int = THUMBNAIL_WIDTH
+    ) -> bytes | None:
         """The frame at ts once SS has written it, waiting at most wait seconds.
 
         SS moves a recording's reported end forward every ~10 s, to what it
@@ -286,14 +296,14 @@ class VodManager:
                 if client is not None and any(
                     r.start <= ts and r.end >= ts + 1 for r in await client.recordings(camera_id, ts - 1, ts + 1)
                 ):
-                    return await self.thumbnail(entry_id, camera_id, ts)
+                    return await self.thumbnail(entry_id, camera_id, ts, width)
             except SSError:
                 pass
             if time.monotonic() + THUMBNAIL_POLL_SECONDS > deadline:
                 return None
             await asyncio.sleep(THUMBNAIL_POLL_SECONDS)
 
-    def sign_thumbnail(self, entry_id: str, camera_id: int, ts: int) -> str:
+    def sign_thumbnail(self, entry_id: str, camera_id: int, ts: int, large: bool = False) -> str:
         """A URL for the frame of camera_id at ts, valid for one to two days.
 
         An HMAC of our own rather than HA's async_sign_path: HA answers an
@@ -302,10 +312,11 @@ class VodManager:
         so a long-open card would get its device IP-banned. A bad signature
         here is a plain 404. The expiry is the end of the (UTC) day plus a
         day, so the URL (and the browser's cached copy) is the same all day,
-        across list refreshes and HA restarts.
+        across list refreshes and HA restarts. large: LARGE_IMAGE_WIDTH wide
+        (for a notification) rather than THUMBNAIL_WIDTH.
         """
         exp = (int(time.time()) // 86400 + 1) * 86400 + THUMBNAIL_URL_TTL_HOURS * 3600
-        path = f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}.jpg"
+        path = f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}{'-large' if large else ''}.jpg"
         return f"{path}?exp={exp}&sig={self._thumbnail_sig(path, exp)}"
 
     def check_thumbnail(self, path: str, exp: str | None, sig: str | None) -> bool:
@@ -319,13 +330,15 @@ class VodManager:
     def _thumbnail_sig(self, path: str, exp: int) -> str:
         return hmac.new(self._thumb_key, f"{path}\n{exp}".encode(), hashlib.sha256).hexdigest()[:32]
 
-    async def thumbnail(self, entry_id: str, camera_id: int, ts: int) -> bytes | None:
-        """JPEG of camera_id at ts, or None if nothing was recorded then.
+    async def thumbnail(
+        self, entry_id: str, camera_id: int, ts: int, width: int = THUMBNAIL_WIDTH
+    ) -> bytes | None:
+        """JPEG of camera_id at ts, width pixels wide, or None if nothing was recorded then.
 
         Requests for the same frame share one job; a job nobody waits for any
         more (the thumbnail was scrolled past) is cancelled.
         """
-        key = (entry_id, camera_id, ts)
+        key = (entry_id, camera_id, ts, width)
         if (hit := self._thumbs.get(key)) is not None:
             at, data = hit
             # A miss is only remembered briefly: the recording may just not
@@ -350,24 +363,27 @@ class VodManager:
             elif not task.done():
                 task.cancel()
 
-    async def _make_thumbnail(self, key: tuple[str, int, int]) -> bytes | None:
+    async def _make_thumbnail(self, key: tuple[str, int, int, int]) -> bytes | None:
         me = asyncio.current_task()
-        entry_id, camera_id, ts = key
+        entry_id, camera_id, ts, width = key
+        disk = self.disk if width == THUMBNAIL_WIDTH else self.disk_large
         try:
             # Made before (even before a restart): no need for the NAS.
-            if (jpg := await self.disk.get(key)) is None:
+            if (jpg := await disk.get(key[:3])) is None:
                 client = self.client(entry_id)
                 if client is None:
                     raise SSError("thumbnail", "fetch", None, "Surveillance Station entry is not loaded")
                 async with self._thumb_sem:
                     try:
-                        jpg = await fetch_snapshot(client, camera_id, ts, get_ffmpeg_manager(self.hass).binary)
+                        jpg = await fetch_snapshot(
+                            client, camera_id, ts, get_ffmpeg_manager(self.hass).binary, width
+                        )
                     except SSError as err:
                         self.track(entry_id, err)
                         raise
                 self.track(entry_id, None)
                 if jpg:  # "nothing recorded" is only remembered in memory, briefly
-                    self.disk.put(key, jpg)
+                    disk.put(key[:3], jpg)
         finally:
             if self._thumb_tasks.get(key) is me:
                 del self._thumb_tasks[key]
@@ -379,7 +395,7 @@ class VodManager:
             self._drop_thumbnail(next(iter(self._thumbs)))
         return data or None
 
-    def _drop_thumbnail(self, key: tuple[str, int, int]) -> None:
+    def _drop_thumbnail(self, key: tuple[str, int, int, int]) -> None:
         if (old := self._thumbs.pop(key, None)) is not None:
             self._thumbs_bytes -= len(old[1]) + THUMBNAIL_ENTRY_BYTES
 
@@ -718,6 +734,7 @@ class ThumbnailView(HomeAssistantView):
     requires_auth = False
     url = THUMBNAIL_URL + r"/{entry_id}/{camera_id:\d+}/{ts:\d+}.jpg"
     name = "api:surveillance_station:thumbnail"
+    width = THUMBNAIL_WIDTH
 
     def __init__(self, manager: VodManager) -> None:
         self.manager = manager
@@ -726,7 +743,7 @@ class ThumbnailView(HomeAssistantView):
         if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
             raise web.HTTPNotFound()
         try:
-            jpg = await self.manager.thumbnail(entry_id, int(camera_id), int(ts))
+            jpg = await self.manager.thumbnail(entry_id, int(camera_id), int(ts), self.width)
         except SSConnectionError:
             raise web.HTTPBadGateway() from None
         except SSError as err:
@@ -739,3 +756,11 @@ class ThumbnailView(HomeAssistantView):
         return web.Response(
             body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=172800, immutable"}
         )
+
+
+class LargeImageView(ThumbnailView):
+    """The same frame, LARGE_IMAGE_WIDTH wide: the image in a notification."""
+
+    url = THUMBNAIL_URL + r"/{entry_id}/{camera_id:\d+}/{ts:\d+}-large.jpg"
+    name = "api:surveillance_station:image"
+    width = LARGE_IMAGE_WIDTH

@@ -63,12 +63,14 @@
           "frigate": "Bookmark Frigate detections",
           "frigate_topic": "Frigate MQTT topic prefix",
           "frigate_objects": "Objects to bookmark",
-          "frigate_link": "Dashboard path of the timeline card"
+          "frigate_link": "Dashboard path of the timeline card",
+          "frigate_quiet_minutes": "Quiet period (minutes)"
         },
         "data_description": {
           "frigate_topic": "Frigate's mqtt.topic_prefix; reviews are read from <prefix>/reviews.",
           "frigate_link": "For example /ss-playback/playback. The event then carries a link that opens the card at the detection.",
-          "frigate_objects": "Frigate labels. A review with any of them is bookmarked, alert or detection. Animals (dog, cat, bird, …) are all named Animal."
+          "frigate_objects": "Frigate labels. A review with any of them is bookmarked, alert or detection. Animals (dog, cat, bird, …) are all named Animal.",
+          "frigate_quiet_minutes": "No surveillance_station_detection event for a camera's review when that camera saw the same kinds (Person, Car, Animal) within this many minutes; it is still bookmarked. 0: every review."
         }
       }
     },

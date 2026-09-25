@@ -35,6 +35,11 @@ THUMBNAIL_URL = "/api/surveillance_station/thumbnail"
 THUMBNAIL_CACHE_BYTES = 16 * 1024 * 1024
 # ...and on disk (under HA's cache directory), so they outlive a restart.
 THUMBNAIL_DISK_BYTES = 64 * 1024 * 1024
+# Widths: the event list's thumbnails, and the larger image for notifications
+# (from the 4K main stream: Frigate's own snapshots are its 640x360 detect stream).
+THUMBNAIL_WIDTH = 320
+LARGE_IMAGE_WIDTH = 1280
+LARGE_IMAGE_DISK_BYTES = 128 * 1024 * 1024
 # What a cached thumbnail costs besides its bytes, so misses (b"") count too.
 THUMBNAIL_ENTRY_BYTES = 256
 # "Nothing recorded then" is re-checked after this long.
@@ -80,6 +85,10 @@ FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyon
 # A review bookmarked later than this after it began (SS was unreachable, HA
 # restarted mid-review) fires no event: a notification would be old news.
 FRIGATE_ANNOUNCE_MAX_AGE = 120
+CONF_FRIGATE_QUIET = "frigate_quiet_minutes"
+# A camera's review with only kinds ("Person", "Animal") it has seen within
+# this many minutes fires no event: the dog that wandered off and came back.
+DEFAULT_FRIGATE_QUIET_MINUTES = 5
 # Bookmarks whose thumbnail is another moment than their start (the frame a
 # detector picked, where the object shows best), remembered across restarts.
 BOOKMARK_FRAMES_MAX = 20_000

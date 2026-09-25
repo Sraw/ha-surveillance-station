@@ -24,15 +24,23 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResu
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectSelector,
+    SelectSelectorConfig,
+)
 
 from .const import (
     CONF_FRIGATE,
     CONF_FRIGATE_OBJECTS,
+    CONF_FRIGATE_QUIET,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_QUIET_MINUTES,
     DEFAULT_FRIGATE_TOPIC,
     DEFAULT_PORT,
     DOMAIN,
@@ -63,6 +71,9 @@ OPTIONS_SCHEMA = vol.Schema(
             )
         ),
         vol.Optional(CONF_FRIGATE_LINK): str,
+        vol.Required(CONF_FRIGATE_QUIET, default=DEFAULT_FRIGATE_QUIET_MINUTES): NumberSelector(
+            NumberSelectorConfig(min=0, max=240, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
+        ),
     }
 )
 
@@ -179,7 +190,13 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
                 errors[CONF_FRIGATE_LINK] = "invalid_link"
             else:
                 return self.async_create_entry(
-                    data={**user_input, CONF_FRIGATE_TOPIC: topic, CONF_FRIGATE_OBJECTS: objects, CONF_FRIGATE_LINK: link}
+                    data={
+                        **user_input,
+                        CONF_FRIGATE_TOPIC: topic,
+                        CONF_FRIGATE_OBJECTS: objects,
+                        CONF_FRIGATE_LINK: link,
+                        CONF_FRIGATE_QUIET: int(user_input[CONF_FRIGATE_QUIET]),
+                    }
                 )
         return self.async_show_form(
             step_id="init",

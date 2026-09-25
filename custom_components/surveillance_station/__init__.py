@@ -30,10 +30,12 @@ from .const import (
     CARD_FILENAME,
     CONF_FRIGATE,
     CONF_FRIGATE_OBJECTS,
+    CONF_FRIGATE_QUIET,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
+    DEFAULT_FRIGATE_QUIET_MINUTES,
     DEFAULT_FRIGATE_TOPIC,
     DOMAIN,
     STATIC_URL,
@@ -41,6 +43,7 @@ from .const import (
 from .frigate import DATA_FRIGATE, FrigateBridge
 from .views import (
     DATA_MANAGER,
+    LargeImageView,
     LiveStreamView,
     ThumbnailView,
     VodInitView,
@@ -67,7 +70,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     manager = VodManager(hass)
     await manager.async_load()
     hass.data[DATA_MANAGER] = manager
-    for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LiveStreamView):
+    for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LargeImageView, LiveStreamView):
         hass.http.register_view(view(manager))
     websocket.async_register(hass)
     await hass.http.async_register_static_paths(
@@ -153,6 +156,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             options.get(CONF_FRIGATE_TOPIC) or DEFAULT_FRIGATE_TOPIC,
             set(options.get(CONF_FRIGATE_OBJECTS) or DEFAULT_FRIGATE_OBJECTS),
             options.get(CONF_FRIGATE_LINK) or "",
+            options.get(CONF_FRIGATE_QUIET, DEFAULT_FRIGATE_QUIET_MINUTES),
         )
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.
@@ -173,6 +177,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConf
     """Delete the entry's stored thumbnails; take the card's Lovelace resource away with the last entry."""
     if (manager := hass.data.get(DATA_MANAGER)) is not None:
         await manager.disk.drop_entry(entry.entry_id)
+        await manager.disk_large.drop_entry(entry.entry_id)
     if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
         return
     if (resources := _storage_resources(hass)) is None:

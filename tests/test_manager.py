@@ -400,3 +400,29 @@ async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integ
     ):
         assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
     assert 3 <= mock_client.recordings.await_count <= 8
+
+
+async def test_large_image(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_client_no_auth, thumbnail_dir: Path
+) -> None:
+    """A notification's image: the same moment, 1280 wide, its own URL (signed apart) and cache."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    small, large = manager.sign_thumbnail(entry_id, 6, T0), manager.sign_thumbnail(entry_id, 6, T0, large=True)
+    assert large.split("?")[0].endswith(f"/6/{T0}-large.jpg")
+    widths = []
+
+    async def snap(client, camera_id, ts, ffmpeg, width):
+        widths.append(width)
+        return b"L" if width == 1280 else b"s"
+
+    http = await hass_client_no_auth()
+    with patch.object(views, "fetch_snapshot", snap):
+        assert await (await http.get(large)).read() == b"L"
+        assert await (await http.get(small)).read() == b"s"
+        # The small URL's signature doesn't open the large image.
+        forged = large.split("?")[0] + "?" + small.split("?")[1]
+        assert (await http.get(forged)).status == 404
+    assert widths == [1280, 320]
+    await manager.disk_large.settle()
+    assert manager.stats()["disk_images"] == 1 and manager.stats()["disk_thumbnails"] == 1
