@@ -150,8 +150,9 @@ async def test_vod_window_in_the_future_is_rejected(
 ) -> None:
     ws = await hass_ws_client(hass)
     future = T0 + 10_000_000  # long after "now" (mocked recordings ignore it anyway)
-    await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": future, "end": future + 60})
-    msg = await ws.receive_json()
+    with patch("custom_components.surveillance_station.websocket.time.time", return_value=T0):
+        await ws.send_json_auto_id({"type": "surveillance_station/vod", "camera_id": 6, "start": future, "end": future + 60})
+        msg = await ws.receive_json()
     assert not msg["success"]
     assert msg["error"]["code"] == "invalid_format"
 
