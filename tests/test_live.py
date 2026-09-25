@@ -31,6 +31,8 @@ class FakeUpstream:
         data = await self.queue.get()
         if data is None:
             raise StopAsyncIteration
+        if isinstance(data, aiohttp.WSMessage):
+            return data  # a caller queued a specific message type (e.g. CLOSE)
         return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, data, None)
 
     async def send_str(self, s: str) -> None:
