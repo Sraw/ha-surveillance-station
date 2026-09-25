@@ -15,7 +15,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.2.3";
+const CARD_VERSION = "0.2.5";
 const HLS_URL = new URL("./vendor/hls.light.min.mjs", import.meta.url).href;
 
 const SPANS = [
@@ -83,10 +83,27 @@ const STYLE = `
   .wrap:fullscreen video { max-height: none; height: 100%; }
   .clock { position: absolute; top: 8px; left: 8px; padding: 2px 8px; border-radius: 6px;
     background: rgba(0,0,0,.55); color: #fff; font-variant-numeric: tabular-nums; font-size: 15px; pointer-events: none; }
-  .status { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); padding: 4px 10px;
-    border-radius: 6px; background: rgba(0,0,0,.65); color: #fff; font-size: 13px; pointer-events: none; }
-  .status:empty { display: none; }
-  .status.err { background: rgba(160,20,20,.85); }
+  /* Loading / error veil: the current frame (or a still of the last one)
+     blurred behind a spinner or icon, a line of text and a sub-line. */
+  .still { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000;
+    opacity: 0; transition: opacity .2s; pointer-events: none; }
+  .still.show { opacity: 1; }
+  .veil { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 10px; padding: 16px; text-align: center; color: #fff;
+    background: rgba(0,0,0,.3); backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    opacity: 1; visibility: visible; transition: opacity .25s, visibility 0s; }
+  .veil.off { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s, visibility 0s .25s; }
+  .spin { width: 44px; height: 44px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25);
+    border-top-color: #fff; animation: ss-spin .9s linear infinite; }
+  @keyframes ss-spin { to { transform: rotate(360deg); } }
+  .veil ha-icon { --mdc-icon-size: 42px; opacity: .9; }
+  .veil.error ha-icon { color: #ff8a80; }
+  .vtext { font-size: 16px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,.6); max-width: 90%; }
+  .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+  .vsub:empty { display: none; }
+  .veil button { color: #fff; background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.45); }
+  .veil:not(.loading) .spin, .veil.loading ha-icon, .veil:not(.error) button { display: none; }
+  .clock { z-index: 2; }
   .warn { padding: 6px 12px; font-size: 13px; color: var(--warning-color, #b58100); }
   .warn:empty { display: none; }
   .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 12px; }
@@ -189,12 +206,15 @@ class SSTimelineCard extends HTMLElement {
     try {
       res = await this._ws({ type: "surveillance_station/cameras" });
     } catch (e) {
-      this._setStatus(`Can't list cameras: ${errText(e)}`, true);
+      this._setStatus("Can't list cameras", "error", errText(e), () => {
+        this._inited = false;
+        this._init();
+      });
       return;
     }
     this._cameras = res.cameras.filter((c) => c.enabled);
     if (!this._cameras.length) {
-      this._setStatus("No enabled cameras in Surveillance Station", true);
+      this._setStatus("No enabled cameras in Surveillance Station", "empty");
       return;
     }
     const params = new URLSearchParams(location.search);
@@ -225,8 +245,15 @@ class SSTimelineCard extends HTMLElement {
         </div>
         <div class="wrap">
           <video muted playsinline preload="auto"></video>
+          <canvas class="still"></canvas>
+          <div class="veil off">
+            <div class="spin"></div>
+            <ha-icon></ha-icon>
+            <div class="vtext"></div>
+            <div class="vsub"></div>
+            <button data-act="retry">Retry</button>
+          </div>
           <div class="clock"></div>
-          <div class="status"></div>
         </div>
         <div class="warn"></div>
         <div class="controls">
@@ -271,7 +298,8 @@ class SSTimelineCard extends HTMLElement {
     this._video = $("video");
     this._wrap = $(".wrap");
     this._clock = $(".clock");
-    this._status = $(".status");
+    this._veil = $(".veil");
+    this._still = $(".still");
     this._track = $(".track");
     this._bars = $(".bars");
     this._ph = $(".ph");
@@ -300,11 +328,28 @@ class SSTimelineCard extends HTMLElement {
       this._mediaReady = true;
       this._onTime();
     });
-    v.addEventListener("waiting", () => this._setStatus("Buffering…"));
+    // Short stalls shouldn't flash the veil.
+    v.addEventListener("waiting", () => {
+      clearTimeout(this._bufTimer);
+      this._bufTimer = setTimeout(() => {
+        // Don't replace a veil that says more ("Loading", an error).
+        if (!this._veilKind && (!v.paused || v.seeking)) {
+          this._setStatus("Buffering", "loading", this._subline(this._currentWall()));
+        }
+      }, 400);
+    });
+    const ready = () => {
+      clearTimeout(this._bufTimer);
+      if (this._veilKind === "loading") this._setStatus("");
+      this._still.classList.remove("show");
+    };
     v.addEventListener("playing", () => {
       this._expiredRetry = false;
-      this._setStatus("");
+      ready();
     });
+    // Paused: a frame is on screen once it can play / the seek landed.
+    v.addEventListener("canplay", () => v.paused && ready());
+    v.addEventListener("seeked", () => v.paused && ready());
     v.addEventListener("play", () => this._playIcon.setAttribute("icon", "mdi:pause"));
     v.addEventListener("pause", () => this._playIcon.setAttribute("icon", "mdi:play"));
     v.addEventListener("ended", () => this._continue());
@@ -390,6 +435,9 @@ class SSTimelineCard extends HTMLElement {
         this._seek(t, true);
         break;
       }
+      case "retry":
+        (this._retry ?? (() => this._loadWindow(this._target, true)))();
+        break;
       case "mute":
         this._video.muted = !this._video.muted;
         break;
@@ -508,7 +556,8 @@ class SSTimelineCard extends HTMLElement {
     t = Math.min(t, now - LIVE_LAG);
     this._target = t;
     this._paint(t);
-    this._setStatus("Loading…");
+    this._freeze();
+    this._setStatus("Loading", "loading", this._subline(t));
     let res;
     try {
       res = await this._ws({
@@ -518,14 +567,14 @@ class SSTimelineCard extends HTMLElement {
         end: Math.min(t + WINDOW_AHEAD, now),
       });
     } catch (e) {
-      if (seq === this._playSeq) this._setStatus(`Playback failed: ${errText(e)}`, true);
+      if (seq === this._playSeq) this._setStatus("Playback failed", "error", errText(e));
       return;
     }
     if (seq !== this._playSeq) return;
     const stop = (text) => {
       this._destroyPlayer();
       this._session = null;
-      this._setStatus(text, true);
+      this._setStatus(text, "empty", this._subline(t));
     };
     if (!res.url) return stop("No recording at this time");
     if (after != null && res.end <= after + 1) return stop("No later recording");
@@ -554,7 +603,7 @@ class SSTimelineCard extends HTMLElement {
           { once: true }
         );
       } else {
-        this._setStatus("This browser can't play HLS video", true);
+        this._setStatus("This browser can't play HLS video", "error");
       }
       return;
     }
@@ -569,7 +618,6 @@ class SSTimelineCard extends HTMLElement {
     let recovered = false;
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (autoplay) v.play().catch(() => {});
-      else this._setStatus("");
     });
     // A live playlist grows on every reload, and may gain a gap; refresh the
     // wall-clock mapping with it.
@@ -603,8 +651,9 @@ class SSTimelineCard extends HTMLElement {
       }
       const codec = /codec/i.test(d.details) || d.details === "manifestIncompatibleCodecsError";
       this._setStatus(
-        codec ? "This browser can't decode H.265 (HEVC) video" : `Playback error: ${d.details}`,
-        true
+        codec ? "This browser can't decode H.265 (HEVC) video" : "Playback error",
+        "error",
+        codec ? "" : d.details
       );
     });
     hls.loadSource(res.url);
@@ -619,7 +668,7 @@ class SSTimelineCard extends HTMLElement {
     if (!s) return;
     const seq = this._playSeq;
     const next = s.end;
-    this._setStatus("Looking for the next recording…");
+    this._setStatus("Finding the next recording", "loading", this._subline(next));
     let recs;
     try {
       recs = (
@@ -631,14 +680,14 @@ class SSTimelineCard extends HTMLElement {
         })
       ).recordings;
     } catch (e) {
-      if (seq === this._playSeq) this._setStatus(`Playback failed: ${errText(e)}`, true);
+      if (seq === this._playSeq) this._setStatus("Playback failed", "error", errText(e));
       return;
     }
     // A seek inside the window while we were asking also cancels this.
     if (seq !== this._playSeq || !this._video.ended) return;
     const rec = recs.find((r) => (r.live ? nowS() : r.end) > next + 1);
     if (!rec) {
-      this._setStatus("No later recording", true);
+      this._setStatus("No later recording", "empty", this._subline(next));
       return;
     }
     this._loadWindow(Math.max(rec.start, next), true, next);
@@ -666,7 +715,8 @@ class SSTimelineCard extends HTMLElement {
       this._recs = r.recordings;
       this._bookmarks = b.bookmarks;
     } catch (e) {
-      if (seq === this._tlSeq) this._setStatus(`Timeline failed: ${errText(e)}`, true);
+      // Keep the video usable; say it where the timeline is.
+      if (seq === this._tlSeq) this._rangeEl.textContent = `Timeline failed: ${errText(e)}`;
       return;
     }
     this._drawTimeline();
@@ -778,11 +828,49 @@ class SSTimelineCard extends HTMLElement {
     if (this._view.end > nowS() - this._span) this._loadTimeline();
   }
 
-  _setStatus(text, error = false) {
-    if (!this._status) return;
-    this._status.textContent = text;
-    this._status.classList.toggle("err", !!error);
+  /**
+   * Veil over the video. kind: "loading" (spinner), "empty" (nothing to show
+   * here) or "error" (with Retry; `retry` overrides what it does). Empty text
+   * hides it.
+   */
+  _setStatus(text, kind = "loading", sub = "", retry = null) {
+    if (!this._veil) return;
+    if (kind !== "loading" || !text) clearTimeout(this._bufTimer);
+    this._veilKind = text ? kind : null;
+    this._retry = retry;
+    this._veil.classList.toggle("off", !text);
+    if (!text) return;
+    this._veil.classList.remove("loading", "empty", "error");
+    this._veil.classList.add(kind);
+    this._veil.querySelector("ha-icon").setAttribute(
+      "icon",
+      kind === "error" ? "mdi:alert-circle-outline" : "mdi:video-off-outline"
+    );
+    this._veil.querySelector(".vtext").textContent = kind === "loading" ? `${text}…` : text;
+    this._veil.querySelector(".vsub").textContent = sub;
   }
+
+  _subline(t) {
+    const cam = this._cameras.find((c) => c.id === this._cameraId);
+    return `${cam ? cam.name + " · " : ""}${fmtDate(t)} ${fmtTime(t)}`;
+  }
+
+  /** Keep the last frame on screen (it gets blurred) while the source changes. */
+  _freeze() {
+    const v = this._video;
+    if (!v || v.readyState < 2 || !v.videoWidth) return;
+    const c = this._still;
+    const w = Math.min(640, v.videoWidth); // it's blurred anyway
+    c.width = w;
+    c.height = Math.round((w * v.videoHeight) / v.videoWidth);
+    try {
+      c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+      c.classList.add("show");
+    } catch (e) {
+      /* no still, just the dark veil */
+    }
+  }
+
 }
 
 // Loaded through add_extra_js_url, this module races HA's own app bundle,
