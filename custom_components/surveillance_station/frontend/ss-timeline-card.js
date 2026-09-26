@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.15.0";
+const CARD_VERSION = "0.15.1";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -272,9 +272,14 @@ const STYLE = `
   @container (min-width: 1000px) {
     .layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; }
     .layout.noside { grid-template-columns: minmax(0, 1fr); }
-    /* The list is as tall as the main column and scrolls inside it. */
-    .side { height: 0; min-height: 100%; border-left: 1px solid var(--divider-color); border-top: none; }
-    .ev-list { max-height: none; }
+    /* Not stretched to a taller list: _fit measures what the column holds. */
+    .main { align-self: start; }
+    /* The list is as tall as the main column, or down to the bottom of the
+       screen where that is lower (--room, see _fit), and scrolls inside it. */
+    /* (.layout: these must outrank the narrow layout's rules further down,
+       which a container query alone doesn't; it capped the list at 60vh.) */
+    .layout .side { height: 0; min-height: max(100%, var(--room, 0px)); border-left: 1px solid var(--divider-color); border-top: none; }
+    .layout .ev-list { max-height: none; }
   }
   .layout.noside .side { display: none; }
 
@@ -3489,6 +3494,10 @@ class SSTimelineCard extends HTMLElement {
     // on the page (below HA's toolbar), capped for cards further down.
     const chrome = this._main.offsetHeight - st.offsetHeight;
     const top = Math.min(Math.max(this.getBoundingClientRect().top + window.scrollY, 0), 200);
+    // Room below the card's top: the event list beside a short main column
+    // (a screen taller than the 16:9 video needs) reaches down to it.
+    const room = `${Math.max(window.innerHeight - top - 8, 0)}px`;
+    if (this.style.getPropertyValue("--room") !== room) this.style.setProperty("--room", room);
     const avail = Math.max(window.innerHeight - top - chrome - 8, MIN_STAGE_HEIGHT);
     const cellH = (avail - gap * (rows - 1)) / rows;
     const fitW = (cellH * 16) / 9 * cols + gap * (cols - 1);
