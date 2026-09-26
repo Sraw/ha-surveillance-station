@@ -50,12 +50,15 @@ async def search(
     query: str | None = None,
     bookmark_id: int | None = None,
     camera_ids: list[int] | None = None,
+    kinds: list[str] | None = None,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """Results, best first. ValueError: nothing to search by; FrigateAPIError: Frigate's."""
+    """Results, best first: bookmarks (of these kinds, if any given). ValueError: nothing
+    to search by; FrigateAPIError: Frigate's."""
+    wanted = {k.strip().casefold() for k in kinds or [] if k.strip()}
     try:
         async with asyncio.timeout(SEARCH_TIMEOUT_SECONDS):
-            return await _search(manager, entry_id, bridge, query, bookmark_id, camera_ids, limit)
+            return await _search(manager, entry_id, bridge, query, bookmark_id, camera_ids, wanted, limit)
     except TimeoutError:
         raise FrigateAPIError("search: no answer in time (Frigate or Surveillance Station)") from None
 
@@ -67,6 +70,7 @@ async def _search(
     query: str | None,
     bookmark_id: int | None,
     camera_ids: list[int] | None,
+    wanted: set[str],
     limit: int,
 ) -> list[dict[str, Any]]:
     api = bridge.api
@@ -117,9 +121,15 @@ async def _search(
         if bm is None or (source is not None and bm.id == source.id):
             continue  # not an event (no bookmark), or the bookmark searched from
         key = f"b{bm.id}"
-        if key in seen_keys:
+        if key in seen_keys or (wanted and not wanted & {k.casefold() for k in name_kinds(bm.name)}):
             continue
         seen_keys.add(key)
+        # The bookmark's stretch of the object (a car parked since the morning, in a
+        # bookmark of the afternoon): the result plays the event, not the morning.
+        if start < bm.start - _SLACK:
+            start = bm.start
+        if end is None or end > bm.end + _SLACK:
+            end = bm.end
         results.append(
             {
                 "key": key,
@@ -128,7 +138,7 @@ async def _search(
                 "label": label,
                 "kind": kind,
                 "start": int(start),
-                "end": int(end) + 1 if end is not None else None,
+                "end": math.ceil(end) if end is not None else None,
                 "bookmark_id": bm.id,
                 "name": bm.name,
                 "comment": bm.comment,
@@ -166,7 +176,13 @@ async def _source_object(bridge: FrigateBridge, source: Bookmark) -> dict[str, A
         params["cameras"] = ",".join(names)
     near = await api.json("/api/events", params)
     seen = [o for o in near if isinstance(o, dict)] if isinstance(near, list) else []
-    return bridge.foremost([o for o in seen if await _placed(bridge, o) == source.camera_id and _overlaps(o, source)])
+    # Of the bookmark's kinds: a parked car is no source for "similar" to an Animal bookmark.
+    its = {k.casefold() for k in name_kinds(source.name)}
+    return bridge.foremost([
+        o for o in seen
+        if await _placed(bridge, o) == source.camera_id and _overlaps(o, source)
+        and {k.casefold() for k in kinds([str(o.get("label") or "")])} & its
+    ])
 
 
 def _bookmark_of(obj: dict[str, Any], camera_id: int, kind: str, bookmarks: list[Bookmark]) -> Bookmark | None:

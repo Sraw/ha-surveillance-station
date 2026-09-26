@@ -134,7 +134,7 @@ bookmarks are the event source.
   above the list asks Frigate's semantic search, in words ("white car",
   "person with a box"; English, Frigate's CLIP model), or "similar to" a
   bookmark (the button on a Frigate bookmark's row: by the foremost object
-  seen in it, image to image). Frigate finds; SS plays: each result is
+  seen in it of the bookmark's kinds, image to image). Frigate finds; SS plays: each result is
   placed on the SS camera its Frigate camera maps to, at its start time, and
   only one on a Frigate bookmark of its kind on that camera then (the one it
   began in, else the one it overlaps most) is a result: that bookmark,
@@ -143,8 +143,10 @@ bookmarks are the event source.
   by camera and time, not by Frigate's review ids: Frigate deletes reviews
   with its own recordings (days), but keeps tracked objects as long as their
   snapshots. Results come best first, each with Frigate's crop of the
-  object, and the kind chips filter them too (a bookmarked one by its name).
-  Tapping one plays SS's recording from 3 s before it. Frigate ranks the best 100 of all cameras before filtering by
+  object, and the kind chips filter them too (by the bookmark's name, before
+  the first 30 are taken). Tapping one plays SS's recording from 3 s before
+  the object appears in its bookmark (one there since before the bookmark
+  plays from the bookmark's start). Frigate ranks the best 100 of all cameras before filtering by
   camera, so with a few cameras shown there may be fewer results.
   Needs `semantic_search.enabled` in Frigate; on a machine whose iGPU also
   decodes and detects, keep it on the CPU (`model_size: small`): with
@@ -254,9 +256,9 @@ How it works:
   when the phone fetches it (needs `snapshots.enabled` in Frigate). The
   object is in it by construction, and the event goes out 3 s after the
   bookmark (time for a better frame than the review's first). If Frigate
-  has no snapshot of it, the same URL gives SS's frame instead; if Frigate
-  doesn't answer within 5 s, SS's frame too, and Frigate isn't asked again
-  for a minute. Without a Frigate URL: SS's frame of
+  has no snapshot of it, the next object's; of none, the same URL gives
+  SS's frame instead; if Frigate doesn't answer within 5 s (or fails), SS's
+  frame too, and Frigate isn't asked again for a minute. Without a Frigate URL: SS's frame of
   the moment Frigate picked (`thumb_time`) from the 4K main stream, 1280 px
   wide; the event waits for SS to have recorded it (SS lists recordings
   0-10 s behind; at most 20 s). That frame is also the bookmark's thumbnail
@@ -347,8 +349,15 @@ broker down, NAS unreachable at runtime and during HA's start):
 - Diagnostics show the bridge: subscribed, Frigate online, and every review
   message's fate (ignored and why, coalesced, dropped, retried, failed,
   bookmarked, announced or not), plus the last error; with a Frigate URL,
-  how the notification images went (`images_frigate`, `images_ss`, of those
-  `images_no_snapshot`) and `last_image_error`.
+  how the notification images went: `images_frigate` (Frigate's snapshot),
+  `images_ss` (SS's frame instead), `images_failed` (neither: the phone got
+  no image), `images_no_snapshot` (Frigate had none for that review),
+  `last_image_error` (Frigate's) and `last_ss_image_error` (SS's frame
+  failing too). A review or object Frigate no longer has (404), or a
+  snapshot that isn't an image, falls to the next object (3 at most) or
+  SS's frame; anything else (unreachable, too slow, refused: a wrong URL
+  or port, failing) pauses asking Frigate for a minute and shows in
+  `last_image_error`.
 - The card retries a stream it gave up on every minute while on screen, so
   a wall display comes back after the NAS reboots.
 

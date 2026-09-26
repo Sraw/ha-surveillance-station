@@ -33,7 +33,8 @@ def _message(body: bytes) -> str:
 
 
 class FrigateAPIError(Exception):
-    """Frigate didn't answer, or not as expected (text: path and status only)."""
+    """Frigate didn't answer, or not as expected (text: path and status only; status 200: an answer
+    that isn't what was asked for)."""
 
     def __init__(self, text: str, status: int | None = None) -> None:
         super().__init__(text)
@@ -50,7 +51,7 @@ class FrigateAPI:
         try:
             return json.loads(body)
         except ValueError:
-            raise FrigateAPIError(f"{path}: not JSON") from None
+            raise FrigateAPIError(f"{path}: not JSON", 200) from None
 
     async def image(self, path: str, params: dict[str, Any] | None = None) -> tuple[bytes, str]:
         """A JPEG or WebP, and its type: by its bytes, not by what the answer claims."""
@@ -59,7 +60,7 @@ class FrigateAPI:
             return body, "image/jpeg"
         if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
             return body, "image/webp"
-        raise FrigateAPIError(f"{path}: not a JPEG or WebP")
+        raise FrigateAPIError(f"{path}: not a JPEG or WebP", 200)
 
     async def _get(self, path: str, params: dict[str, Any] | None) -> tuple[bytes, str]:
         try:

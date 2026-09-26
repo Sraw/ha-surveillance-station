@@ -206,7 +206,7 @@ async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConn
         vol.Optional("limit", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=BOOKMARK_PAGE_MAX)),
         # Only bookmarks of these kinds ("Person", "Car": the parts of a name
         # like "Person, Car", ignoring case). Omitted or empty: all.
-        vol.Optional("kinds"): [str],
+        vol.Optional("kinds"): vol.All([vol.All(str, vol.Length(max=64))], vol.Length(max=16)),
     }
 )
 @websocket_api.async_response
@@ -266,6 +266,8 @@ def _kind_counts(bookmarks: list[Bookmark]) -> list[list[Any]]:
         vol.Exclusive("query", "by"): vol.All(str, vol.Length(min=1, max=200)),
         vol.Exclusive("bookmark_id", "by"): vol.Coerce(int),
         vol.Optional("camera_ids"): [vol.Coerce(int)],
+        # Only bookmarks of these kinds (as bookmark_page's kinds).
+        vol.Optional("kinds"): vol.All([vol.All(str, vol.Length(max=64))], vol.Length(max=16)),
         vol.Optional("limit", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=FRIGATE_SEARCH_MAX)),
     }
 )
@@ -281,7 +283,7 @@ async def ws_search(hass: HomeAssistant, connection: websocket_api.ActiveConnect
         results = await search(
             _manager(hass), entry_id, bridge,
             query=msg.get("query"), bookmark_id=msg.get("bookmark_id"),
-            camera_ids=msg.get("camera_ids"), limit=msg["limit"],
+            camera_ids=msg.get("camera_ids"), kinds=msg.get("kinds"), limit=msg["limit"],
         )
         return {"results": results}
 

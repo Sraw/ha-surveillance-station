@@ -123,6 +123,7 @@ async def test_similar_to_a_bookmark(hass: HomeAssistant, bridge: FrigateBridge,
     aioclient_mock.get(f"{F}/api/config", json=CONFIG)
     aioclient_mock.get(f"{F}/api/events", json=[
         obj("o0", label="bicycle"), obj("o9", camera="backyard", label="person"), obj("o1", label="car"),
+        obj("o5", label="person"),  # foremost of all, but not the Car bookmark's kind
         obj("o2", label="car", start=T0 + 300, end=T0 + 310),  # on the camera, not in the bookmark's time
     ])
     aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o7", start=T0 + 905, end=T0 + 915, label="person")])
@@ -145,7 +146,13 @@ async def test_which_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_w
     ])
     with patch.object(search_mod.time, "time", return_value=T0 + 950):
         msg = await ask(hass, hass_ws_client, query="car")
-    assert [(r["key"], r["name"]) for r in msg["result"]["results"]] == [("b21", "Car"), ("b22", "Person")]
+        # The bookmark's stretch of each: tapping plays the event, not the morning the car arrived.
+        assert [(r["key"], r["name"], r["start"], r["end"]) for r in msg["result"]["results"]] == [
+            ("b21", "Car", T0 + 100, T0 + 111), ("b22", "Person", T0 + 900, T0 + 920),
+        ]
+        # Kinds chosen: before the limit, by the bookmark's name.
+        msg = await ask(hass, hass_ws_client, query="car", kinds=[" PERSON ", ""], limit=1)
+        assert [r["key"] for r in msg["result"]["results"]] == ["b22"]
 
 
 async def test_empty_answer_asked_again(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:

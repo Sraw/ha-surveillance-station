@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.4";
+const CARD_VERSION = "0.14.5";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -73,6 +73,8 @@ const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
 const BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 const THUMB_RETRY_MS = 30_000;
 const EVENT_PAGE = 30; // events per page of the list; more load as it scrolls
+// A Frigate bookmark's comment names its review, as the integration writes (and reads) it.
+const FRIGATE_REF = /\[frigate [A-Za-z0-9][A-Za-z0-9._-]{0,63}\]/;
 // The list (and its thumbnail links, valid 24-48 h) is reloaded after this long.
 const EVENT_LIST_MAX_AGE_MS = 12 * 3600 * 1000;
 const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
@@ -2838,7 +2840,7 @@ class SSTimelineCard extends HTMLElement {
       prefs.set("kinds", [...this._kinds]);
       this._drawKinds();
       this._drawTimeline();
-      this._resetEvents(); // the bookmarks, of these kinds (drawn: a search shown, filtered anew)
+      this._resetEvents(); // the bookmarks, of these kinds (and a search shown, asked anew)
       return;
     }
     if (b.dataset.similar) {
@@ -3068,7 +3070,11 @@ class SSTimelineCard extends HTMLElement {
   _resetEvents() {
     // A search follows the cameras shown (not a reconnect or a periodic start-over).
     const s = this._search;
-    if (s && s.cams !== this._shown.join()) this._runSearch(s.params, s.label);
+    if (s && (s.cams !== this._shown.join() || s.kinds !== this._kindsKey())) {
+      // Asked once the chips settle: each search is a CLIP run on Frigate, one at a time.
+      clearTimeout(this._srTimer);
+      this._srTimer = setTimeout(() => this._search === s && this._runSearch(s.params, s.label), 300);
+    } else clearTimeout(this._srTimer); // a chip turned back: as asked
     this._evSeq++;
     this._evItems = [];
     this._evMore = true;
@@ -3234,7 +3240,7 @@ class SSTimelineCard extends HTMLElement {
     const s = this._search;
     // "Similar" is offered on Frigate's bookmarks when its search can be asked.
     const similar = (id, comment) =>
-      this._searchable && id != null && /\[frigate [^\]]+\]/.test(comment ?? "")
+      this._searchable && id != null && FRIGATE_REF.test(comment ?? "")
         ? `<button class="icon sim" data-similar="${id}" title="Find similar">${`<ha-icon icon="mdi:image-search-outline"></ha-icon>`}</button>`
         : "";
     for (const e of s ? this._searchShown() : this._evItems) {
@@ -3299,6 +3305,10 @@ class SSTimelineCard extends HTMLElement {
     return this._kinds.size ? { kinds: [...this._kinds] } : {};
   }
 
+  _kindsKey() {
+    return [...this._kinds].map((k) => k.toLowerCase()).sort().join();
+  }
+
   /** Whether a bookmark (by its name, "Person, Car") or a result (its kind) is of a kind chosen. */
   _kindOk(name) {
     if (!this._kinds.size) return true;
@@ -3354,7 +3364,9 @@ class SSTimelineCard extends HTMLElement {
   /** Ask Frigate (through the integration): {query} or {bookmark_id} (similar to it). */
   async _runSearch(params, label) {
     const seq = ++this._srSeq;
-    this._search = { params, label, items: [], loading: true, error: null, cams: this._shown.join() };
+    this._search = {
+      params, label, items: [], loading: true, error: null, cams: this._shown.join(), kinds: this._kindsKey(),
+    };
     this._searchHead.hidden = false;
     this._syncTools();
     this._searchHead.querySelector(".t").textContent = label;
@@ -3363,7 +3375,9 @@ class SSTimelineCard extends HTMLElement {
     this._drawEvents();
     let res;
     try {
-      res = await this._ws({ type: "surveillance_station/search", ...params, camera_ids: this._shown, limit: 30 });
+      res = await this._ws({
+        type: "surveillance_station/search", ...params, camera_ids: this._shown, ...this._kindsParam(), limit: 30,
+      });
     } catch (e) {
       if (seq !== this._srSeq) return;
       this._search.loading = false;
@@ -3378,6 +3392,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _endSearch() {
+    clearTimeout(this._srTimer);
     this._srSeq++;
     if (!this._search) return;
     this._search = null;
@@ -3391,13 +3406,14 @@ class SSTimelineCard extends HTMLElement {
   /** Highlight the events the playhead is in (on the cameras shown). */
   _markActiveEvent(t) {
     if (!this._evItemsEl) return;
-    const ids = (this._evItems ?? [])
-      .filter((e) => this._shown.includes(e.camera_id) && t >= e.start - 3 && t <= Math.max(e.end, e.start + 10))
-      .map((e) => String(e.id));
-    const key = ids.join();
+    const s = this._search;
+    const ids = (s ? this._searchShown() : this._evItems ?? [])
+      .filter((e) => this._shown.includes(e.camera_id) && t >= e.start - 3 && t <= Math.max(e.end ?? t, e.start + 10))
+      .map((e) => String(s ? e.key : e.id));
+    const key = `${s ? "s" : "e"}:${ids.join()}`;
     if (key === this._activeEvent) return;
     this._activeEvent = key;
-    for (const b of this._evItemsEl.querySelectorAll(".ev")) b.classList.toggle("on", ids.includes(b.dataset.ev));
+    for (const b of this._evItemsEl.querySelectorAll(".ev")) b.classList.toggle("on", ids.includes(b.dataset.sr ?? b.dataset.ev));
   }
 
   /** Play an event: its camera becomes the master, from a little before it. */

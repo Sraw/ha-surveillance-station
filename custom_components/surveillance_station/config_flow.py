@@ -266,7 +266,8 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
 
 
 def _frigate_url(text: str) -> str | None:
-    """"" (not set), the URL without a trailing slash, or None if it isn't an http(s) URL."""
+    """"" (not set), the URL without a trailing slash, or None if it isn't an http(s) URL
+    (nor one with a login in it: that would sit in the options as plain text)."""
     text = text.strip().rstrip("/")
     if not text:
         return ""
@@ -276,7 +277,7 @@ def _frigate_url(text: str) -> str | None:
         return None
     if (
         url.scheme not in ("http", "https") or not url.host or any(c.isspace() for c in text)
-        or url.query_string or url.fragment
+        or url.query_string or url.fragment or "@" in text.partition("://")[2].partition("/")[0]
     ):
         return None
     return text

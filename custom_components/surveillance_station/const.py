@@ -99,6 +99,8 @@ FRIGATE_EVENT_WAIT_SECONDS = 20
 # review's first moment (the object just coming into view, a cat taken for a
 # person before the person arrives) is rarely it.
 FRIGATE_SNAPSHOT_SETTLE_SECONDS = 3
+# Objects whose snapshot a notification image tries, foremost first.
+FRIGATE_SNAPSHOT_TRIES = 3
 # Frigate's API answers a request within this.
 FRIGATE_API_TIMEOUT = 10
 # A notification's image: Frigate's snapshot within this (all its requests

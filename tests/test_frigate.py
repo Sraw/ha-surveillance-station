@@ -279,6 +279,8 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://"}, CONF_FRIGATE_URL, "invalid_url"),
         ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://f:5000/?a=1"}, CONF_FRIGATE_URL, "invalid_url"),
         ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://[::1"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://u:p@f:5000"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://@f:5000"}, CONF_FRIGATE_URL, "invalid_url"),
     ):
         result = await hass.config_entries.options.async_configure(flow["flow_id"], {**base, **bad})
         assert result["errors"] == {field: error}

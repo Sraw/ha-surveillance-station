@@ -45,7 +45,11 @@ await page.screenshot({ path: "search-results.png" });
 
 // A chip chosen during a search: after closing it, the list is of that kind.
 await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-kinds button")].find((b) => b.dataset.kind === "Person").click());
-await sleep(2500);
+await sleep(500);
+for (let i = 0; i < 20 && (await ev((c) => c._search?.loading)); i++) await sleep(500);
+const byKind = await ev((c) => ({ kinds: c._search.kinds, names: c._search.items.map((r) => r.name) }));
+console.log("white car, Person chosen:", JSON.stringify(byKind).slice(0, 200));
+check(byKind.kinds === "person" && byKind.names.every((n) => n.split(", ").includes("Person")), "a chip chosen during a search asks it again, of that kind");
 await ev((c) => c.shadowRoot.querySelector('[data-act="search-close"]').click());
 await sleep(1500);
 const persons = await rows();
@@ -62,6 +66,8 @@ await sleep(5000);
 const at = await ev((c) => ({ cam: c._master.cameraId, wall: c._master.wall() }));
 console.log("played:", at.cam, "at", (at.wall - first.start).toFixed(1), "s from the result's start");
 check(at.cam === first.camera_id && Math.abs(at.wall - first.start) < 8, "result plays its camera near its time");
+const lit = await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items .ev.on")].map((b) => b.dataset.sr));
+check(lit.includes(first.key), "the result playing is highlighted");
 
 // Back, then "similar" on a bookmark.
 await ev((c) => c.shadowRoot.querySelector('[data-act="search-close"]').click());
