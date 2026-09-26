@@ -215,15 +215,29 @@ How it works:
 - Each new bookmark fires **`surveillance_station_detection`** once, with
   `camera`, `camera_id`, `objects` (as named: `["Person", "Animal"]`),
   `labels` (Frigate's: `["person", "dog"]`), `zones`, `severity`, `start`,
-  `review_id`, `bookmark_id`, `image` (a signed frame of the moment from SS's
-  main stream, 1280 px wide: Frigate's own snapshots come from its 640x360
-  detect stream), `thumbnail` (the same, 320 px) and `url` (the card at that
-  moment, if a dashboard path is set). It waits
-  for SS to have recorded the moment (SS lists recordings 0-10 s behind; at
-  most 20 s), so the frame is there when a phone fetches it. The frame is
-  the one Frigate picked as showing the object best (`thumb_time`), and it
-  is also the bookmark's thumbnail in the card (kept up to date as Frigate
-  picks a better one); the link still starts at the review's beginning.
+  `review_id`, `bookmark_id`, `image` (signed, see below), `thumbnail` (SS's
+  frame, 320 px) and `url` (the card at that moment, if a dashboard path is
+  set).
+- **The image**, with the options' **Frigate URL** set (Frigate's API as HA
+  reaches it, e.g. `http://frigate:5000`, the internal port): Frigate's
+  snapshot of the review's foremost object (a person before a car before an
+  animal, then the surest), box drawn, at its detect resolution, as it is
+  when the phone fetches it. The object is in it by construction, and the
+  event goes out 3 s after the bookmark (time for a better frame than the
+  review's first). If Frigate doesn't answer, or has no snapshot of it, the
+  same URL gives SS's frame instead. Without a Frigate URL: SS's frame of
+  the moment Frigate picked (`thumb_time`) from the 4K main stream, 1280 px
+  wide; the event waits for SS to have recorded it (SS lists recordings
+  0-10 s behind; at most 20 s). That frame is also the bookmark's thumbnail
+  in the card (kept up to date as Frigate picks a better one); the link
+  still starts at the review's beginning.
+- **Frigate's times are its detect stream's**: whatever that stream lags
+  behind the camera is how late every review, bookmark and SS frame is. On
+  Reolink cameras the RTSP sub stream measured a multiple of its I-frame
+  interval behind (8-11 s at 4 s, under 1 s at 1 s): **set the sub stream's
+  I-frame interval to 1 s** too. To measure, draw the host's clock on a
+  pulled frame (`ffmpeg ... -vf "drawtext=text='%{localtime}'"`) and compare
+  it with the camera's on-screen time.
 - **Quiet period** (options: 5 min, for animals by default; cars can be
   added; **people never**): no event for a review whose kinds are all quiet
   ones seen on the same camera within it, the dog that wandered off and came
@@ -519,9 +533,9 @@ entities; there is no per-user camera permission.
   cameras with the same name.
 - The card's text is English; its times follow the HA profile's 12/24 h
   setting. Grid cells are 16:9.
-- A notification's image link stays valid for one to two days. With SS
-  recording on motion, a recording starting more than ~8 s after Frigate's
-  frame leaves the notification without an image.
+- A notification's image link stays valid for one to two days. Without a
+  Frigate URL, and with SS recording on motion, a recording starting more
+  than ~8 s after Frigate's frame leaves the notification without an image.
 - Sound is the camera's own codec, played if the browser can (AAC: all;
   Opus / MP3: most; G.711 / G.726, many cameras' default: none, in MSE); the
   Sound button says when it can't. HLS playback (browsers without MSE)

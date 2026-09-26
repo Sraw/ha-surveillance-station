@@ -37,6 +37,7 @@ from .const import (
     CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
+    CONF_FRIGATE_URL,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
     DEFAULT_FRIGATE_QUIET_KINDS,
@@ -45,7 +46,8 @@ from .const import (
     DOMAIN,
     STATIC_URL,
 )
-from .frigate import DATA_FRIGATE, FrigateBridge, store_key as frigate_store_key
+from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, store_key as frigate_store_key
+from .frigate_api import FrigateAPI
 from .views import (
     DATA_MANAGER,
     LargeImageView,
@@ -77,6 +79,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.data[DATA_MANAGER] = manager
     for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LargeImageView, LiveStreamView):
         hass.http.register_view(view(manager))
+    hass.http.register_view(FrigateImageView(hass, manager))
     websocket.async_register(hass)
     await hass.http.async_register_static_paths(
         [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), False)]
@@ -190,6 +193,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             options.get(CONF_FRIGATE_QUIET, DEFAULT_FRIGATE_QUIET_MINUTES),
             set(options.get(CONF_FRIGATE_QUIET_KINDS, DEFAULT_FRIGATE_QUIET_KINDS)),
             options.get(CONF_FRIGATE_CAMERAS) or {},
+            FrigateAPI(async_get_clientsession(hass), url) if (url := options.get(CONF_FRIGATE_URL)) else None,
         )
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.

@@ -66,12 +66,14 @@
           "frigate_topic": "Frigate MQTT topic prefix",
           "frigate_objects": "Objects to bookmark",
           "frigate_link": "Dashboard path of the timeline card",
+          "frigate_url": "Frigate URL (optional)",
           "frigate_quiet_minutes": "Quiet period (minutes)",
           "frigate_quiet_kinds": "Quiet period applies to"
         },
         "data_description": {
           "frigate_topic": "Frigate's mqtt.topic_prefix; reviews are read from this prefix's /reviews topic.",
           "frigate_link": "For example /ss-playback/playback. The event then carries a link that opens the card at the detection.",
+          "frigate_url": "Frigate's API as Home Assistant reaches it, such as http://frigate:5000 (the internal port, no login). With it, a notification's image is Frigate's snapshot of the object, box drawn, and it is sent a few seconds sooner; without it, the Surveillance Station frame of that moment.",
           "frigate_objects": "Frigate labels. A review with any of them is bookmarked, alert or detection. Animals (dog, cat, bird, …) are all named Animal.",
           "frigate_quiet_minutes": "No surveillance_station_detection event for a camera's review when it has only kinds chosen below, all seen on that camera within this many minutes (the dog that wandered off and came back); it is still bookmarked. 0: every review.",
           "frigate_quiet_kinds": "People are never quiet: a second person arriving is always announced."
@@ -86,7 +88,8 @@
       "invalid_topic": "Enter a topic prefix without wildcards.",
       "invalid_link": "Enter a path starting with /, such as /ss-playback/playback.",
       "no_objects": "Choose at least one object.",
-      "duplicate_camera": "A Frigate camera can go to one Surveillance Station camera only."
+      "duplicate_camera": "A Frigate camera can go to one Surveillance Station camera only.",
+      "invalid_url": "Enter an http:// or https:// URL, such as http://frigate:5000."
     }
   },
   "issues": {

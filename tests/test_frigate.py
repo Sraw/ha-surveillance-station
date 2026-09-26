@@ -27,6 +27,7 @@ from custom_components.surveillance_station.const import (
     CONF_FRIGATE_QUIET,
     CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_TOPIC,
+    CONF_FRIGATE_URL,
     DETECTION_EVENT,
     DOMAIN,
 )
@@ -273,11 +274,17 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         ({CONF_FRIGATE_TOPIC: "frigate/#"}, CONF_FRIGATE_TOPIC, "invalid_topic"),
         ({CONF_FRIGATE_TOPIC: " / "}, CONF_FRIGATE_TOPIC, "invalid_topic"),
         ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_LINK: "ss-playback"}, CONF_FRIGATE_LINK, "invalid_link"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "frigate:5000"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "ftp://frigate"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://f:5000/?a=1"}, CONF_FRIGATE_URL, "invalid_url"),
+        ({CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_URL: "http://[::1"}, CONF_FRIGATE_URL, "invalid_url"),
     ):
         result = await hass.config_entries.options.async_configure(flow["flow_id"], {**base, **bad})
         assert result["errors"] == {field: error}
     result = await hass.config_entries.options.async_configure(
-        flow["flow_id"], {**base, CONF_FRIGATE_TOPIC: " frigate/ ", CONF_FRIGATE_LINK: " /ss-playback/playback "}
+        flow["flow_id"],
+        {**base, CONF_FRIGATE_TOPIC: " frigate/ ", CONF_FRIGATE_LINK: " /ss-playback/playback ", CONF_FRIGATE_URL: " http://frigate:5000/ "},
     )
     # Then SS's cameras (as SS lists them, sorted), for names that don't match Frigate's.
     assert result["step_id"] == "cameras"
@@ -297,11 +304,13 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         CONF_FRIGATE_OBJECTS: ["dog", "person"],
         CONF_FRIGATE_TOPIC: "frigate",
         CONF_FRIGATE_LINK: "/ss-playback/playback",
+        CONF_FRIGATE_URL: "http://frigate:5000",
         CONF_FRIGATE_QUIET: 5,
         CONF_FRIGATE_QUIET_KINDS: ["Animal"],
         CONF_FRIGATE_CAMERAS: {"Backyard": "back_yard, garden"},
     }
     start.assert_awaited_once()  # reloaded with the bridge on
+    assert hass.data[DATA_FRIGATE][setup_integration.entry_id].api.url == "http://frigate:5000"
     assert hass.data[DATA_FRIGATE][setup_integration.entry_id]._aliases == {"backyard": "Backyard", "garden": "Backyard"}
 
 

@@ -66,12 +66,14 @@
           "frigate_topic": "Frigate MQTT 主题前缀",
           "frigate_objects": "要创建书签的对象",
           "frigate_link": "时间轴卡片所在的仪表盘路径",
+          "frigate_url": "Frigate 地址（可选）",
           "frigate_quiet_minutes": "静默期（分钟）",
           "frigate_quiet_kinds": "静默期适用于"
         },
         "data_description": {
           "frigate_topic": "即 Frigate 的 mqtt.topic_prefix；review 从该前缀的 /reviews 主题读取。",
           "frigate_link": "例如 /ss-playback/playback。事件会带上一个链接，打开卡片并定位到检测时刻。",
+          "frigate_url": "Home Assistant 访问 Frigate API 的地址，例如 http://frigate:5000（内部端口，无需登录）。填了之后，通知图用 Frigate 对该物体的快照（画出检测框），推送也会早几秒；不填则用 Surveillance Station 在那一刻的画面。",
           "frigate_objects": "Frigate 标签。review 含其中任意一个就创建书签，alert 和 detection 都算。动物（dog、cat、bird……）统一命名为 Animal。",
           "frigate_quiet_minutes": "某摄像头的 review 如果只含下面所选的类别，且这些类别在该摄像头上这么多分钟内都出现过（走开又回来的狗），就不触发 surveillance_station_detection 事件；书签照常创建。0：每个 review 都触发。",
           "frigate_quiet_kinds": "人永远不静默：又来了一个人，总是会通知。"
@@ -86,7 +88,8 @@
       "invalid_topic": "请输入不含通配符的主题前缀。",
       "invalid_link": "请输入以 / 开头的路径，例如 /ss-playback/playback。",
       "no_objects": "至少选择一个对象。",
-      "duplicate_camera": "一个 Frigate 摄像头只能对应一个 Surveillance Station 摄像头。"
+      "duplicate_camera": "一个 Frigate 摄像头只能对应一个 Surveillance Station 摄像头。",
+      "invalid_url": "请输入 http:// 或 https:// 开头的地址，例如 http://frigate:5000。"
     }
   },
   "issues": {

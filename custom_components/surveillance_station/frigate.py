@@ -13,11 +13,16 @@ punctuation (``drive_way`` is "Drive Way"), or as the options map them.
 A review is announced as a ``surveillance_station_detection`` event once it
 has its bookmark (once per review, remembered across restarts; and not when the review has only kinds that may be quiet,
 animals by default, never people, all seen on that camera within the quiet
-period) for automations to notify with, carrying a signed frame of
-the moment Frigate saw the object best and, if configured, a link to the card
-at the review's start. The bookmark's thumbnail in the card is that frame too. The event waits for
-SS to have recorded that moment (it lists recordings ~0-10 s behind), at most
-EVENT_WAIT_SECONDS, so the frame is there when a phone fetches it.
+period) for automations to notify with, carrying a signed image and, if
+configured, a link to the card at the review's start. With Frigate's API
+configured, the image is Frigate's snapshot of the review's foremost object
+(box drawn) as it is when fetched: the object is in it whatever the delay
+between the cameras' streams, and the event waits only
+SNAPSHOT_SETTLE_SECONDS for a better frame than the review's first. Without
+it (or when Frigate doesn't answer), the image is SS's frame of the moment
+Frigate saw the object best, and the event waits for SS to have recorded that
+moment (it lists recordings ~0-10 s behind), at most EVENT_WAIT_SECONDS. The
+bookmark's thumbnail in the card is always SS's frame.
 
 The review id is kept in the bookmark's comment, so a review that ends after
 a Home Assistant restart still finds its bookmark.
@@ -45,9 +50,11 @@ import re
 import time
 from typing import Any
 
+from aiohttp import web
 from synology_ss_playback import Camera, SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
+from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -66,6 +73,7 @@ from .const import (
     FRIGATE_DECIDED_MAX,
     FRIGATE_DEFERRED_MAX_AGE,
     FRIGATE_EVENT_WAIT_SECONDS,
+    FRIGATE_IMAGE_URL,
     FRIGATE_HEALTH_INTERVAL,
     FRIGATE_ISSUE_AFTER_SECONDS,
     FRIGATE_MQTT_RETRY_SECONDS,
@@ -74,9 +82,11 @@ from .const import (
     FRIGATE_RETRY_SECONDS,
     FRIGATE_OPEN_BOOKMARK_SECONDS,
     FRIGATE_QUIET_KINDS,
+    FRIGATE_SNAPSHOT_SETTLE_SECONDS,
     FRIGATE_TRACKED_MAX,
     LARGE_IMAGE_WIDTH,
 )
+from .frigate_api import FRIGATE_ID, FrigateAPI, FrigateAPIError
 from .views import VodManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -140,8 +150,10 @@ class FrigateBridge:
         quiet_minutes: float = 0,
         quiet_kinds: set[str] | None = None,
         cameras: dict[str, str] | None = None,
+        api: FrigateAPI | None = None,
     ) -> None:
         self.hass = hass
+        self.api = api
         self.entry_id = entry_id
         self.client = client
         self.manager = manager
@@ -216,6 +228,7 @@ class FrigateBridge:
         self._counts = {
             "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
             "announced": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
+            "images_frigate": 0, "images_ss": 0,
         }
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
@@ -239,6 +252,7 @@ class FrigateBridge:
             "objects": sorted(self.objects, key=_rank),
             "quiet_minutes": self.quiet / 60,
             "quiet_kinds": sorted(self.quiet_kinds),
+            "frigate_api": self.api is not None,
             **self._counts,
             "ignored": dict(self._ignored),
             "queued": len(self._pending) + len(self._replay),
@@ -792,7 +806,7 @@ class FrigateBridge:
             "labels": list(dict.fromkeys(objects)),
             "zones": zones,
             "start": start,
-            "image": self.manager.sign_thumbnail(self.entry_id, camera_id, frame, large=True),
+            "image": self._image_url(review_id, camera_id, frame),
             "thumbnail": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
             "url": self._url(camera_id, start),
         }
@@ -800,7 +814,10 @@ class FrigateBridge:
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
             try:
-                await wait_for_frame()
+                if self._frigate_image(review_id):
+                    await asyncio.sleep(FRIGATE_SNAPSHOT_SETTLE_SECONDS)
+                else:
+                    await wait_for_frame()
             finally:
                 self._announcing_ids.discard(review_id)
             self.hass.bus.async_fire(DETECTION_EVENT, payload)
@@ -830,6 +847,45 @@ class FrigateBridge:
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")
         self._announcing.add(task)
         task.add_done_callback(self._announcing.discard)
+
+    def _frigate_image(self, review_id: str) -> bool:
+        return self.api is not None and FRIGATE_ID.fullmatch(review_id) is not None
+
+    def _image_url(self, review_id: str, camera_id: int, frame: int) -> str:
+        if self._frigate_image(review_id):
+            # SS's frame (camera, moment) is in the path: the fallback.
+            return self.manager.sign_path(f"{FRIGATE_IMAGE_URL}/{self.entry_id}/{camera_id}/{frame}/{review_id}.jpg")
+        return self.manager.sign_thumbnail(self.entry_id, camera_id, frame, large=True)
+
+    async def review_image(self, review_id: str) -> tuple[bytes, str] | None:
+        """Frigate's snapshot (box drawn) of the review's foremost chosen object.
+
+        Foremost: a person before a car before an animal, then the surest.
+        None: no such object with a snapshot (any more). FrigateAPIError: no
+        answer from Frigate.
+        """
+        if self.api is None:
+            return None
+        review = await self.api.json(f"/api/review/{review_id}")
+        data = review.get("data") if isinstance(review, dict) else None
+        ids = [i for i in _strings((data or {}).get("detections")) if FRIGATE_ID.fullmatch(i)]
+        found = await asyncio.gather(*(self.api.json(f"/api/events/{i}") for i in ids[:16]), return_exceptions=True)
+        if ids and all(isinstance(f, BaseException) for f in found):
+            raise FrigateAPIError(f"/api/events: {found[0]}")
+        events = [
+            e for e in found
+            if isinstance(e, dict) and e.get("label") in self.objects and e.get("has_snapshot")
+            and FRIGATE_ID.fullmatch(str(e.get("id")))
+        ]
+        if not events:
+            return None
+        best = min(events, key=lambda e: (_rank(str(e["label"])), -_score(e)))
+        return await self.api.image(f"/api/events/{best['id']}/snapshot.jpg", {"bbox": 1, "quality": 90})
+
+    def count_image(self, frigate: bool, err: FrigateAPIError | None = None) -> None:
+        self._counts["images_frigate" if frigate else "images_ss"] += 1
+        if err is not None:
+            self._error(err)
 
     def _url(self, camera_id: int, start: int) -> str | None:
         if not self.link:
@@ -915,6 +971,62 @@ def store_key(entry_id: str) -> str:
 
 def _strings(value: Any) -> list[str]:
     return [str(v) for v in value] if isinstance(value, list) else []
+
+
+def _score(event: dict[str, Any]) -> float:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    try:
+        return float(data.get("top_score") or event.get("top_score") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class FrigateImageView(HomeAssistantView):
+    """A detection's notification image: Frigate's snapshot, else SS's frame.
+
+    Signed like the thumbnails (see ThumbnailView): a phone fetches it with no
+    credentials, and a bad signature is a 404, never a 401. Fetched when the
+    notification arrives, so Frigate's snapshot is its best frame by then.
+    """
+
+    requires_auth = False
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9._-]{1,64}}.jpg"
+    name = "api:surveillance_station:frigate_image"
+
+    def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
+        self.hass = hass
+        self.manager = manager
+
+    async def get(
+        self, request: web.Request, entry_id: str, camera_id: str, frame: str, review_id: str
+    ) -> web.Response:
+        if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
+            raise web.HTTPNotFound()
+        bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
+        if bridge is not None:
+            failed: FrigateAPIError | None = None
+            try:
+                found = await bridge.review_image(review_id)
+            except FrigateAPIError as err:
+                _LOGGER.debug("Frigate snapshot for %s: %s", review_id, err)
+                found, failed = None, err
+            if found is not None:
+                bridge.count_image(True)
+                body, content_type = found
+                # It may get better while the review goes on; a phone fetches it once.
+                return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=60"})
+            bridge.count_image(False, failed)
+        # No Frigate (unloaded, unreachable) or no snapshot: SS's frame of the moment.
+        try:
+            jpg = await self.manager.thumbnail_when_recorded(
+                entry_id, int(camera_id), int(frame), FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
+            )
+        except SSError as err:
+            _LOGGER.debug("Frame %s@%s failed: %s", camera_id, frame, err)
+            raise web.HTTPBadGateway() from None
+        if jpg is None:
+            raise web.HTTPNotFound()
+        return web.Response(body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=60"})
 
 
 # Set on a queued message that replaced its review's "new": it was seen new.

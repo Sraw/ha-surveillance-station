@@ -79,6 +79,7 @@ CONF_FRIGATE = "frigate"
 CONF_FRIGATE_TOPIC = "frigate_topic"
 CONF_FRIGATE_OBJECTS = "frigate_objects"  # Frigate labels bookmarked, whatever the review's severity
 CONF_FRIGATE_LINK = "frigate_link"  # dashboard path of the card, for the event's url
+CONF_FRIGATE_URL = "frigate_url"  # Frigate's HTTP API, for its snapshots as notification images
 # {SS camera name: Frigate camera name(s), comma-separated}, for names that don't match.
 CONF_FRIGATE_CAMERAS = "frigate_cameras"
 DEFAULT_FRIGATE_TOPIC = "frigate"
@@ -93,6 +94,14 @@ DETECTION_EVENT = f"{DOMAIN}_detection"
 FRIGATE_OPEN_BOOKMARK_SECONDS = 30
 # The event waits at most this long for SS to have recorded the moment (its frame).
 FRIGATE_EVENT_WAIT_SECONDS = 20
+# With Frigate's snapshot as the image (its API configured), the event waits
+# this long instead: Frigate keeps each object's best frame so far, and the
+# review's first moment (the object just coming into view, a cat taken for a
+# person before the person arrives) is rarely it.
+FRIGATE_SNAPSHOT_SETTLE_SECONDS = 3
+# Frigate's API answers within this, or the image falls back to SS's frame.
+FRIGATE_API_TIMEOUT = 10
+FRIGATE_IMAGE_URL = "/api/surveillance_station/frigate_image"
 FRIGATE_TRACKED_MAX = 256  # reviews in progress remembered
 FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyond
 # A review bookmarked later than this after it began (SS was unreachable, HA

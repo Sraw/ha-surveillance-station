@@ -333,8 +333,11 @@ class VodManager:
         across list refreshes and HA restarts. large: LARGE_IMAGE_WIDTH wide
         (for a notification) rather than THUMBNAIL_WIDTH.
         """
+        return self.sign_path(f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}{'-large' if large else ''}.jpg")
+
+    def sign_path(self, path: str) -> str:
+        """Any image URL of ours, signed as sign_thumbnail's are (checked by check_thumbnail)."""
         exp = (int(time.time()) // 86400 + 1) * 86400 + THUMBNAIL_URL_TTL_HOURS * 3600
-        path = f"{THUMBNAIL_URL}/{entry_id}/{camera_id}/{ts}{'-large' if large else ''}.jpg"
         return f"{path}?exp={exp}&sig={self._thumbnail_sig(path, exp)}"
 
     def check_thumbnail(self, path: str, exp: str | None, sig: str | None) -> bool:

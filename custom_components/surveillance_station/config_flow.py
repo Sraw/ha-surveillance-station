@@ -20,6 +20,7 @@ from synology_ss_playback import (
     SurveillanceStationClient,
 )
 import voluptuous as vol
+from yarl import URL
 
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
@@ -41,6 +42,7 @@ from .const import (
     CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
+    CONF_FRIGATE_URL,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
     DEFAULT_FRIGATE_QUIET_KINDS,
@@ -77,6 +79,7 @@ OPTIONS_SCHEMA = vol.Schema(
             )
         ),
         vol.Optional(CONF_FRIGATE_LINK): str,
+        vol.Optional(CONF_FRIGATE_URL): str,
         vol.Required(CONF_FRIGATE_QUIET, default=DEFAULT_FRIGATE_QUIET_MINUTES): NumberSelector(
             NumberSelectorConfig(min=0, max=240, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
         ),
@@ -199,6 +202,7 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
         if user_input is not None:
             topic = user_input[CONF_FRIGATE_TOPIC].strip().strip("/")
             link = (user_input.get(CONF_FRIGATE_LINK) or "").strip()
+            url = _frigate_url(user_input.get(CONF_FRIGATE_URL) or "")
             objects = sorted({o.strip().lower() for o in user_input[CONF_FRIGATE_OBJECTS] if o.strip()})
             if not topic or any(c in topic for c in "#+"):
                 errors[CONF_FRIGATE_TOPIC] = "invalid_topic"
@@ -206,12 +210,15 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
                 errors[CONF_FRIGATE_OBJECTS] = "no_objects"
             elif link and (not link.startswith("/") or link.startswith("//") or "\\" in link):
                 errors[CONF_FRIGATE_LINK] = "invalid_link"
+            elif url is None:
+                errors[CONF_FRIGATE_URL] = "invalid_url"
             else:
                 self._options = {
                     **user_input,
                     CONF_FRIGATE_TOPIC: topic,
                     CONF_FRIGATE_OBJECTS: objects,
                     CONF_FRIGATE_LINK: link,
+                    CONF_FRIGATE_URL: url,
                     CONF_FRIGATE_QUIET: int(user_input[CONF_FRIGATE_QUIET]),
                     CONF_FRIGATE_CAMERAS: self.config_entry.options.get(CONF_FRIGATE_CAMERAS) or {},
                 }
@@ -256,6 +263,20 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
             ),
             errors=errors,
         )
+
+
+def _frigate_url(text: str) -> str | None:
+    """"" (not set), the URL without a trailing slash, or None if it isn't an http(s) URL."""
+    text = text.strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        url = URL(text)
+    except ValueError:
+        return None
+    if url.scheme not in ("http", "https") or not url.host or url.query_string or url.fragment:
+        return None
+    return text
 
 
 def _once(names: list[str]) -> list[str]:
