@@ -231,14 +231,20 @@ async def ws_bookmark_page(
         else:
             rest = matching
         page = rest[: msg["limit"]]
+        # Frigate's bookmarks: Frigate's snapshot, as the notification's image.
+        bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
+        manager = _manager(hass)
+
+        def thumbnail(b: Bookmark) -> str:
+            if bridge is not None:
+                return bridge.bookmark_thumbnail(b)
+            return manager.sign_thumbnail(entry_id, b.camera_id, manager.frame(entry_id, b))
+
         return {
             "total": len(matching),
             "more": len(rest) > len(page),
             "kinds": _kind_counts(shown),
-            "bookmarks": [
-                _bookmark(b, _manager(hass).sign_thumbnail(entry_id, b.camera_id, _manager(hass).frame(entry_id, b)))
-                for b in page
-            ],
+            "bookmarks": [_bookmark(b, thumbnail(b)) for b in page],
         }
 
     await _run(hass, connection, msg, go())

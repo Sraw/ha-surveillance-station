@@ -101,6 +101,10 @@ FRIGATE_EVENT_WAIT_SECONDS = 20
 FRIGATE_SNAPSHOT_SETTLE_SECONDS = 3
 # Objects whose snapshot a notification image tries, foremost first.
 FRIGATE_SNAPSHOT_TRIES = 3
+# A Frigate bookmark's thumbnail (event list, search results): its snapshot this tall.
+FRIGATE_THUMB_HEIGHT = 180
+# Thumbnails built from Frigate at once (an event list page asks for 30).
+FRIGATE_THUMB_PARALLEL = 4
 # Frigate's API answers a request within this.
 FRIGATE_API_TIMEOUT = 10
 # A notification's image: Frigate's snapshot within this (all its requests

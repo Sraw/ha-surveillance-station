@@ -18,7 +18,7 @@ bookmarks (with an event to notify from).
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics (including the Frigate bridge: subscribed?, review messages (several per review) and how each ended — ignored by reason, dropped, failed, or bookmarked then announced / not announced — queue, failing now, last error) |
 | `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
-| `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*) |
+| `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*); with a Frigate URL, the notification image and the Frigate bookmarks' thumbnails (Frigate's snapshots, `/api/surveillance_station/frigate_image/…`) |
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 
@@ -115,7 +115,12 @@ viewer's choice is remembered in the browser and wins over the options.
 The **Events** list is a collapsible sidebar on wide cards (≥ 1000 px) and
 sits under the timeline on narrow ones. It holds every SS bookmark of the
 cameras shown, newest first, grouped by day, each with a thumbnail of the
-moment. It loads 30 at a time as you scroll (cursor-paged, so events created
+moment (a Frigate bookmark's, with a Frigate URL set: Frigate's snapshot of
+its foremost object, box drawn, 180 px tall, as the notification's image;
+once Frigate has deleted the review, the snapshot of the object it still has
+from that camera, time and kind; with none, or Frigate not answering in 5 s,
+SS's frame, and Frigate isn't asked for thumbnails for a minute after it
+failed; 4 are made at a time). It loads 30 at a time as you scroll (cursor-paged, so events created
 meanwhile don't shift it). Once a minute it is brought up to date: new events
 are merged in by time (an event can be bookmarked after a later one), events
 deleted in SS go away, and after more than a page of new ones, or 12 h, it
@@ -143,7 +148,7 @@ bookmarks are the event source.
   found either. Matched by camera and time, not by Frigate's review ids:
   Frigate deletes reviews with its own recordings (days), but keeps tracked
   objects as long as their snapshots. Results come best first, each with its
-  bookmark's thumbnail (SS's frame, as in the event list), and the kind
+  bookmark's thumbnail (as in the event list), and the kind
   chips filter them too (by the bookmark's name, before the first 30 are
   taken). Tapping one plays SS's recording from 3 s before the object
   appears in its bookmark (one there since before the bookmark plays from
@@ -263,7 +268,8 @@ How it works:
   the moment Frigate picked (`thumb_time`) from the 4K main stream, 1280 px
   wide; the event waits for SS to have recorded it (SS lists recordings
   0-10 s behind; at most 20 s). That frame is also the bookmark's thumbnail
-  in the card (kept up to date as Frigate picks a better one); the link
+  in the card without a Frigate URL (kept up to date as Frigate picks a
+  better one); the link
   still starts at the review's beginning.
 - **Frigate's times are its detect stream's**: whatever that stream lags
   behind the camera is how late every review, bookmark and SS frame is. On
@@ -411,7 +417,7 @@ Every buffer has a cap, and the only thing kept on disk is thumbnails:
 | HA disk | event thumbnails, `<config>/.cache/surveillance_station/thumbnails/` (left out of HA backups) | 64 MB, least recently used removed first; kept across restarts, so a thumbnail is made from the recording once; an entry's are deleted with the entry |
 | HA disk | notification images (1280 px, from the 4K main stream), `<config>/.cache/surveillance_station/images/` | 128 MB, the same way |
 | HA memory | the bookmark list of each entry | re-read after 15 s; one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
-| Browser disk | thumbnails | `private, max-age=172800, immutable` (a thumbnail of a past moment never changes, and its URL stays the same all day and across HA restarts) |
+| Browser disk | thumbnails | `private, max-age=172800, immutable` (a thumbnail of a past moment never changes, and its URL stays the same all day and across HA restarts); a Frigate bookmark's snapshot `private, max-age=3600` (Frigate may pick a better one while the review goes on) |
 | Browser disk | segments | none: served `Cache-Control: no-store` (the URLs are per-session, so a cached copy would never be used again) |
 
 On the NAS, every segment download adds a line to the Surveillance Station
@@ -447,7 +453,7 @@ one (after every HA restart, or after a day) with 401, and counts every 401 as
 a failed login, so a wall tablet left open would get its IP banned under
 `login_attempts_threshold`.
 
-A notification's Frigate image is signed the same way, under
+A notification's (and a bookmark's) Frigate image is signed the same way, under
 `/api/surveillance_station/frigate_image/…`; HA fetches it from Frigate
 and passes on only a JPEG or WebP (checked by its bytes). Only ids
 shaped like Frigate's (`1790406867.462609-6jc58g`) go into Frigate's URLs.

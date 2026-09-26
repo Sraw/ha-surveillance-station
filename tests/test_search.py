@@ -76,9 +76,9 @@ async def test_words(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client,
         "start": T0 + 98, "end": T0 + 111, "bookmark_id": 21, "name": "Car",
         "comment": "Frigate alert in driveway [frigate r1]", "thumbnail": first["thumbnail"],
     }  # not the hand-made bookmark over the same time
-    # The bookmark's SS thumbnail (16:9, as the event list's), not Frigate's square crop.
-    manager = hass.data[DATA_MANAGER]
-    assert first["thumbnail"] == manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, bridge.client.list_bookmarks.return_value[2]))
+    # The bookmark's thumbnail, as the event list's (Frigate's snapshot), not Frigate's square crop.
+    assert first["thumbnail"] == bridge.bookmark_thumbnail(bridge.client.list_bookmarks.return_value[2])
+    assert first["thumbnail"].startswith(f"/api/surveillance_station/frigate_image/{bridge.entry_id}/thumb/6/")
     # Frigate asked for the cameras shown only (its names for them).
     assert query_of(aioclient_mock, "events/search") == {
         "query": "white car", "search_type": "thumbnail,description", "limit": "100", "cameras": "drive_way",
@@ -243,3 +243,13 @@ async def test_one_query_at_a_time(hass: HomeAssistant, bridge: FrigateBridge, h
             await ws.send_json_auto_id({"type": "surveillance_station/search", "query": q})
         answers = [await ws.receive_json() for _ in range(3)]
     assert all(a["success"] for a in answers) and peak == 1
+
+
+async def test_event_list_thumbnails(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client) -> None:
+    """The event list's thumbnails: Frigate's snapshot for its bookmarks, SS's frame for one by hand."""
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
+    listed = {b["id"]: b["thumbnail"] for b in (await ws.receive_json())["result"]["bookmarks"]}
+    marks = {b.id: b for b in bridge.client.list_bookmarks.return_value}
+    assert listed == {i: bridge.bookmark_thumbnail(b) for i, b in marks.items()}
+    assert "/frigate_image/" in listed[21] and "/api/surveillance_station/thumbnail/" in listed[20]

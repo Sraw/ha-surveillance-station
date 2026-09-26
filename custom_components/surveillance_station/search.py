@@ -24,19 +24,14 @@ from typing import Any
 from synology_ss_playback import Bookmark
 
 from .const import FRIGATE_SEARCH_ASK, FRIGATE_SEARCH_MAX
-from .frigate import FrigateBridge, kinds, name_kinds, review_id_of
+from .frigate import BOOKMARK_SLACK, FrigateBridge, event_time as _time, kinds, name_kinds, overlaps as _overlaps, review_id_of
 from .frigate_api import FRIGATE_ID, FrigateAPIError
 from .views import VodManager
 
 # The whole search (Frigate's answers and the SS camera list) within this.
 SEARCH_TIMEOUT_SECONDS = 15
-# An object is a bookmark's when their times overlap, give or take this
-# (a review, and so its bookmark, starts when an object qualifies, which is
-# after the object itself was first seen).
-_SLACK = 2
-# "Similar" by time looks back this far for the bookmark's objects: one can
-# have started long before its review (a car parked for hours, then moving).
-_LOOKBACK = 3600
+# An object is a bookmark's when their times overlap, give or take this.
+_SLACK = BOOKMARK_SLACK
 # Frigate (0.18) may answer a search that ran into another client's with
 # nothing: an empty answer is asked once more, this much later.
 _EMPTY_RETRY_SECONDS = 0.5
@@ -142,9 +137,9 @@ async def _search(
                 "bookmark_id": bm.id,
                 "name": bm.name,
                 "comment": bm.comment,
-                # The bookmark's own (SS's main stream, as the event list shows it): the camera's
-                # frame, sharp, where Frigate's crop of the object is a small square.
-                "thumbnail": manager.sign_thumbnail(entry_id, bm.camera_id, manager.frame(entry_id, bm)),
+                # The bookmark's own, as the event list shows it (Frigate's snapshot, box drawn),
+                # not Frigate's crop of the object (a small square).
+                "thumbnail": bridge.bookmark_thumbnail(bm),
             }
         )
         if len(results) >= min(limit, FRIGATE_SEARCH_MAX):
@@ -171,20 +166,8 @@ async def _source_object(bridge: FrigateBridge, source: Bookmark) -> dict[str, A
         found = await asyncio.gather(*(api.json(f"/api/events/{i}") for i in ids), return_exceptions=True)
         if (best := bridge.foremost([o for o in found if isinstance(o, dict)])) is not None:
             return best
-    params: dict[str, Any] = {
-        "after": source.start - _LOOKBACK, "before": source.end + _SLACK, "has_snapshot": 1, "limit": 100,
-    }
-    if names := await bridge.frigate_cameras([source.camera_id]):
-        params["cameras"] = ",".join(names)
-    near = await api.json("/api/events", params)
-    seen = [o for o in near if isinstance(o, dict)] if isinstance(near, list) else []
-    # Of the bookmark's kinds: a parked car is no source for "similar" to an Animal bookmark.
-    its = {k.casefold() for k in name_kinds(source.name)}
-    return bridge.foremost([
-        o for o in seen
-        if await _placed(bridge, o) == source.camera_id and _overlaps(o, source)
-        and {k.casefold() for k in kinds([str(o.get("label") or "")])} & its
-    ])
+    ranked = await bridge.bookmark_objects(source)
+    return ranked[0] if ranked else None
 
 
 def _bookmark_of(obj: dict[str, Any], camera_id: int, kind: str, bookmarks: list[Bookmark]) -> Bookmark | None:
@@ -212,21 +195,3 @@ async def _placed(bridge: FrigateBridge, obj: dict[str, Any]) -> int | None:
     camera = obj.get("camera")
     found = await bridge.ss_camera(camera) if isinstance(camera, str) and camera else None
     return found[0] if found else None
-
-
-def _overlaps(obj: dict[str, Any], bm: Bookmark) -> bool:
-    start = _time(obj.get("start_time"))
-    if start is None:
-        return False
-    end = _time(obj.get("end_time"))
-    if end is None:
-        end = time.time()  # still being tracked
-    return start <= bm.end + _SLACK and end >= bm.start - _SLACK
-
-
-def _time(value: Any) -> float | None:
-    try:
-        t = float(value)
-    except (TypeError, ValueError):
-        return None
-    return t if math.isfinite(t) and 0 < t < 2**32 else None

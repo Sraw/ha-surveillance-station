@@ -51,7 +51,7 @@ import time
 from typing import Any
 
 from aiohttp import web
-from synology_ss_playback import Camera, SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
+from synology_ss_playback import Bookmark, Camera, SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
 from homeassistant.components.http import HomeAssistantView
@@ -87,6 +87,8 @@ from .const import (
     FRIGATE_QUIET_KINDS,
     FRIGATE_SNAPSHOT_SETTLE_SECONDS,
     FRIGATE_SNAPSHOT_TRIES,
+    FRIGATE_THUMB_HEIGHT,
+    FRIGATE_THUMB_PARALLEL,
     FRIGATE_TRACKED_MAX,
     LARGE_IMAGE_WIDTH,
 )
@@ -248,6 +250,8 @@ class FrigateBridge:
         # last error (apart from the bookmarks' last_error).
         self._image_down_until = -math.inf
         self._image_error: tuple[float, str] | None = None
+        self.thumb_sem = asyncio.Semaphore(FRIGATE_THUMB_PARALLEL)
+        self._thumbs_down_until = -math.inf
         self._ss_image_error: tuple[float, str] | None = None  # SS's frame instead, failing too
         # Frigate's camera names (its config), for searching some cameras only.
         self._frigate_camera_names: list[str] = []
@@ -886,7 +890,7 @@ class FrigateBridge:
             return self.manager.sign_path(f"{FRIGATE_IMAGE_URL}/{self.entry_id}/{camera_id}/{frame}/{review_id}.jpg")
         return self.manager.sign_thumbnail(self.entry_id, camera_id, frame, large=True)
 
-    async def review_image(self, review_id: str) -> tuple[bytes, str] | None:
+    async def review_image(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
         """Frigate's snapshot (box drawn) of the review's foremost chosen object.
 
         Foremost: a person before a car before an animal, then the surest; the
@@ -914,21 +918,77 @@ class FrigateBridge:
             raise next((f for f in found if isinstance(f, FrigateAPIError)), FrigateAPIError("/api/events: no answer"))
         ranked = [e["id"] for e in self.ranked([e for e in found if isinstance(e, dict) and e.get("has_snapshot")])]
         # A few at most: the phone is waiting (and running out the budget counts as Frigate failing).
-        for i in [*ranked, *unwritten][:FRIGATE_SNAPSHOT_TRIES]:
+        return await self._snapshot([*ranked, *unwritten], height)
+
+    async def _snapshot(self, ids: list[str], height: int | None) -> tuple[bytes, str] | None:
+        """The first of these objects' snapshots (box drawn) Frigate has; a few tried at most."""
+        assert self.api is not None
+        params: dict[str, Any] = {"bbox": 1, "quality": 90} | ({"height": height} if height else {})
+        for i in ids[:FRIGATE_SNAPSHOT_TRIES]:
             try:
-                return await self.api.image(f"/api/events/{i}/snapshot.jpg", {"bbox": 1, "quality": 90})
+                return await self.api.image(f"/api/events/{i}/snapshot.jpg", params)
             except FrigateAPIError as err:
                 # That object's snapshot gone, or not an image (HTTP 200): the next one's.
                 if err.status not in (200, 404):
                     raise
         return None
 
+    async def bookmark_objects(self, bm: Bookmark) -> list[dict[str, Any]]:
+        """Frigate's objects (with a snapshot) in one of its bookmarks, by its camera and time and
+        of its kinds, foremost first: how to find them once the review is gone (Frigate keeps
+        reviews days, objects as long as their snapshots)."""
+        assert self.api is not None
+        params: dict[str, Any] = {
+            "after": bm.start - BOOKMARK_LOOKBACK, "before": bm.end + BOOKMARK_SLACK, "has_snapshot": 1, "limit": 100,
+        }
+        if names := await self.frigate_cameras([bm.camera_id]):
+            params["cameras"] = ",".join(names)
+        near = await self.api.json("/api/events", params)
+        # Of the bookmark's kinds: a parked car isn't what an Animal bookmark is of.
+        its = {k.casefold() for k in name_kinds(bm.name)}
+        mine = []
+        for o in near if isinstance(near, list) else []:
+            if not isinstance(o, dict) or not overlaps(o, bm):
+                continue
+            if not {k.casefold() for k in kinds([str(o.get("label") or "")])} & its:
+                continue
+            camera = o.get("camera")
+            if isinstance(camera, str) and (found := await self.ss_camera(camera)) and found[0] == bm.camera_id:
+                mine.append(o)
+        return self.ranked(mine)
+
+    async def bookmark_image(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
+        """A Frigate bookmark's image: its review's snapshot, else (the review gone) that of
+        the foremost object Frigate still has from the bookmark's camera and time."""
+        if (found := await self.review_image(review_id, height)) is not None:
+            return found
+        client = self.manager.client(self.entry_id)
+        if client is None:
+            return None
+        try:
+            marks = await self.manager.bookmarks(self.entry_id, client)
+        except SSError:
+            return None  # SS's trouble, not Frigate's: SS's frame (which may fail too)
+        bm = next((b for b in marks if review_id_of(b.comment) == review_id), None)
+        if bm is None:
+            return None
+        return await self._snapshot([o["id"] for o in await self.bookmark_objects(bm)], height)
+
+    def bookmark_thumbnail(self, bm: Bookmark) -> str:
+        """A bookmark's thumbnail URL (signed): Frigate's snapshot for one of its own, as the
+        notification's image; SS's frame for any other (or with no Frigate URL)."""
+        frame = self.manager.frame(self.entry_id, bm)
+        rid = review_id_of(bm.comment)
+        if self.api is None or not rid:
+            return self.manager.sign_thumbnail(self.entry_id, bm.camera_id, frame)
+        return self.manager.sign_path(f"{FRIGATE_IMAGE_URL}/{self.entry_id}/thumb/{bm.camera_id}/{frame}/{rid}.jpg")
+
     def ranked(self, events: list[Any]) -> list[dict[str, Any]]:
         """Of Frigate's tracked objects, the chosen ones, foremost first: a person, a car, an animal; then the surest."""
         chosen = [
             e for e in events
             if isinstance(e, dict) and isinstance(e.get("label"), str) and e["label"] in self.objects
-            and FRIGATE_ID.fullmatch(str(e.get("id")))
+            and isinstance(e.get("id"), str) and FRIGATE_ID.fullmatch(e["id"])
         ]
         return sorted(chosen, key=lambda e: (_rank(str(e["label"])), -_score(e)))
 
@@ -990,6 +1050,20 @@ class FrigateBridge:
         if err is None:
             self._counts["images_no_snapshot"] += 1
             return
+        self.frigate_failed(err)
+
+    def thumbs_from_frigate(self) -> bool:
+        """Whether to ask Frigate for bookmark thumbnails now (not while it, or they, just failed)."""
+        return self.image_from_frigate() and _monotonic() >= self._thumbs_down_until
+
+    def thumbs_failed(self) -> None:
+        """A thumbnail from Frigate failed (unreachable, failing, slow): SS's frames for a minute,
+        so a page of them doesn't each wait it out. Thumbnails only: a notification finds out
+        for itself (a thumbnail's lookup is heavier, a slow one weak evidence)."""
+        self._thumbs_down_until = _monotonic() + FRIGATE_IMAGE_BACKOFF_SECONDS
+
+    def frigate_failed(self, err: Exception) -> None:
+        """Frigate didn't give an image (unreachable, too slow, failing): shown, and not asked for a minute."""
         detail = str(err)[:200]
         text = str(err) if isinstance(err, FrigateAPIError) else f"{type(err).__name__}: {detail}" if detail else type(err).__name__
         self._image_error = (time.time(), text)
@@ -1083,6 +1157,35 @@ def frigate_names(value: str) -> list[str]:
     return [n.strip() for n in str(value or "").split(",") if n.strip()]
 
 
+# An object is a bookmark's when their times overlap, give or take this
+# (a review, and so its bookmark, starts when an object qualifies, which is
+# after the object itself was first seen).
+BOOKMARK_SLACK = 2
+# A bookmark's objects by time: looked for back this far (one can have
+# started long before its review: a car parked for hours, then moving).
+BOOKMARK_LOOKBACK = 3600
+
+
+def event_time(value: Any) -> float | None:
+    """A Frigate time (epoch seconds), if it is one."""
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        return None
+    return t if math.isfinite(t) and 0 < t < 2**32 else None
+
+
+def overlaps(obj: dict[str, Any], bm: Bookmark) -> bool:
+    """Whether a Frigate object was there during a bookmark (one still tracked: until now)."""
+    start = event_time(obj.get("start_time"))
+    if start is None:
+        return False
+    end = event_time(obj.get("end_time"))
+    if end is None:
+        end = time.time()  # still being tracked
+    return start <= bm.end + BOOKMARK_SLACK and end >= bm.start - BOOKMARK_SLACK
+
+
 def store_key(entry_id: str) -> str:
     return f"{DOMAIN}.frigate.{entry_id}"
 
@@ -1161,6 +1264,44 @@ class FrigateImageView(HomeAssistantView):
             raise web.HTTPNotFound()
         count()
         return web.Response(body=jpg, content_type="image/jpeg", headers={"Cache-Control": "private, max-age=60"})
+
+
+class FrigateThumbnailView(HomeAssistantView):
+    """A Frigate bookmark's thumbnail (event list, search results): Frigate's snapshot of its
+    foremost object, box drawn, as the notification's image; else SS's frame (a redirect to
+    its thumbnail). Signed like the rest."""
+
+    requires_auth = False
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/thumb/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.jpg"
+    name = "api:surveillance_station:frigate_thumbnail"
+
+    def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
+        self.hass = hass
+        self.manager = manager
+
+    async def get(
+        self, request: web.Request, entry_id: str, camera_id: str, frame: str, review_id: str
+    ) -> web.Response:
+        if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
+            raise web.HTTPNotFound()
+        bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
+        if bridge is not None and bridge.thumbs_from_frigate():
+            found = None
+            # Queued (a page asks for 30) outside the budget: waiting isn't Frigate being slow.
+            async with bridge.thumb_sem:
+                try:
+                    if bridge.thumbs_from_frigate():  # not failed while this one waited
+                        async with asyncio.timeout(FRIGATE_IMAGE_BUDGET_SECONDS):
+                            found = await bridge.bookmark_image(review_id, FRIGATE_THUMB_HEIGHT)
+                except (FrigateAPIError, TimeoutError) as err:
+                    _LOGGER.debug("Frigate thumbnail for %s: %r", review_id, err)
+                    bridge.thumbs_failed()
+                except SSError as err:  # SS's camera list (to match Frigate's cameras): not Frigate's fault
+                    _LOGGER.debug("Frigate thumbnail for %s: %r", review_id, err)
+            if found is not None:
+                body, content_type = found
+                return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=3600"})
+        raise web.HTTPFound(self.manager.sign_thumbnail(entry_id, int(camera_id), int(frame)))
 
 
 # Set on a queued message that replaced its review's "new": it was seen new.

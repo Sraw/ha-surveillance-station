@@ -300,3 +300,103 @@ async def test_unloaded_while_settling(hass: HomeAssistant, bridge: FrigateBridg
         bridge.stop()
         await hass.async_block_till_done()
     assert not events and RID in bridge._not_yet
+
+
+async def test_bookmark_thumbnail(
+    hass: HomeAssistant, bridge: FrigateBridge, mock_client: MagicMock, hass_client_no_auth, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A Frigate bookmark's thumbnail is Frigate's snapshot (small, box drawn); once the review is
+    gone, of the object Frigate still has from that camera and time; else a redirect to SS's frame."""
+    mine = Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20)
+    by_hand = Bookmark(31, 6, "Mine", "by hand", T, T + 20)
+    mock_client.list_bookmarks.return_value = [mine, by_hand]
+    manager = hass.data[DATA_MANAGER]
+    assert bridge.bookmark_thumbnail(by_hand) == manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, by_hand))
+    url = bridge.bookmark_thumbnail(mine)
+    assert url.split("?")[0] == f"{FRIGATE_IMAGE_URL}/{bridge.entry_id}/thumb/6/{manager.frame(bridge.entry_id, mine)}/{RID}.jpg"
+    http = await hass_client_no_auth()
+
+    mock_review(aioclient_mock, [event("e1", "person", 0.9)])
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", content=JPG)
+    resp = await http.get(url)
+    assert resp.status == 200 and await resp.read() == JPG and resp.headers["Cache-Control"] == "private, max-age=3600"
+    assert aioclient_mock.mock_calls[-1][1].query == {"bbox": "1", "quality": "90", "height": "180"}
+    assert (await http.get(url.split("?")[0] + "?exp=1&sig=x")).status == 404
+
+    # The review gone (Frigate keeps reviews days, objects weeks): by camera, time and kind.
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    aioclient_mock.get(f"{F}/api/config", json={"cameras": {"drive_way": {}}})
+    aioclient_mock.get(f"{F}/api/events", json=[
+        {"id": "o1", "camera": "drive_way", "label": "car", "start_time": T + 1, "end_time": T + 9, "has_snapshot": True},
+        {"id": "o2", "camera": "drive_way", "label": "person", "start_time": T + 1, "end_time": T + 9, "has_snapshot": True},
+        # Surer, but not in the bookmark's time.
+        {"id": "o3", "camera": "drive_way", "label": "person", "start_time": T + 500, "end_time": T + 509,
+         "has_snapshot": True, "data": {"top_score": 0.99}},
+    ])
+    aioclient_mock.get(f"{F}/api/events/o2/snapshot.jpg", content=WEBP)
+    resp = await http.get(url)
+    assert resp.status == 200 and await resp.read() == WEBP
+    assert [str(c[1]).split("?")[0].split("/api/")[1] for c in aioclient_mock.mock_calls][-1] == "events/o2/snapshot.jpg"
+
+    # SS failing to list the bookmarks: SS's frame, and not Frigate's fault.
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    with patch.object(manager, "bookmarks", AsyncMock(side_effect=SSError("Bookmark", "List", 400))):
+        resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 302 and bridge.thumbs_from_frigate()
+
+    # Nothing of it left, or Frigate down: SS's frame (and not asking Frigate for a minute).
+    ss = manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, mine))
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    aioclient_mock.get(f"{F}/api/events", json=[])
+    resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 302 and resp.headers["Location"] == ss and bridge.image_from_frigate()
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", status=503)
+    resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 302 and not bridge.thumbs_from_frigate()
+    # The notifications' own: they find out for themselves (their lookup is lighter).
+    assert bridge.image_from_frigate() and bridge.stats()["last_image_error"] is None
+    assert bridge.stats()["images_frigate"] == 0
+    asked = len(aioclient_mock.mock_calls)
+    assert (await http.get(url, allow_redirects=False)).status == 302
+    assert len(aioclient_mock.mock_calls) == asked
+
+
+async def test_thumbnails_queued(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth) -> None:
+    """A page's thumbnails wait their turn outside the budget: a queue isn't Frigate being slow."""
+    mine = Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20)
+    url = bridge.bookmark_thumbnail(mine)
+    http = await hass_client_no_auth()
+
+    async def slow(*_):
+        await asyncio.sleep(0.05)
+        return JPG, "image/jpeg"
+
+    with patch.object(frigate_mod, "FRIGATE_IMAGE_BUDGET_SECONDS", 0.1), patch.object(bridge, "bookmark_image", slow), \
+            patch.object(bridge, "thumb_sem", asyncio.Semaphore(1)):
+        answers = await asyncio.gather(*(http.get(url, allow_redirects=False) for _ in range(6)))
+    assert [r.status for r in answers] == [200] * 6 and bridge.thumbs_from_frigate()
+
+
+async def test_thumbnail_ss_camera_list_failing(
+    hass: HomeAssistant, bridge: FrigateBridge, mock_client: MagicMock, hass_client_no_auth, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """SS failing to list its cameras (to place Frigate's objects): SS's frame, Frigate not blamed."""
+    mine = Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20)
+    mock_client.list_bookmarks.return_value = [mine]
+    url = bridge.bookmark_thumbnail(mine)
+    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    aioclient_mock.get(f"{F}/api/config", json={"cameras": {"drive_way": {}}})
+    aioclient_mock.get(f"{F}/api/events", json=[
+        {"id": "o2", "camera": "drive_way", "label": "person", "start_time": T + 1, "end_time": T + 9, "has_snapshot": True},
+    ])
+    bridge._cameras_at = float("-inf")
+    # The event list's bookmarks (SS's cameras) answer; the bridge's own look at the cameras fails.
+    mock_client.cameras.side_effect = [[Camera(id=6, name="Drive Way", enabled=True)], SSError("Camera", "List", 400)]
+    http = await hass_client_no_auth()
+    resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 302 and bridge.thumbs_from_frigate() and mock_client.cameras.call_count == 2
+
