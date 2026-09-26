@@ -120,7 +120,11 @@ its foremost object, box drawn, 180 px tall, as the notification's image;
 once Frigate has deleted the review, the snapshot of the object it still has
 from that camera, time and kind; with none, or Frigate not answering in 5 s,
 SS's frame, and Frigate isn't asked for thumbnails for a minute after it
-failed; 4 are made at a time). It loads 30 at a time as you scroll (cursor-paged, so events created
+failed; 4 are made at a time). Frigate deletes a review with its recordings
+(`record.alerts/detections.retain.days`): keep those as long as
+`snapshots.retain` (and SS's recordings), so a thumbnail is always found
+through its review, the same object as at first; by time, with two of a kind
+there, it may be the other one. It loads 30 at a time as you scroll (cursor-paged, so events created
 meanwhile don't shift it). Once a minute it is brought up to date: new events
 are merged in by time (an event can be bookmarked after a later one), events
 deleted in SS go away, and after more than a page of new ones, or 12 h, it
