@@ -1,0 +1,86 @@
+blueprint:
+  name: Surveillance Station detection notification
+  description: >-
+    A phone notification for each Frigate detection the Surveillance Station
+    integration bookmarks (its surveillance_station_detection event): what was
+    seen and where, a frame of the moment from Surveillance Station's
+    recording, and, if the integration's options set a dashboard path, a tap
+    that opens the timeline card at the detection.
+  domain: automation
+  input:
+    notify_device:
+      name: Phone
+      description: A device with the Home Assistant Companion app.
+      selector:
+        device:
+          integration: mobile_app
+    cameras:
+      name: Cameras
+      description: Surveillance Station camera names to notify for. Empty for all.
+      default: []
+      selector:
+        text:
+          multiple: true
+    objects:
+      name: Objects
+      description: >-
+        Notify when a detection has any of these (as the event names them:
+        Person, Car, Animal, or a capitalised Frigate label such as Bicycle).
+        Empty for all.
+      default: []
+      selector:
+        select:
+          options: [Person, Car, Animal]
+          multiple: true
+          custom_value: true
+    severities:
+      name: Severities
+      description: Frigate's review severity.
+      default: [alert, detection]
+      selector:
+        select:
+          options: [alert, detection]
+          multiple: true
+    time_format:
+      name: Time format
+      description: strftime format of the time in the message.
+      default: "%H:%M:%S"
+      selector:
+        text:
+
+mode: parallel
+max: 20
+
+triggers:
+  - trigger: event
+    event_type: surveillance_station_detection
+
+variables:
+  cameras: !input cameras
+  objects: !input objects
+  severities: !input severities
+  time_format: !input time_format
+  detection: "{{ trigger.event.data }}"
+
+conditions:
+  - condition: template
+    value_template: "{{ not cameras or detection.camera in cameras }}"
+  - condition: template
+    value_template: "{{ not objects or detection.objects | select('in', objects) | list | count > 0 }}"
+  - condition: template
+    value_template: "{{ detection.severity in severities }}"
+
+actions:
+  - device_id: !input notify_device
+    domain: mobile_app
+    type: notify
+    title: "{{ detection.objects | join(', ') }} at {{ detection.camera }}"
+    message: "{{ detection.start | timestamp_custom(time_format) }}"
+    data:
+      image: "{{ detection.image }}"
+      # Android: clickAction; iOS: url. Without a dashboard path, the app opens.
+      clickAction: "{{ detection.url or '' }}"
+      url: "{{ detection.url or '' }}"
+      # One notification per review (a later one for it replaces it).
+      tag: "{{ detection.review_id }}"
+      group: surveillance_station

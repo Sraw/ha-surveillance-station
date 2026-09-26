@@ -21,6 +21,7 @@ from synology_ss_playback import Bookmark, Camera, SSAuthError, SSConnectionErro
 
 from custom_components.surveillance_station.const import (
     CONF_FRIGATE,
+    CONF_FRIGATE_CAMERAS,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_QUIET,
@@ -32,6 +33,7 @@ from custom_components.surveillance_station.const import (
 from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge, bookmark_comment, bookmark_name, camera_key
 from custom_components.surveillance_station.views import DATA_MANAGER, VodManager
 from homeassistant.components import mqtt as mqtt_mod
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
@@ -273,9 +275,19 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
     ):
         result = await hass.config_entries.options.async_configure(flow["flow_id"], {**base, **bad})
         assert result["errors"] == {field: error}
+    result = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {**base, CONF_FRIGATE_TOPIC: " frigate/ ", CONF_FRIGATE_LINK: " /ss-playback/playback "}
+    )
+    # Then SS's cameras (as SS lists them, sorted), for names that don't match Frigate's.
+    assert result["step_id"] == "cameras"
+    assert [str(k) for k in result["data_schema"].schema] == ["Backyard", "Drive Way"]
+    result = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"Backyard": "back_yard", "Drive Way": "Back Yard"}
+    )
+    assert result["errors"] == {"base": "duplicate_camera"}
     with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)) as start:
         result = await hass.config_entries.options.async_configure(
-            flow["flow_id"], {**base, CONF_FRIGATE_TOPIC: " frigate/ ", CONF_FRIGATE_LINK: " /ss-playback/playback "}
+            flow["flow_id"], {"Backyard": " back_yard , garden,", "Drive Way": " "}
         )
         await hass.async_block_till_done()
     assert result["type"] == "create_entry"
@@ -286,8 +298,28 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         CONF_FRIGATE_LINK: "/ss-playback/playback",
         CONF_FRIGATE_QUIET: 5,
         CONF_FRIGATE_QUIET_KINDS: ["Animal"],
+        CONF_FRIGATE_CAMERAS: {"Backyard": "back_yard, garden"},
     }
     start.assert_awaited_once()  # reloaded with the bridge on
+    assert hass.data[DATA_FRIGATE][setup_integration.entry_id]._aliases == {"backyard": "backyard", "garden": "backyard"}
+
+
+@pytest.mark.parametrize("frigate", [True, False])
+async def test_options_without_the_camera_step(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, frigate: bool
+) -> None:
+    """Frigate off, or SS not answering: saved at once, the mapping kept as it was."""
+    hass.config_entries.async_update_entry(setup_integration, options={CONF_FRIGATE_CAMERAS: {"Backyard": "garden"}})
+    await hass.async_block_till_done()
+    mock_client.cameras.side_effect = SSConnectionError("x", "List", None)
+    flow = await hass.config_entries.options.async_init(setup_integration.entry_id)
+    with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)):
+        result = await hass.config_entries.options.async_configure(
+            flow["flow_id"], {CONF_FRIGATE: frigate, CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_OBJECTS: ["person"]}
+        )
+        await hass.async_block_till_done()
+    assert result["type"] == "create_entry"
+    assert setup_integration.options[CONF_FRIGATE_CAMERAS] == {"Backyard": "garden"}
 
 
 async def test_better_frame_later(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
@@ -410,8 +442,9 @@ async def test_stats_ignored_and_dropped(hass: HomeAssistant, bridge: FrigateBri
         for rid in ("q1", "q2", "q1", "q3"):
             bridge._received(MagicMock(payload=json.dumps(review("update", rid=rid))))
     stats = bridge.stats()
-    # q1's second message replaced its first; q3 pushed the oldest (q1) out.
-    assert (stats["messages"], stats["coalesced"], stats["dropped"], stats["queued"]) == (4, 1, 1, 2)
+    # q1's second message replaced its first; q3 pushed the oldest (q1) out,
+    # to wait with those SS failed (not lost).
+    assert (stats["messages"], stats["coalesced"], stats["dropped"], stats["queued"], stats["deferred"]) == (4, 1, 0, 2, 1)
     assert list(bridge._pending) == ["q2", "q3"]
 
 
@@ -904,6 +937,12 @@ async def test_refusals_that_last_become_an_issue(hass: HomeAssistant, bridge: F
     await bridge._process("r", review("new", rid="r"))
     assert not bridge.stats()["failing"] and bridge._rejected_since is not None
     bridge._rejected_since -= 601
+    bridge._check_health()
+    assert registry.async_get_issue(DOMAIN, issue) is None  # one review refused (a camera disabled...): no issue
+    client.list_bookmarks.return_value = [Bookmark(1, 6, "Person", "Frigate alert [frigate r]", T, T + 30)]
+    await bridge._process("r", review("update", rid="r"))  # its bookmark found, made before: not a refusal cleared
+    assert bridge._rejected_since is not None
+    await bridge._process("q", review("new", rid="q"))  # a second one refused
     bridge._failing_since = bridge._rejected_since  # and a probe finds SS answering: still refused
     bridge._check_health()
     await hass.async_block_till_done()
@@ -938,4 +977,108 @@ async def test_overflow_keeps_the_canary_and_the_dropped(hass: HomeAssistant, br
         assert list(bridge._pending) == ["k", "q2"] and list(bridge._deferred) == ["q1"]
         for rid in ("d1", "d2"):  # and what waits for SS is bounded too
             bridge._keep(rid, review("new", rid=rid))
-    assert list(bridge._deferred) == ["d1", "d2"] and bridge.stats()["dropped"] == 2
+    assert list(bridge._deferred) == ["d1", "d2"] and bridge.stats()["dropped"] == 1
+
+
+async def test_mapped_camera(hass: HomeAssistant, setup_integration: MockConfigEntry, client: MagicMock) -> None:
+    """A Frigate camera named otherwise than its SS camera: bookmarked on the one the options map it to."""
+    client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=12, name="前门", enabled=True)]
+    mapped = FrigateBridge(
+        hass, setup_integration.entry_id, client, hass.data[DATA_MANAGER], "frigate", {"person"}, "",
+        cameras={"前门": "front_door, porch"},
+    )
+    mapped.manager.thumbnail_when_recorded = AsyncMock(return_value=b"jpg")
+    await mapped.handle(review("new", camera="porch", rid="p"))
+    await mapped.handle(review("new", camera="drive_way", rid="d"))  # the others still by name
+    assert [c.args[0] for c in client.create_bookmark.await_args_list] == [12, 6]
+    await hass.async_block_till_done()
+
+
+async def test_cut_short_during_a_retry_keeps_the_newer_message(
+    hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock
+) -> None:
+    """The worker, unloaded while it retries a review with its newer message: that message is kept."""
+    retrying = asyncio.Event()
+
+    async def create(*args):
+        if not client.create_bookmark.await_count > 1:
+            raise SSConnectionError("x", "Create", None)
+        retrying.set()
+        await asyncio.Event().wait()
+
+    client.create_bookmark.side_effect = create
+    client.list_bookmarks.return_value = []
+    with patch("custom_components.surveillance_station.frigate.FRIGATE_RETRY_SECONDS", 0.5):
+        bridge._worker = hass.async_create_background_task(bridge._work(), "test worker")
+        bridge._received(MagicMock(payload=json.dumps(review("new", rid="r"))))
+        async with asyncio.timeout(5):
+            while not bridge._counts["retried"]:  # its first try failed; waiting to retry
+                await asyncio.sleep(0.01)
+        bridge._received(MagicMock(payload=json.dumps(review("end", rid="r", end=T + 9))))
+        async with asyncio.timeout(5):
+            await retrying.wait()
+    assert bridge._current[1]["type"] == "end"
+    bridge.stop()
+    await asyncio.sleep(0)
+    kept = bridge._deferred["r"]
+    assert (kept["type"], kept["after"]["end_time"], kept["_maybe_made"]) == ("end", T + 9, True)
+
+
+async def test_waiting_reviews_are_written_when_ha_stops(hass: HomeAssistant, bridge: FrigateBridge, hass_storage) -> None:
+    """HA stopping doesn't unload the entry: what is queued or in flight goes into the final write all the same."""
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ), patch.object(bridge, "_work", AsyncMock()):
+        assert await bridge.start()
+    bridge._keep("d", review("new", rid="d"))
+    bridge._replay["p"] = review("new", rid="p")
+    bridge._current = ("c", review("new", rid="c"))
+    bridge._pending["n"] = review("new", rid="n")
+    bridge._pending["c"] = review("update", rid="c")  # newer than the one in flight: it goes instead
+    with patch.object(bridge._store, "async_delay_save") as save:
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        await hass.async_block_till_done()
+    data = save.call_args.args[0]()
+    kept = dict(data["deferred"])
+    assert list(kept) == ["d", "p", "n", "c"]
+    assert kept["c"]["type"] == "update" and kept["c"]["_maybe_made"] and not kept["n"].get("_maybe_made")
+    assert all(r["_failed_at"] == T + 2 for r in kept.values())
+    assert list(bridge._pending) == ["n", "c"] and not bridge._pending["c"].get("_maybe_made")  # queues untouched
+    bridge.stop()
+    assert bridge._stop_listener is None
+
+
+async def test_failure_after_a_newer_message_was_pushed_out(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """The review's newer message already waits with the deferred (a full queue): the failed older one doesn't replace it."""
+    bridge._keep("r", review("end", rid="r", end=T + 9))
+    bridge._defer("r", review("new", rid="r"))
+    assert bridge._deferred["r"]["type"] == "end" and bridge._deferred["r"]["_maybe_made"]
+
+
+async def test_stored_without_a_date_expires_a_day_after_start(hass: HomeAssistant, bridge: FrigateBridge, hass_storage) -> None:
+    """Kept by a version that didn't date them: dated at load, and given up on a day later like the rest."""
+    hass_storage[bridge._store.key] = {
+        "version": 1, "key": bridge._store.key, "data": {"deferred": [["r", review("new", rid="r")]]}
+    }
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ), patch.object(bridge, "_work", AsyncMock()):
+        assert await bridge.start()
+    key, loaded = next(iter(bridge._pending.items()))  # tried at once, the canary
+    assert key == bridge._canary_key == "r" and loaded["_failed_at"] == T + 2
+    bridge._keep(*bridge._pending.popitem())
+    with patch("custom_components.surveillance_station.frigate.time.time", return_value=T + 2 + 86401):
+        bridge._check_health()
+    assert not bridge._deferred and bridge.stats()["dropped"] == 1
+    bridge.stop()
+
+
+async def test_canary_mark_cleared_once_tried(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    bridge._keep("k", review("new", rid="k"))
+    bridge._canary()
+    bridge._worker = hass.async_create_background_task(bridge._work(), "test worker")
+    async with asyncio.timeout(5):
+        while bridge._canary_key is not None:
+            await asyncio.sleep(0.01)
+    assert client.create_bookmark.await_count == 1 and bridge._current is None
+    bridge.stop()

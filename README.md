@@ -171,8 +171,10 @@ event list, and in DS cam / the SS client. Every animal is called "Animal".
 
 - Read from `<prefix>/reviews` on MQTT (HA's MQTT integration, connected to
   Frigate's broker). Frigate cameras are matched to SS cameras by name,
-  ignoring case, spaces and punctuation (`drive_way` = "Drive Way"); an
-  unmatched one is logged once.
+  ignoring case, spaces and punctuation (`drive_way` = "Drive Way"); where
+  the names differ (an SS camera named "前门" or "Porch Cam"), the options'
+  second step maps each SS camera to its Frigate camera(s). An unmatched one
+  is logged once.
 - `new`: bookmark from the review's start, named after its objects
   ("Person, Car", "Animal"); its end is open (30 s, or up to now) until `end`
   sets it. `update`: renamed as objects or zones are added; a review that
@@ -233,10 +235,13 @@ broker down, NAS unreachable at runtime and during HA's start):
   anything fresh, and back to waiting if SS fails again): an outage loses
   no bookmark (and, past 2 minutes, sends no stale notification). Only a
   bookmark made or found counts as SS being back, not reads that work.
-  DSM's common codes (100-119: the SS package stopped or updating) count as
-  unreachable. An error code SS gives for the request itself (400 and up)
-  is not kept: it would only come again. Reviews not handled yet at an
-  unload or restart, and the one in flight, are kept the same way.
+  DSM's "not now" codes (unknown error; API or method not there, as while
+  the SS package is stopped or updating; session gone) count as
+  unreachable. Any other error code (bad parameters, no permission, SS's
+  own 400 and up) is not kept: it would only come again. Reviews not
+  handled yet at an unload or an HA restart (written at HA's final write:
+  HA doesn't unload entries when it stops), and the one in flight, are
+  kept the same way.
 - Messages waiting for SS are one per review (a later one replaces the
   earlier: it says everything that one did), at most 1000 reviews.
 - The SS camera list is read again every 10 minutes and after any failure:
@@ -256,7 +261,8 @@ broker down, NAS unreachable at runtime and during HA's start):
   wrong password: no login for a minute, then again.
 - A problem lasting 10 minutes becomes an issue in **Settings → Repairs**,
   gone by itself once it clears: MQTT not available, bookmarks failing
-  (checked again every minute) or refused by SS until one is made again,
+  (checked again every minute) or refused by SS (for more than one review,
+  until one is made again),
   Frigate offline (its `<prefix>/available`).
 - A notification cut short (unload, restart while waiting for the frame)
   isn't counted as sent: the review's next message sends it, within the
@@ -268,7 +274,13 @@ broker down, NAS unreachable at runtime and during HA's start):
 - The card retries a stream it gave up on every minute while on screen, so
   a wall display comes back after the NAS reboots.
 
-A notification is an automation on that event, e.g.:
+A notification is an automation on that event. The repository ships a
+blueprint for the companion app,
+[`blueprints/automation/surveillance_station/detection_notification.yaml`](blueprints/automation/surveillance_station/detection_notification.yaml)
+(import it in **Settings → Automations & scenes → Blueprints → Import
+blueprint** with that file's URL): a phone, which cameras, objects and
+severities, and it sends the title, time, frame and link, one notification
+per review. Or by hand, e.g.:
 
 ```yaml
 triggers:
@@ -439,6 +451,12 @@ entities; there is no per-user camera permission.
   about 1.5 s of "Buffering" whatever its length.
 - A jump lands on the keyframe before the time asked for (SS starts there),
   so up to one GOP early; buffered frames are then played from there.
+  Frames (thumbnails, notification images) are cut the same way: SS's
+  Download takes whole seconds and starts at the keyframe at or before
+  them, and the file it returns has no finer time to correct by. **Set the
+  cameras' I-frame interval to 1 s** (e.g. 15 at 15 fps): with a 4 s GOP a
+  notification's frame can be 4 s before the moment Frigate picked, the
+  person not in it yet.
 - Each camera in a grid is a stream from the NAS to the browser (via HA) at
   full recording quality: a 4-camera grid of 4K H.265 needs a device that
   decodes four of them at once, and at 4-8x a multiple of that.

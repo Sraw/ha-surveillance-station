@@ -70,6 +70,8 @@ CONF_FRIGATE = "frigate"
 CONF_FRIGATE_TOPIC = "frigate_topic"
 CONF_FRIGATE_OBJECTS = "frigate_objects"  # Frigate labels bookmarked, whatever the review's severity
 CONF_FRIGATE_LINK = "frigate_link"  # dashboard path of the card, for the event's url
+# {SS camera name: Frigate camera name(s), comma-separated}, for names that don't match.
+CONF_FRIGATE_CAMERAS = "frigate_cameras"
 DEFAULT_FRIGATE_TOPIC = "frigate"
 DEFAULT_FRIGATE_OBJECTS = ["person", "car", "dog", "cat"]
 # Named "Animal" in bookmarks and events, one kind for all of them.

@@ -31,6 +31,7 @@ from . import websocket
 from .const import (
     CARD_FILENAME,
     CONF_FRIGATE,
+    CONF_FRIGATE_CAMERAS,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_QUIET,
     CONF_FRIGATE_QUIET_KINDS,
@@ -188,6 +189,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             options.get(CONF_FRIGATE_LINK) or "",
             options.get(CONF_FRIGATE_QUIET, DEFAULT_FRIGATE_QUIET_MINUTES),
             set(options.get(CONF_FRIGATE_QUIET_KINDS, DEFAULT_FRIGATE_QUIET_KINDS)),
+            options.get(CONF_FRIGATE_CAMERAS) or {},
         )
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.

@@ -8,7 +8,7 @@ bookmark on the matching camera: created when it first qualifies, renamed as
 objects are added, and given its real end at the end. Every animal is named
 "Animal".
 Frigate cameras are matched to SS cameras by name, ignoring case, spaces and
-punctuation (``drive_way`` is "Drive Way").
+punctuation (``drive_way`` is "Drive Way"), or as the options map them.
 
 A review is announced as a ``surveillance_station_detection`` event once it
 has its bookmark (once per review, remembered across restarts; and not when the review has only kinds that may be quiet,
@@ -37,6 +37,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
+import itertools
 import json
 import logging
 import math
@@ -47,7 +48,8 @@ from typing import Any
 from synology_ss_playback import SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
@@ -136,6 +138,7 @@ class FrigateBridge:
         link: str,
         quiet_minutes: float = 0,
         quiet_kinds: set[str] | None = None,
+        cameras: dict[str, str] | None = None,
     ) -> None:
         self.hass = hass
         self.entry_id = entry_id
@@ -145,6 +148,10 @@ class FrigateBridge:
         self.objects = objects
         self.link = link
         self.quiet = quiet_minutes * 60
+        # Frigate camera -> SS camera (both as camera_key), where the names differ.
+        self._aliases = {
+            camera_key(f): camera_key(ss) for ss, frigate in (cameras or {}).items() for f in frigate_names(frigate)
+        }
         # Never "Person", whatever is passed.
         self.quiet_kinds = (quiet_kinds or set()) & set(FRIGATE_QUIET_KINDS)
         # (SS camera id, kind) -> when that kind was last active on that
@@ -177,6 +184,7 @@ class FrigateBridge:
         # SS refusing bookmarks (an error code) while answering otherwise
         # (rights taken away): since when, cleared by a bookmark made.
         self._rejected_since: float | None = None
+        self._rejected: set[str] = set()  # the reviews refused since then
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._unsubscribe: list[Callable[[], None]] = []
@@ -185,6 +193,7 @@ class FrigateBridge:
         self._announcing_ids: set[str] = set()
         self._probe: asyncio.Task | None = None
         self._stop_health: Callable[[], None] | None = None
+        self._stop_listener: Callable[[], None] | None = None
         self._started_at = _monotonic()
         self._failing_since: float | None = None
         self._frigate_offline_since: float | None = None
@@ -194,7 +203,8 @@ class FrigateBridge:
         self._stopped = False
         # For diagnostics: is anything arriving, and where does it stop?
         # messages: every review message (new, each update, end), so several
-        # per review. messages = handled + queued + coalesced + dropped;
+        # per review. messages = handled + queued + coalesced + dropped
+        # (+ those pushed out of a full queue to wait with the deferred);
         # handled ends as ignored (by reason), failed (after retries), or went
         # through (bookmarked counts new bookmarks; each review is then
         # announced or not_announced).
@@ -263,6 +273,9 @@ class FrigateBridge:
         self._stop_health = async_track_time_interval(
             self.hass, self._check_health, timedelta(seconds=FRIGATE_HEALTH_INTERVAL)
         )
+        # HA stopping doesn't unload entries (stop() isn't called): what
+        # waits is written at its final write instead.
+        self._stop_listener = self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STOP, self._ha_stopping)
         warned = False
         # HA's MQTT may be starting, retrying its broker, or reloading. Keep
         # waiting (this runs as an entry task, cancelled on unload) rather
@@ -302,22 +315,18 @@ class FrigateBridge:
         self._stopped = True
         self._subscribed = False
         # Not handled yet, or cut short: kept for next time (async_flush
-        # writes it). Oldest first, so a review's newest message wins.
-        waiting = [*self._replay.items()]
-        if self._current is not None:
-            key, review = self._current
-            waiting.append((key, {**review, _MAYBE_MADE: True}))
-        waiting += self._pending.items()
-        for key, review in waiting:
-            self._keep(key, review)
+        # writes it).
+        self._deferred = self._waiting()
         self._replay.clear()
         self._pending.clear()
+        self._current = None
         for unsubscribe in self._unsubscribe:
             unsubscribe()
         self._unsubscribe = []
-        if self._stop_health is not None:
-            self._stop_health()
-            self._stop_health = None
+        for remove in (self._stop_health, self._stop_listener):
+            if remove is not None:
+                remove()
+        self._stop_health = self._stop_listener = None
         for task in (self._worker, self._probe, *self._announcing):
             if task is not None:
                 task.cancel()
@@ -326,6 +335,12 @@ class FrigateBridge:
         for issue in list(self._issues):
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
         self._issues.clear()
+
+    @callback
+    def _ha_stopping(self, _event: Event) -> None:
+        # A delayed save while stopping is written at HA's final write, by
+        # when the worker is cancelled (and a review cut short is _current).
+        self._save()
 
     async def async_flush(self) -> None:
         """Write what must survive a restart now (after stop(), on unload)."""
@@ -369,14 +384,13 @@ class FrigateBridge:
                 review[_MAYBE_MADE] = True
         self._pending[key] = review  # an existing key keeps its place
         if len(self._pending) > FRIGATE_QUEUE_MAX:
-            # SS stuck for a long while: newer reviews matter more (but not
-            # the one being tried to see whether SS is back).
-            oldest = [k for k in list(self._pending)[:2] if k != self._canary_key][0]
+            # SS stuck for a long while: the oldest (but not the one being
+            # tried to see whether SS is back) waits with those SS failed.
+            oldest = next(k for k in itertools.islice(self._pending, 2) if k != self._canary_key)
             self._keep(oldest, self._pending.pop(oldest))
-            self._counts["dropped"] += 1
             if not self._dropping:
                 self._dropping = True
-                _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; dropping the oldest")
+                _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; the oldest wait for later")
         self._wake.set()
 
     async def _work(self) -> None:
@@ -401,13 +415,13 @@ class FrigateBridge:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
+            # Kept if cancelled (unload, HA stopping): stop() and the final
+            # write keep it for next time. _process handles every Exception.
             self._current = (key, review)
-            try:
-                await self._process(key, review)
-            finally:
-                self._current = None
-                if key == self._canary_key:
-                    self._canary_key = None
+            await self._process(key, review)
+            self._current = None
+            if key == self._canary_key:
+                self._canary_key = None
 
     async def _process(self, key: str, review: dict[str, Any]) -> None:
         retries = 0
@@ -432,6 +446,8 @@ class FrigateBridge:
                     self._bookmark_error = str(err)[:300]
                     if self._rejected_since is None:
                         self._rejected_since = _monotonic()
+                    if len(self._rejected) < 16:
+                        self._rejected.add(key)
                     _LOGGER.warning("Surveillance Station refused the bookmark of Frigate review %s: %s", key, err)
                     return
                 if self._failing or retries >= FRIGATE_RETRIES:
@@ -444,6 +460,8 @@ class FrigateBridge:
                 # A newer message of the same review may have come meanwhile.
                 if (newer := self._pending.pop(key, None)) is not None:
                     review = {**newer, _MAYBE_MADE: True}
+                if self._current is not None and self._current[0] == key:
+                    self._current = (key, review)
                 continue
             except Exception as err:  # noqa: BLE001 - one bad message must not stop the bridge
                 # This message, not SS: counted and logged, not retried, and
@@ -463,26 +481,49 @@ class FrigateBridge:
             _LOGGER.warning("Frigate review not turned into a bookmark (tried again once SS answers): %s", err)
 
     def _defer(self, key: str, review: dict[str, Any]) -> None:
-        for queue in (self._pending, self._replay):
-            if (newer := queue.get(key)) is not None:
-                # A newer message of the review is waiting: it goes instead
-                # (knowing the bookmark may exist); this one is older news.
-                newer[_MAYBE_MADE] = True
-                return
-        self._keep(key, review)
+        if not self._newer_waits(key):
+            self._keep(key, review)
         self._save()
 
-    def _keep(self, key: str, review: dict[str, Any]) -> None:
+    def _newer_waits(self, key: str, queues: tuple[OrderedDict[str, dict[str, Any]], ...] | None = None) -> bool:
+        """Is a newer message of the review in flight waiting? It then goes instead, knowing the bookmark may exist.
+
+        Anything of the review waiting while one of its messages is handled
+        came later: _received takes an earlier one out of every queue."""
+        for queue in queues or (self._pending, self._replay, self._deferred):
+            if (newer := queue.get(key)) is not None:
+                newer[_MAYBE_MADE] = True
+                return True
+        return False
+
+    def _waiting(self) -> OrderedDict[str, dict[str, Any]]:
+        """Everything not bookmarked yet, one message per review, as kept for next time (queues untouched)."""
+        waiting = OrderedDict((k, dict(r)) for k, r in self._deferred.items())
+        replay = OrderedDict((k, dict(r)) for k, r in self._replay.items())
+        pending = OrderedDict((k, dict(r)) for k, r in self._pending.items())
+        if self._current is not None:
+            key, review = self._current
+            if not self._newer_waits(key, (pending, replay, waiting)):
+                replay[key] = {**review, _MAYBE_MADE: True}
+        for key, review in (*replay.items(), *pending.items()):
+            self._keep(key, review, waiting)
+        return waiting
+
+    def _keep(
+        self, key: str, review: dict[str, Any], into: OrderedDict[str, dict[str, Any]] | None = None
+    ) -> None:
         """Wait for SS (the review's latest message, with what earlier ones told)."""
-        earlier = self._deferred.pop(key, None) or {}
+        into = self._deferred if into is None else into
+        earlier = into.pop(key, None) or {}
         review = {**review, _FAILED_AT: earlier.get(_FAILED_AT) or review.get(_FAILED_AT) or time.time()}
         for flag in (_MAYBE_MADE, _SEEN_NEW):
             if earlier.get(flag):
                 review[flag] = True
-        self._deferred[key] = _compact(review)
-        if len(self._deferred) > FRIGATE_QUEUE_MAX:
-            self._deferred.popitem(last=False)
-            self._counts["dropped"] += 1
+        into[key] = _compact(review)
+        if len(into) > FRIGATE_QUEUE_MAX:
+            into.popitem(last=False)
+            if into is self._deferred:
+                self._counts["dropped"] += 1
 
     def _canary(self) -> None:
         """Try the oldest review waiting for SS again, first in line."""
@@ -504,6 +545,7 @@ class FrigateBridge:
             _LOGGER.info("Surveillance Station answers again: bookmarking Frigate detections")
         if bookmark:
             self._rejected_since = None
+            self._rejected.clear()
         if self._deferred:
             for key, review in self._deferred.items():
                 if key not in self._pending:  # a newer message waiting wins
@@ -626,7 +668,7 @@ class FrigateBridge:
         return {
             "decided": list(self._decided),
             "last_seen": [[c, k, t, rid] for (c, k), (t, rid) in self._last_seen.items()],
-            "deferred": [[key, review] for key, review in self._deferred.items()],
+            "deferred": [[key, review] for key, review in self._waiting().items()],
         }
 
     def _save(self) -> None:
@@ -643,12 +685,13 @@ class FrigateBridge:
             if bm.camera_id == camera_id and bm.comment.endswith(tag):
                 tracked = _Tracked(bm.id, camera_id, bm.name, bm.comment, bm.start, bm.end)
                 self._remember(review_id, tracked)
-                self._ok()
+                self._ok(bookmark=False)  # SS answers; made before, so not a refusal cleared
                 return tracked
         return None
 
     async def _camera(self, frigate_camera: str) -> tuple[int, str] | None:
         key = camera_key(frigate_camera)
+        key = self._aliases.get(key, key)
         age = _monotonic() - self._cameras_at
         # Listed again at most once a minute for a camera not there (added or
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
@@ -659,7 +702,8 @@ class FrigateBridge:
         if (found := self._cameras.get(key)) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
             self._unknown.add(frigate_camera)
             _LOGGER.warning(
-                "Frigate camera %r matches no Surveillance Station camera by name; its detections are not bookmarked",
+                "Frigate camera %r matches no Surveillance Station camera by name (map it in the integration's"
+                " options); its detections are not bookmarked",
                 frigate_camera,
             )
         return found
@@ -755,7 +799,10 @@ class FrigateBridge:
             self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
         problems = {
             "frigate_mqtt": not self._subscribed and lasting(self._started_at),
-            "frigate_failing": lasting(self._failing_since) or lasting(self._rejected_since),
+            # Refusals: of more than one review (one camera disabled in SS
+            # overnight is not "bookmarks failing").
+            "frigate_failing": lasting(self._failing_since)
+            or (lasting(self._rejected_since) and len(self._rejected) > 1),
             "frigate_offline": lasting(self._frigate_offline_since),
         }
         for issue, present in problems.items():
@@ -792,6 +839,11 @@ class FrigateBridge:
             self._probe = None
 
 
+def frigate_names(value: str) -> list[str]:
+    """The Frigate camera names an option lists (comma-separated)."""
+    return [n.strip() for n in str(value or "").split(",") if n.strip()]
+
+
 def store_key(entry_id: str) -> str:
     return f"{DOMAIN}.frigate.{entry_id}"
 
@@ -807,19 +859,19 @@ _MAYBE_MADE = "_maybe_made"
 _FAILED_AT = "_failed_at"  # when it first failed (epoch), for giving up after a day
 
 
+_TRANSIENT_CODES = frozenset({None, 100, 102, 103, 104, 106, 107, 119, 407})
+
+
 def _transient(err: SSError) -> bool:
     """Worth trying again later: SS unreachable, overloaded or blocking us for
     now; credentials refused (a reauth fixes that); or one of DSM's common
-    codes (100-119: API or method not there, session...), as while the SS
-    package is stopped or updating. SS's own codes (400 and up) for this
-    request would only come again."""
+    codes for "not now": unknown error, API or method not there (the SS
+    package stopped or updating), session gone. Not 101/114 (bad
+    parameters), nor 105 (no permission, still after the client logged in
+    again): those, and SS's own codes (400 and up) for this request, would
+    only come again."""
     code = err.code
-    return (
-        isinstance(err, (SSConnectionError, SSAuthError))
-        or code is None
-        or code == 407
-        or (isinstance(code, int) and 100 <= code < 120)
-    )
+    return isinstance(err, (SSConnectionError, SSAuthError)) or code in _TRANSIENT_CODES
 
 
 def _compact(review: dict[str, Any]) -> dict[str, Any]:

@@ -32,8 +32,10 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
 )
 
+from .frigate import camera_key, frigate_names
 from .const import (
     CONF_FRIGATE,
+    CONF_FRIGATE_CAMERAS,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_QUIET,
     CONF_FRIGATE_QUIET_KINDS,
@@ -180,7 +182,13 @@ class SurveillanceStationConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
-    """Frigate detections as bookmarks (saving reloads the entry)."""
+    """Frigate detections as bookmarks (saving reloads the entry).
+
+    Then, if SS answers, which Frigate camera each SS camera is, where the
+    names don't match."""
+
+    _options: dict[str, Any]
+    _cameras: list[str]
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
@@ -195,17 +203,52 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
             elif link and (not link.startswith("/") or link.startswith("//") or "\\" in link):
                 errors[CONF_FRIGATE_LINK] = "invalid_link"
             else:
-                return self.async_create_entry(
-                    data={
-                        **user_input,
-                        CONF_FRIGATE_TOPIC: topic,
-                        CONF_FRIGATE_OBJECTS: objects,
-                        CONF_FRIGATE_LINK: link,
-                        CONF_FRIGATE_QUIET: int(user_input[CONF_FRIGATE_QUIET]),
-                    }
-                )
+                self._options = {
+                    **user_input,
+                    CONF_FRIGATE_TOPIC: topic,
+                    CONF_FRIGATE_OBJECTS: objects,
+                    CONF_FRIGATE_LINK: link,
+                    CONF_FRIGATE_QUIET: int(user_input[CONF_FRIGATE_QUIET]),
+                    CONF_FRIGATE_CAMERAS: self.config_entry.options.get(CONF_FRIGATE_CAMERAS) or {},
+                }
+                if user_input[CONF_FRIGATE] and (cameras := await self._ss_cameras()):
+                    self._cameras = cameras
+                    return await self.async_step_cameras()
+                return self.async_create_entry(data=self._options)
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(OPTIONS_SCHEMA, user_input or self.config_entry.options),
+            errors=errors,
+        )
+
+    async def _ss_cameras(self) -> list[str]:
+        """SS's camera names, or none if the entry isn't loaded or SS doesn't answer."""
+        client = getattr(self.config_entry, "runtime_data", None)
+        if client is None:
+            return []
+        try:
+            return sorted({c.name for c in await client.cameras()})
+        except SSError:
+            return []
+
+    async def async_step_cameras(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            mapping = {
+                name: ", ".join(names)
+                for name in self._cameras
+                if (names := frigate_names(user_input.get(name, "")))
+            }
+            listed = [camera_key(n) for names in mapping.values() for n in frigate_names(names)]
+            if len(listed) != len(set(listed)):
+                errors["base"] = "duplicate_camera"
+            else:
+                return self.async_create_entry(data={**self._options, CONF_FRIGATE_CAMERAS: mapping})
+        schema = vol.Schema({vol.Optional(name): str for name in self._cameras})
+        return self.async_show_form(
+            step_id="cameras",
+            data_schema=self.add_suggested_values_to_schema(
+                schema, user_input or self._options[CONF_FRIGATE_CAMERAS]
+            ),
             errors=errors,
         )

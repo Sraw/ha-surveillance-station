@@ -58,7 +58,7 @@
     "step": {
       "init": {
         "title": "Frigate detections",
-        "description": "Turn Frigate's review items into Surveillance Station bookmarks (needs the MQTT integration, connected to Frigate's broker). Frigate cameras are matched to Surveillance Station cameras by name. Each new bookmark also fires a surveillance_station_detection event, for an automation to send a notification.",
+        "description": "Turn Frigate's review items into Surveillance Station bookmarks (needs the MQTT integration, connected to Frigate's broker). Frigate cameras are matched to Surveillance Station cameras by name (ignoring case, spaces and punctuation); the next step maps those whose names differ. Each new bookmark also fires a surveillance_station_detection event, for an automation to send a notification.",
         "data": {
           "frigate": "Bookmark Frigate detections",
           "frigate_topic": "Frigate MQTT topic prefix",
@@ -74,12 +74,17 @@
           "frigate_quiet_minutes": "No surveillance_station_detection event for a camera's review when it has only kinds chosen below, all seen on that camera within this many minutes (the dog that wandered off and came back); it is still bookmarked. 0: every review.",
           "frigate_quiet_kinds": "People are never quiet: a second person arriving is always announced."
         }
+      },
+      "cameras": {
+        "title": "Frigate cameras",
+        "description": "For each Surveillance Station camera whose name doesn't match its Frigate camera's (ignoring case, spaces and punctuation), enter the Frigate camera's name as in Frigate's config (several: separate them with commas). Leave the others empty."
       }
     },
     "error": {
       "invalid_topic": "Enter a topic prefix without wildcards.",
       "invalid_link": "Enter a path starting with /, such as /ss-playback/playback.",
-      "no_objects": "Choose at least one object."
+      "no_objects": "Choose at least one object.",
+      "duplicate_camera": "A Frigate camera can go to one Surveillance Station camera only."
     }
   },
   "issues": {

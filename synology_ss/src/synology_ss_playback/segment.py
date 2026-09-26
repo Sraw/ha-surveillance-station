@@ -110,8 +110,9 @@ async def fetch_snapshot(
 ) -> bytes | None:
     """A JPEG of what the camera recorded at wall time t, or None if nothing was.
 
-    SS cuts from the keyframe at or before the offset (1 s GOP here), so the
-    frame is at most a second early.
+    SS cuts whole seconds, from the keyframe at or before the offset, so the
+    frame is up to one GOP early (a second with a 1 s I-frame interval); the
+    cut carries no finer time to correct by.
     """
     now = time.time()
     for rec in await client.recordings(camera_id, int(t) - 1, int(t) + 1):
