@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.12.2";
+const CARD_VERSION = "0.12.3";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -1225,7 +1225,9 @@ class StreamFeed {
     const a = (this.audio = { el, started: false, inited: false });
     a.track = new Track(el, {
       onAppended: () => a.started || this.alignAudio(),
-      onError: () => this.audio === a && this.stopAudio(),
+      // Failing before it played (addSourceBuffer threw, the init segment
+      // was refused): unplayable here, and said so; after: stopped.
+      onError: () => this.audio === a && (a.started ? this.stopAudio() : this.audioUnplayableNow(a.codec ?? "?")),
     });
     el.play().catch(() => {});
     if (this.audioInit) this.initAudio();
@@ -1263,10 +1265,10 @@ class StreamFeed {
     // Whatever the camera sends: the browser says whether it can play it.
     const codec = (a.codec = audioCodecOf(this.audioInit[1]));
     const mime = `audio/mp4; codecs="${codec}"`;
-    // Said to be playable but refused all the same (addSourceBuffer threw, or
-    // the moov wasn't what it seemed): unplayable too.
-    const ok = MSE.isTypeSupported(mime) && (await a.track.sink.init(this.audioInit, mime));
-    if (!ok && this.audio === a) this.audioUnplayableNow(codec); // (not if sound was turned off meanwhile)
+    // (Said to be playable but refused all the same, addSourceBuffer throwing
+    // or the init segment refused: the track's onError says so.)
+    if (!MSE.isTypeSupported(mime)) return this.audioUnplayableNow(codec);
+    await a.track.sink.init(this.audioInit, mime);
   }
 
   audioFragment(data, wall) {

@@ -22,7 +22,7 @@
     "synology_ss_playback"
   ],
   "requirements": [
-    "synology-ss-playback==0.6.1"
+    "synology-ss-playback==0.6.2"
   ],
-  "version": "0.12.2"
+  "version": "0.12.3"
 }

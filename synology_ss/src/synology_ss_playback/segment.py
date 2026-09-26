@@ -47,7 +47,7 @@ async def fetch_segment(
         seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000) + 1000
     )
     fetched = time.monotonic()
-    data = await _remux(ffmpeg, raw, seg, timeout)
+    data = await _remux(ffmpeg, raw, seg, timeout, client.nas)
     init, media = split_fmp4(data)
     if not init or not media:
         raise SSError("remux", "split", None, f"empty output for segment {seg.index}")
@@ -59,14 +59,15 @@ async def fetch_segment(
     return init, media
 
 
-# Recordings whose audio MP4 can't carry (their later segments go without it
-# straight away, and consistently: one init for all of them).
-_NO_AUDIO: OrderedDict[int, None] = OrderedDict()
-_AUDIO_REFUSED = re.compile(r"codec|tag", re.IGNORECASE)
+# Recordings (of which NAS, of which id) whose audio MP4 can't carry: their
+# later segments go without it straight away, and consistently (one init).
+_NO_AUDIO: OrderedDict[tuple[str, int], None] = OrderedDict()
+# ffmpeg's own words for it; not damaged input ("Could not find codec parameters").
+_AUDIO_REFUSED = re.compile(r"Could not find tag for codec|not currently supported in container", re.IGNORECASE)
 
 
-async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes:
-    if seg.recording_id not in _NO_AUDIO:
+async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float, nas: str = "") -> bytes:
+    if (nas, seg.recording_id) not in _NO_AUDIO:
         try:
             return await _run_ffmpeg(
                 ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
@@ -77,7 +78,7 @@ async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes
             if err.method != "run" or err.code is None or not _AUDIO_REFUSED.search(str(err)):
                 raise
         _LOGGER.debug("Recording %s: audio MP4 can't carry; its segments go without", seg.recording_id)
-        _NO_AUDIO[seg.recording_id] = None
+        _NO_AUDIO[(nas, seg.recording_id)] = None
         while len(_NO_AUDIO) > 256:
             _NO_AUDIO.popitem(last=False)
     return await _run_ffmpeg(

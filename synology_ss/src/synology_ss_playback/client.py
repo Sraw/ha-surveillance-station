@@ -173,6 +173,7 @@ class SurveillanceStationClient:
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"  # an IPv6 literal
         self._base = f"{'https' if use_https else 'http'}://{host}:{port}/webapi"
+        self.nas = f"{host}:{port}"  # which NAS, for per-NAS caches
         self._username = username
         self._password = password
         self._sid: str | None = None

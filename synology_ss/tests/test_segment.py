@@ -80,12 +80,29 @@ async def test_audio_refused_once_per_recording(monkeypatch: pytest.MonkeyPatch)
     assert run.await_count == 3 and "0:a:0?" not in run.await_args.args
 
 
-async def test_other_ffmpeg_failure_is_not_retried_without_audio() -> None:
+async def test_audio_refused_is_remembered_per_nas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recording ids are per NAS: one NAS's G.711 recording says nothing about another's with the same id."""
+    monkeypatch.setattr(seg_mod, "_NO_AUDIO", seg_mod.OrderedDict())
+    first, second = MagicMock(nas="a:5000"), MagicMock(nas="b:5000")
+    for c in (first, second):
+        c.download = AsyncMock(return_value=b"raw-mp4")
+    run = AsyncMock(side_effect=[_proc(1, b"", b"Could not find tag for codec pcm_alaw"), _proc(0, FMP4), _proc(0, FMP4)])
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", run):
+        await seg_mod.fetch_segment(first, _seg(), "ffmpeg")
+        await seg_mod.fetch_segment(second, _seg(), "ffmpeg")
+    assert "0:a:0?" in run.await_args.args
+
+
+@pytest.mark.parametrize(
+    "stderr", [b"Invalid data found when processing input", b"Could not find codec parameters for stream 0"]
+)
+async def test_other_ffmpeg_failure_is_not_retried_without_audio(stderr: bytes) -> None:
+    """Damaged input, even worded with "codec": an error, not a recording marked audio-less."""
     client = MagicMock()
     client.download = AsyncMock(return_value=b"raw-mp4")
-    run = AsyncMock(return_value=_proc(1, b"", b"Invalid data found when processing input"))
+    run = AsyncMock(return_value=_proc(1, b"", stderr))
     with patch.object(seg_mod.asyncio, "create_subprocess_exec", run):
-        with pytest.raises(SSError, match="Invalid data"):
+        with pytest.raises(SSError, match=stderr.decode()[:12]):
             await seg_mod.fetch_segment(client, _seg(), "ffmpeg")
     assert run.await_count == 1
 

@@ -656,7 +656,6 @@ class FrigateBridge:
             live = self._live(review)
             news = objects and live and (now - start <= FRIGATE_ANNOUNCE_MAX_AGE or review_id in self._not_yet)
             if news and not repeat:
-                self._not_yet.pop(review_id, None)
                 self._announce(
                     review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start
                 )
@@ -806,6 +805,7 @@ class FrigateBridge:
                 self._announcing_ids.discard(review_id)
             self.hass.bus.async_fire(DETECTION_EVENT, payload)
             self._counts["announced"] += 1
+            self._not_yet.pop(review_id, None)
             self._decide(review_id)
             self._save()
 
@@ -822,6 +822,10 @@ class FrigateBridge:
                 self._error(err)
                 _LOGGER.warning("Frame for detection %s not ready: %r", review_id, err)
 
+        # Not yet news told until it has fired: cut short (unloaded while
+        # waiting for the frame), it is news for the review's next message
+        # after the reload, however long the review has gone on by then.
+        self._note_not_yet(review_id)
         self._announcing_ids.add(review_id)
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")
         self._announcing.add(task)

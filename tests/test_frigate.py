@@ -381,8 +381,22 @@ async def test_unloading_doesnt_announce(hass: HomeAssistant, bridge: FrigateBri
     async with asyncio.timeout(5):
         await waiting.wait()
     bridge.stop()
+    await bridge.async_flush()
     await hass.async_block_till_done()
     assert not events
+
+    # Reloaded minutes later: the review's next message announces it after all.
+    bridge.manager.thumbnail_when_recorded = AsyncMock()
+    again = FrigateBridge(hass, bridge.entry_id, client, bridge.manager, "frigate", {"person"}, "")
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ):
+        await again.start()
+    with patch("custom_components.surveillance_station.frigate.time.time", return_value=T + 200):
+        await again.handle(review("update"))
+        await hass.async_block_till_done()
+    assert len(events) == 1
+    again.stop()
 
 
 async def test_malformed_reviews(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:

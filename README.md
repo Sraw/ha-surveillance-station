@@ -519,7 +519,9 @@ entities; there is no per-user camera permission.
   cameras with the same name.
 - The card's text is English; its times follow the HA profile's 12/24 h
   setting. Grid cells are 16:9.
-- A notification's image link stays valid for one to two days.
+- A notification's image link stays valid for one to two days. With SS
+  recording on motion, a recording starting more than ~8 s after Frigate's
+  frame leaves the notification without an image.
 - Sound is the camera's own codec, played if the browser can (AAC: all;
   Opus / MP3: most; G.711 / G.726, many cameras' default: none, in MSE); the
   Sound button says when it can't. HLS playback (browsers without MSE)
