@@ -37,7 +37,9 @@
       "cannot_connect": "Cannot reach Surveillance Station.",
       "invalid_auth": "Login rejected.",
       "no_cameras": "Logged in, but this account sees no cameras. Check its Surveillance Station privilege profile.",
-      "unknown": "Unexpected error."
+      "unknown": "Unexpected error.",
+      "unsupported": "This Surveillance Station lacks Web APIs the integration needs (the log names them). Update it to Surveillance Station 9.",
+      "otp_required": "This account needs a two-step verification code. Turn two-step verification off for this dedicated account, or exempt it from a policy that enforces it."
     },
     "abort": {
       "already_configured": "This Surveillance Station is already configured.",

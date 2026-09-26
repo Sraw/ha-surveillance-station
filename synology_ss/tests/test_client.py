@@ -481,3 +481,28 @@ async def test_logout_is_quick() -> None:
     await client.login()
     await client.logout()
     assert session.request.call_args.kwargs["timeout"].total == 5
+
+
+async def test_missing_apis() -> None:
+    """What the NAS lacks of the Web APIs used, or has only older versions of (SYNO.API.Info, no login)."""
+    from synology_ss_playback.client import REQUIRED_APIS
+
+    apis = {api: {"minVersion": 1, "maxVersion": v} for api, v in REQUIRED_APIS.items()}
+    apis["SYNO.SurveillanceStation.Event"] = {"minVersion": 1, "maxVersion": 3}  # SS too old
+    del apis["SYNO.SurveillanceStation.ThirdParty.Bookmark"]
+    apis["SYNO.SurveillanceStation.Camera"] = {"minVersion": "x"}  # odd
+    client, session = _client([_resp(body=_json({"success": True, "data": apis}))])
+    assert await client.missing_apis() == [
+        "SYNO.SurveillanceStation.Camera v9",
+        "SYNO.SurveillanceStation.Event v5",
+        "SYNO.SurveillanceStation.ThirdParty.Bookmark v1",
+    ]
+    assert session.request.call_args.args[1].endswith("/webapi/query.cgi")
+    client, _ = _client([_resp(body=_json({"success": False, "error": {"code": 102}}))])
+    with pytest.raises(SSError):
+        await client.missing_apis()
+
+
+def test_ipv6_host() -> None:
+    client = SurveillanceStationClient(MagicMock(), "fd00::5", 5001, True, "u", "p")
+    assert client._base == "https://[fd00::5]:5001/webapi"

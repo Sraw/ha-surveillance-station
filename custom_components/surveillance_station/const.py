@@ -44,6 +44,10 @@ LARGE_IMAGE_WIDTH = 1280
 LARGE_IMAGE_DISK_BYTES = 128 * 1024 * 1024
 # What a cached thumbnail costs besides its bytes, so misses (b"") count too.
 THUMBNAIL_ENTRY_BYTES = 256
+# A camera with no recording in progress and none ended this long before a
+# moment isn't being recorded then (motion-only recording): not waited for.
+# Longer than SS's gap between two files of a continuous recording.
+RECORDING_GAP_SECONDS = 60
 # "Nothing recorded then" is re-checked after this long.
 THUMBNAIL_MISS_SECONDS = 300
 # Parallel thumbnail jobs: fewer than playback's, which must not wait on them.

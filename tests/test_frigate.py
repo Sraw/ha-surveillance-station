@@ -1105,3 +1105,49 @@ async def test_kept_again_keeps_what_the_earlier_told(hass: HomeAssistant, bridg
     bridge._keep("r", review("end", rid="r", end=T + 9))
     kept = bridge._deferred["r"]
     assert (kept["type"], kept["_maybe_made"], kept["_seen_new"], kept["_failed_at"]) == ("end", True, True, T - 50)
+
+
+async def test_person_joining_a_quiet_review_is_announced(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A dog again (quiet, not announced), then a person in the same review: that is news."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await bridge.handle(review("new", objects=("dog",), rid="d2", start=T + 30))
+    await bridge.handle(review("update", objects=("dog",), rid="d2", start=T + 30))  # still only the dog
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d2", start=T + 30))
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d2", start=T + 30))  # once
+    await hass.async_block_till_done()
+    assert [(e.data["review_id"], e.data["objects"]) for e in events] == [("d1", ["Animal"]), ("d2", ["Person", "Animal"])]
+    assert bridge.stats()["not_announced"] == 1
+
+
+async def test_quiet_review_ending_quiet_is_decided(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await bridge.handle(review("new", objects=("dog",), rid="d2", start=T + 30))
+    await bridge.handle(review("end", objects=("dog",), rid="d2", start=T + 30, end=T + 60))
+    await hass.async_block_till_done()
+    assert [e.data["review_id"] for e in events] == ["d1"]
+    assert "d2" in bridge._decided and "d2" not in bridge._not_yet and bridge.stats()["not_announced"] == 1
+
+
+async def test_object_of_interest_minutes_into_a_review(hass: HomeAssistant, bridge: FrigateBridge, clock) -> None:
+    """Bicycles for five minutes, then a person: news now, though the review began long ago.
+
+    One heard of only now, long after it began (HA restarted), is not."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    clock.return_value = T + 300
+    await bridge.handle(review("update", objects=("bicycle", "person"), rid="b"))
+    await bridge.handle(review("update", objects=("person",), rid="late"))  # never seen before
+    await hass.async_block_till_done()
+    assert [e.data["review_id"] for e in events] == ["b"]
+
+
+async def test_replayed_message_is_no_news(hass: HomeAssistant, bridge: FrigateBridge, clock) -> None:
+    """Received minutes ago, handled only now (SS was down): bookmarked, not announced, even for a review seen going on."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    clock.return_value = T + 300
+    await bridge.handle({**review("update", objects=("person",), rid="b"), "_received_at": T + 100})
+    await hass.async_block_till_done()
+    assert not events and bridge.stats()["bookmarked"] == 1

@@ -37,7 +37,9 @@
       "cannot_connect": "无法连接 Surveillance Station。",
       "invalid_auth": "登录被拒绝。",
       "no_cameras": "已登录，但此账户看不到任何摄像头。请检查它的 Surveillance Station 权限配置文件。",
-      "unknown": "意外错误。"
+      "unknown": "意外错误。",
+      "unsupported": "这台 NAS 上的 Surveillance Station 太旧，缺少本集成需要的 Web API（日志里列出了缺哪些）。请更新到 Surveillance Station 9。",
+      "otp_required": "该账户需要两步验证码。请为这个专用账户关闭两步验证，或把它排除在强制两步验证的策略之外。"
     },
     "abort": {
       "already_configured": "这台 Surveillance Station 已经配置过了。",

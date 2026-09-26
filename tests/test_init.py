@@ -224,3 +224,16 @@ async def test_removing_the_last_entry_in_yaml_mode_lovelace(
         await hass.async_block_till_done()
     storage_resources.assert_called_once_with(hass)
     assert resources.async_items() == before
+
+
+def test_card_version_is_the_integrations() -> None:
+    """The card logs its version: the same as the manifest's, bumped together."""
+    import json
+    from pathlib import Path
+    import re
+
+    here = Path(__file__).parent.parent / "custom_components/surveillance_station"
+    card = (here / "frontend/ss-timeline-card.js").read_text()
+    assert re.search(r'const CARD_VERSION = "([^"]+)"', card).group(1) == json.loads(
+        (here / "manifest.json").read_text()
+    )["version"]

@@ -22,6 +22,21 @@ bookmarks (with an event to notify from).
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 
+## Requirements
+
+- **Surveillance Station 9 on DSM 7** (tested: SS 9.3, DSM 7.2). Setup checks
+  that the NAS has the Web APIs used and says so if not.
+- **Home Assistant 2026.9** or newer, with `ffmpeg` (HA's own image has it).
+- A dedicated DSM account without two-step verification (setup says so if
+  DSM asks it for a code; exempt it from a policy that enforces 2FA).
+- For playback in the browser: H.265 decoding if the cameras record H.265
+  (see *Known limitations*); audio plays when it is AAC.
+- NAS, HA and the viewing devices on NTP: the card lines up SS's frame times
+  with the device's clock, and "live" means within a few seconds of it.
+- Cameras with a **1-second I-frame interval** (GOP = frame rate) for exact
+  seeks and notification frames; SS cuts at keyframes, so a longer GOP
+  makes both up to one GOP early.
+
 ## Install
 
 1. Create a dedicated DSM user for HA. It needs Surveillance Station access
@@ -212,7 +227,8 @@ How it works:
   added; **people never**): no event for a review whose kinds are all quiet
   ones seen on the same camera within it, the dog that wandered off and came
   back; it is still bookmarked. A person, or a kind not seen lately, is
-  always announced: a second person arriving is exactly what to hear about.
+  always announced: a second person arriving is exactly what to hear about,
+  also when they join the quiet review later.
   Frigate's own `review.*.cutoff_time` decides when an absence splits a
   review in the first place (alerts 40 s, detections 30 s by default). Here
   detections (dogs, cats) are at 120 s; alerts (people, cars) stay at 40 s,
@@ -223,9 +239,11 @@ How it works:
   "Car". Normally that is its first message; if that one failed, a later
   one (even its `end`). Which reviews were announced is kept across
   restarts (with the quiet period), so a review going on over a restart is
-  announced neither twice nor never. One bookmarked more than 2 minutes
-  after it began (SS was unreachable, HA was down) gets its bookmark but no
-  event: the notification would be old news.
+  announced neither twice nor never. One first heard of more than 2
+  minutes after it began (HA was down), or whose message waited more than 2
+  minutes for SS, gets its bookmark but no event: the notification would be
+  old news. A review seen going on without being news (only bicycles, or a
+  quiet dog) is announced when it becomes news, however long it has lasted.
 - Anyone who can publish to Frigate's topic on the broker can make
   bookmarks (and pick the moment whose frame is signed into the event); the
   broker is expected to require a login, as Frigate's does.
@@ -485,6 +503,24 @@ entities; there is no per-user camera permission.
 - Each camera in a grid is a stream from the NAS to the browser (via HA) at
   full recording quality: a 4-camera grid of 4K H.265 needs a device that
   decodes four of them at once, and at 4-8x a multiple of that.
+
+- Scale: a grid opens on the first four cameras unless the card names
+  them (`cameras:`); each cell is its camera's full-quality stream from the
+  NAS through HA, and HA relays at most 16 at once (all viewers together).
+  Mind the viewing device's decoders and HA's network with more.
+- The card lists all bookmarks every 15 s while open (SS's time filter for
+  them doesn't work): with tens of thousands of bookmarks that gets slow.
+- The card's layout choices (cameras, grid, span) are remembered per
+  browser, shared by all cards in it.
+- One Frigate instance per NAS (one MQTT topic prefix per entry).
+- Not tried: CMS recording servers (cameras on another NAS), Archive Vault
+  and camera-edge (SD card) recordings, disabled cameras (not shown), two
+  cameras with the same name.
+- The card's text is English; its times follow the HA profile's 12/24 h
+  setting. Grid cells are 16:9.
+- A notification's image link stays valid for one to two days.
+- Audio other than AAC (G.711 / G.726) is not played; HLS playback (browsers
+  without MSE) leaves it out.
 
 ## ffmpeg / browser traps found while building this
 

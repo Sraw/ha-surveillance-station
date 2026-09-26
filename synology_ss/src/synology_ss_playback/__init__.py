@@ -1,6 +1,7 @@
 """Play back Synology Surveillance Station recordings as HLS."""
 
 from .client import (
+    OTP_ERRORS,
     Bookmark,
     Camera,
     RecordingInfo,
@@ -22,6 +23,7 @@ from .vod import (
 )
 
 __all__ = [
+    "OTP_ERRORS",
     "Bookmark",
     "Camera",
     "Recording",

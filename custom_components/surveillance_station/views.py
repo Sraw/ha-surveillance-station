@@ -65,6 +65,7 @@ from .const import (
     MAX_LIVE_STREAMS,
     MAX_PARALLEL_FETCHES,
     MAX_PARALLEL_THUMBNAILS,
+    RECORDING_GAP_SECONDS,
     SEGMENT_CACHE_BYTES,
     THUMBNAIL_CACHE_BYTES,
     THUMBNAIL_DISK_BYTES,
@@ -300,10 +301,14 @@ class VodManager:
         while True:
             client = self.client(entry_id)
             try:
-                if client is not None and any(
-                    r.start <= ts and r.end >= ts + 1 for r in await client.recordings(camera_id, ts - 1, ts + 1)
-                ):
-                    return await self.thumbnail(entry_id, camera_id, ts, width)
+                if client is not None:
+                    recordings = await client.recordings(camera_id, ts - RECORDING_GAP_SECONDS, ts + 1)
+                    if any(r.start <= ts and r.end >= ts + 1 for r in recordings):
+                        return await self.thumbnail(entry_id, camera_id, ts, width)
+                    if not any(r.live or r.end >= ts - RECORDING_GAP_SECONDS for r in recordings):
+                        # SS isn't recording this camera (motion-only, or
+                        # not at all): nothing to wait for.
+                        return None
             except SSError:
                 pass
             if _monotonic() + THUMBNAIL_POLL_SECONDS > deadline:

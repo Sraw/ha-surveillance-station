@@ -160,6 +160,11 @@ class FrigateBridge:
         # news). Kept across restarts with _last_seen, so a review that goes
         # on over a restart is neither announced twice nor never.
         self._decided: OrderedDict[str, None] = OrderedDict()
+        # Reviews seen live but not announceable yet (none of the chosen
+        # objects yet, or only quiet kinds): a later message that makes them
+        # news is announced then, however long ago they began. With the
+        # kinds kept quiet in them: those stay quiet for that review.
+        self._not_yet: OrderedDict[str, frozenset[str]] = OrderedDict()
         self._store: Store[dict[str, Any]] = Store(hass, 1, store_key(entry_id))
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
         self._cameras_by_name: dict[str, tuple[int, str]] = {}  # SS name -> (SS id, SS name)
@@ -373,6 +378,7 @@ class FrigateBridge:
         if not (isinstance(review, dict) and isinstance(review.get("after"), dict)):
             return
         self._counts["messages"] += 1
+        review[_RECEIVED_AT] = time.time()
         self._last_message = time.time()
         key = str(review["after"].get("id") or "") or f"_{self._counts['messages']}"
         # A review's newer message replaces what of it waits anywhere,
@@ -577,6 +583,8 @@ class FrigateBridge:
         tracked = self._tracked.get(review_id)
         if tracked is None and not objects:
             self._ignore("no_objects")  # none of the chosen objects (yet)
+            if self._live(review):
+                self._note_not_yet(review_id)
             return
         camera = await self._camera(str(after.get("camera") or ""))
         if camera is None:
@@ -611,7 +619,10 @@ class FrigateBridge:
             t, by = self._last_seen.get((camera_id, kind), (-math.inf, ""))
             return by != review_id and now - t < self.quiet
 
-        repeat = bool(objects) and all(k in self.quiet_kinds and seen_lately(k) for k in kinds(objects))
+        silenced = self._not_yet.get(review_id, frozenset())
+        repeat = bool(objects) and all(
+            k in silenced or (k in self.quiet_kinds and seen_lately(k)) for k in kinds(objects)
+        )
         if tracked is None:
             bm = await self.client.create_bookmark(camera_id, name, start, end, comment)
             self._ok()
@@ -630,17 +641,32 @@ class FrigateBridge:
             # after it began (HA was down, SS unreachable) it is old news.
             # Decided for good only once the event has fired: one cut short
             # (unload, restart) is tried again by the review's next message.
-            if objects and now - start <= FRIGATE_ANNOUNCE_MAX_AGE and not repeat:
+            # News: a message received just now (not one replayed after an
+            # outage) of a review that began lately, or that we saw going on
+            # without being news until now (a person joining a quiet dog's
+            # review, or appearing minutes into one of bicycles).
+            live = self._live(review)
+            news = objects and live and (now - start <= FRIGATE_ANNOUNCE_MAX_AGE or review_id in self._not_yet)
+            if news and not repeat:
+                self._not_yet.pop(review_id, None)
                 self._announce(
                     review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start
                 )
+            elif news and kind != "end":
+                # Only quiet kinds seen lately: not now, but a later message
+                # adding another kind is news. Counted once.
+                if review_id not in self._not_yet:
+                    self._counts["not_announced"] += 1
+                self._note_not_yet(review_id, kinds(objects))
             else:
+                if review_id not in self._not_yet:
+                    self._counts["not_announced"] += 1
+                self._not_yet.pop(review_id, None)
                 self._decide(review_id)
-                self._counts["not_announced"] += 1
         # Bookmarked: its kinds count as seen here (still going on: now;
         # ended: when last active; one replayed long after: when it began,
         # not now, or it would silence what happens now).
-        active = ended or (now if now - start <= FRIGATE_ANNOUNCE_MAX_AGE else float(start))
+        active = ended or (now if self._live(review) else float(start))
         for k in kinds(objects):
             last = self._last_seen.get((camera_id, k))
             if last is None or active >= last[0]:
@@ -661,6 +687,16 @@ class FrigateBridge:
             self._forget_bookmarks = True
         else:
             self.manager.forget_bookmarks(self.entry_id)
+
+    def _live(self, review: dict[str, Any]) -> bool:
+        """Received just now, not replayed after an outage (a message handled directly: now)."""
+        return time.time() - review.get(_RECEIVED_AT, time.time()) <= FRIGATE_ANNOUNCE_MAX_AGE
+
+    def _note_not_yet(self, review_id: str, quiet: list[str] | None = None) -> None:
+        self._not_yet[review_id] = self._not_yet.get(review_id, frozenset()) | frozenset(quiet or ())
+        self._not_yet.move_to_end(review_id)
+        while len(self._not_yet) > FRIGATE_TRACKED_MAX:
+            self._not_yet.popitem(last=False)
 
     def _decide(self, review_id: str) -> None:
         self._decided[review_id] = None
@@ -869,6 +905,7 @@ _SEEN_NEW = "_seen_new"
 # Set on a message whose try failed: its bookmark may exist all the same.
 _MAYBE_MADE = "_maybe_made"
 _FAILED_AT = "_failed_at"  # when it first failed (epoch), for giving up after a day
+_RECEIVED_AT = "_received_at"  # when the message came (epoch): a replay of an old one is no news
 
 
 _TRANSIENT_CODES = frozenset({None, 100, 102, 103, 104, 106, 107, 119, 407})

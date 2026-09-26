@@ -391,8 +391,11 @@ async def test_thumbnail_when_recorded(hass: HomeAssistant, setup_integration: M
 
 
 async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client) -> None:
+    """SS recording, but never getting that far: waited for until the deadline."""
     manager = hass.data[DATA_MANAGER]
-    mock_client.recordings = AsyncMock(return_value=[])
+    mock_client.recordings = AsyncMock(
+        return_value=[RecordingInfo(id=1, camera_id=6, start=T0 - 100, end=T0 - 5, mount_id=1, live=True, hevc=True)]
+    )
     clock = iter(range(0, 1000, 3))
     with (
         patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
@@ -400,6 +403,23 @@ async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integ
     ):
         assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
     assert 3 <= mock_client.recordings.await_count <= 8
+
+
+@pytest.mark.parametrize(
+    "recordings",
+    [
+        [],  # not recorded at all
+        [RecordingInfo(id=1, camera_id=6, start=T0 - 900, end=T0 - 300, mount_id=1, live=False, hevc=True)],  # motion-only, over
+    ],
+)
+async def test_thumbnail_when_not_recording(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client, recordings
+) -> None:
+    """SS isn't recording the camera then: nothing to wait for (a notification isn't held for it)."""
+    mock_client.recordings = AsyncMock(return_value=recordings)
+    with patch.object(views, "THUMBNAIL_POLL_SECONDS", 0):
+        assert await hass.data[DATA_MANAGER].thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
+    assert mock_client.recordings.await_count == 1
 
 
 async def test_large_image(

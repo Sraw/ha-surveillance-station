@@ -43,6 +43,7 @@ def mock_client() -> Generator[MagicMock]:
     """The SurveillanceStationClient both the flow and the entry create."""
     client = MagicMock()
     client.login = AsyncMock()
+    client.missing_apis = AsyncMock(return_value=[])
     client.logout = AsyncMock()
     client.info = AsyncMock(return_value=SSInfo(serial=SERIAL, hostname="The-NAS", version="9.3.0-12143", timezone="US/Pacific"))
     client.cameras = AsyncMock(

@@ -36,9 +36,12 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.10.0";
+const CARD_VERSION = "0.12.0";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
+// Cameras a grid opens on when the card names none: each is a full-quality
+// stream from the NAS through HA to the browser (more are a chip away).
+const DEFAULT_GRID_MAX = 4;
 
 const SPANS = [
   [900, "15m"],
@@ -147,8 +150,26 @@ const prefs = {
   },
 };
 
+// 12 or 24 h, as the user's HA profile says (hass.locale.time_format:
+// "12", "24", "language" or "system").
+let hour12 = false;
+function setTimeFormat(locale) {
+  const f = locale?.time_format;
+  if (f === "12" || f === "24") hour12 = f === "12";
+  else {
+    const lang = f === "system" ? undefined : locale?.language;
+    hour12 = Boolean(new Intl.DateTimeFormat(lang, { hour: "numeric" }).resolvedOptions().hour12);
+  }
+}
 function fmtTime(t, seconds = true) {
   const d = new Date(t * 1000);
+  if (hour12) {
+    const h = d.getHours() % 12 || 12;
+    return `${h}:${pad(d.getMinutes())}${seconds ? ":" + pad(d.getSeconds()) : ""} ${d.getHours() < 12 ? "AM" : "PM"}`;
+  }
+  return isoTime(d, seconds);
+}
+function isoTime(d, seconds = true) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? ":" + pad(d.getSeconds()) : ""}`;
 }
 function fmtDate(t) {
@@ -188,7 +209,7 @@ function fmtDur(s) {
 }
 function toLocalInput(t) {
   const d = new Date(t * 1000);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${fmtTime(t)}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${isoTime(d)}`;
 }
 function hevcSupport() {
   const MS = window.ManagedMediaSource || window.MediaSource;
@@ -980,7 +1001,9 @@ class StreamFeed {
     if (head.close) return this.end("closed");
     if (head.vdoCodec || head.adoCodec) {
       // First, and again whenever SS opens another recording file (new init segments follow).
-      if (head.vdoCodec && !/^(H26[45]|AVC1)$/i.test(head.vdoCodec)) return this.end("codec", head.vdoCodec);
+      // Anything but (M)JPEG is checked against the browser on its moov: SS's
+      // names for H.264/H.265 variants aren't all known.
+      if (head.vdoCodec && /JPEG/i.test(head.vdoCodec)) return this.end("codec", head.vdoCodec);
       this.audioCodecOk = /^(MPEG4-GENERIC|MP4A-LATM)$/i.test(head.adoCodec ?? ""); // AAC
       return;
     }
@@ -1711,6 +1734,7 @@ class Player {
     };
     if (why === "codec") {
       this.streamFailed = true;
+      if (/^(hev1|hvc1)/.test(detail ?? "")) this.card._noHevc();
       this.setStatus("This browser can't decode this camera's video", "error", detail ?? "", retry);
       return;
     }
@@ -2014,6 +2038,7 @@ class SSTimelineCard extends HTMLElement {
       if (this.isConnected) hass.connection?.addEventListener?.("ready", this._onReconnect);
     }
     this._hass = hass;
+    setTimeFormat(hass.locale);
     if (first && this.isConnected) this._init();
   }
 
@@ -2151,7 +2176,18 @@ class SSTimelineCard extends HTMLElement {
     if (!ids.length && Array.isArray(this._config.cameras)) {
       ids = this._config.cameras.map((x) => this._findCamera(x)?.id).filter((id) => id != null);
     }
-    return { cameras: ids.length ? ids : this._cameras.map((c) => c.id), grid: grid ?? this._config.view !== "single" };
+    return {
+      cameras: ids.length ? ids : this._cameras.slice(0, DEFAULT_GRID_MAX).map((c) => c.id),
+      grid: grid ?? this._config.view !== "single",
+    };
+  }
+
+  /** A camera turned out to be H.265 and this browser can't decode it: say why (once), not before. */
+  _noHevc() {
+    const warn = this.shadowRoot?.querySelector(".warn");
+    if (warn && !warn.textContent && hevcSupport() === false) {
+      warn.textContent = "This browser can't decode H.265 (HEVC), which these cameras record in. Chrome or Edge with hardware decoding, Safari, and the Home Assistant apps can.";
+    }
   }
 
   _cameraName(id) {
@@ -2261,10 +2297,6 @@ class SSTimelineCard extends HTMLElement {
     this._jumpBox = $(".jump:not(.shows)");
     this._showsBox = $(".shows");
 
-    if (hevcSupport() === false) {
-      $(".warn").textContent =
-        "This browser reports no H.265 (HEVC) support; playback of Surveillance Station recordings will likely fail here.";
-    }
 
     root.querySelector("ha-card").addEventListener("click", (e) => this._onClick(e));
     $(".speed").addEventListener("change", (e) => {
@@ -3223,7 +3255,8 @@ class SSTimelineCard extends HTMLElement {
 // scoped-registry polyfill), a definition would land in the wrong registry,
 // so wait for the frontend's root element and define on the current one.
 async function register() {
-  await window.customElements.whenDefined("home-assistant");
+  // hc-main on Home Assistant Cast (a Chromecast / Nest Hub showing a dashboard).
+  await Promise.race(["home-assistant", "hc-main"].map((tag) => window.customElements.whenDefined(tag)));
   const registry = window.customElements;
   if (registry.get(CARD_TAG)) return;
   registry.define(CARD_TAG, SSTimelineCard);

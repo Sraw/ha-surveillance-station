@@ -12,6 +12,7 @@ import logging
 from typing import Any
 
 from synology_ss_playback import (
+    OTP_ERRORS,
     SSAuthError,
     SSConnectionError,
     SSError,
@@ -107,11 +108,14 @@ class SurveillanceStationConfigFlow(ConfigFlow, domain=DOMAIN):
             data[CONF_PASSWORD],
         )
         try:
+            if missing := await client.missing_apis():
+                _LOGGER.warning("Surveillance Station lacks what this integration needs: %s", ", ".join(missing))
+                return None, "unsupported"
             await client.login()
             info = await client.info()
             cameras = await client.cameras()
-        except SSAuthError:
-            return None, "invalid_auth"
+        except SSAuthError as err:
+            return None, "otp_required" if err.code in OTP_ERRORS else "invalid_auth"
         except SSConnectionError:
             return None, "cannot_connect"
         except SSError:

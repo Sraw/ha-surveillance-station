@@ -58,8 +58,20 @@ async def fetch_segment(
 
 
 async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes:
+    try:
+        return await _run_ffmpeg(
+            ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
+        )
+    except SSError as err:
+        if err.method != "run" or err.code is None:
+            raise
+    # ffmpeg refused: most likely an audio codec MP4 can't carry (G.711,
+    # G.726: many cameras' default). The video without it rather than nothing.
+    _LOGGER.debug("Remux of segment %s failed; again without audio", seg.index)
     return await _run_ffmpeg(
-        ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
+        ffmpeg, raw,
+        lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc, audio=False),
+        timeout,
     )
 
 

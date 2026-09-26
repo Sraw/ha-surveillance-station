@@ -33,6 +33,8 @@ async def test_user_flow(hass: HomeAssistant, mock_client: MagicMock) -> None:
     ("side_effect", "error"),
     [
         (SSAuthError("SYNO.API.Auth", "login", 400), "invalid_auth"),
+        (SSAuthError("SYNO.API.Auth", "login", 403), "otp_required"),
+        (SSAuthError("SYNO.API.Auth", "login", 406), "otp_required"),
         (SSConnectionError("SYNO.API.Auth", "login", None), "cannot_connect"),
         (SSError("SYNO.API.Auth", "login", 119), "unknown"),
     ],
@@ -49,6 +51,15 @@ async def test_user_flow_errors_recover(
     mock_client.login.side_effect = None
     result = await hass.config_entries.flow.async_configure(result["flow_id"], USER_INPUT)
     assert result["type"] is FlowResultType.CREATE_ENTRY
+
+
+async def test_user_flow_old_surveillance_station(hass: HomeAssistant, mock_client: MagicMock) -> None:
+    """An SS without the Web APIs used: said at setup (before logging in), not as failures later."""
+    mock_client.missing_apis.return_value = ["SYNO.SurveillanceStation.Event v5"]
+    result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], USER_INPUT)
+    assert result["errors"] == {"base": "unsupported"}
+    mock_client.login.assert_not_awaited()
 
 
 async def test_user_flow_no_cameras(hass: HomeAssistant, mock_client: MagicMock) -> None:

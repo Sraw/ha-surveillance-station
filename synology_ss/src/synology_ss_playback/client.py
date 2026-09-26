@@ -52,6 +52,18 @@ BLOCKED_SECONDS = 60
 # enough to recover from a refusal that was not about the password, far
 # below DSM's auto-block threshold (10 failures in 5 minutes by default).
 AUTH_RETRY_SECONDS = 1800
+# DSM's codes for "this account needs a two-step verification code".
+OTP_ERRORS = {403, 404, 406}
+# The Web APIs (and the versions) this client calls: an older Surveillance
+# Station lacks some, see missing_apis().
+REQUIRED_APIS = {
+    "SYNO.API.Auth": 6,
+    "SYNO.SurveillanceStation.Info": 8,
+    "SYNO.SurveillanceStation.Camera": 9,
+    "SYNO.SurveillanceStation.Event": 5,
+    "SYNO.SurveillanceStation.Recording": 6,
+    "SYNO.SurveillanceStation.ThirdParty.Bookmark": 1,
+}
 VIDEO_CODEC_H265 = 6
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
@@ -94,6 +106,8 @@ class SSError(Exception):
 
     def __init__(self, api: str, method: str, code: int | None, detail: Any = None) -> None:
         super().__init__(f"{api}.{method} failed: code={code} {detail or ''}".strip())
+        self.api = api
+        self.method = method
         self.code = code
 
 
@@ -156,6 +170,8 @@ class SurveillanceStationClient:
         password: str,
     ) -> None:
         self._session = session
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"  # an IPv6 literal
         self._base = f"{'https' if use_https else 'http'}://{host}:{port}/webapi"
         self._username = username
         self._password = password
@@ -347,6 +363,24 @@ class SurveillanceStationClient:
                 continue
             raise SSError(api, method, code, data.get("error"))
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def missing_apis(self) -> list[str]:
+        """The Web APIs this client needs that the NAS lacks, or has only in older versions (no login needed)."""
+        data = await self._raw_json(
+            "query.cgi", {"api": "SYNO.API.Info", "method": "query", "version": 1, "query": ",".join(REQUIRED_APIS)}
+        )
+        apis = data.get("data") if data.get("success") else None
+        if not isinstance(apis, dict):
+            raise SSError("SYNO.API.Info", "query", _error_code(data), "unexpected reply")
+        missing = []
+        for api, version in REQUIRED_APIS.items():
+            try:
+                ok = int(apis[api]["minVersion"]) <= version <= int(apis[api]["maxVersion"])
+            except _BAD_ITEM:
+                ok = False
+            if not ok:
+                missing.append(f"{api} v{version}")
+        return missing
 
     async def info(self) -> SSInfo:
         data = await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)

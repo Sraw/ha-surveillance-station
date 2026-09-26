@@ -226,7 +226,7 @@ def split_fmp4(data: bytes) -> tuple[bytes, bytes]:
 
 
 def ffmpeg_remux_args(
-    ffmpeg: str, src: str, duration: float, media_start: float, hevc: bool = True
+    ffmpeg: str, src: str, duration: float, media_start: float, hevc: bool = True, audio: bool = True
 ) -> list[str]:
     """ffmpeg command: stream-copy one cut into fragmented MP4 on stdout.
 
@@ -249,8 +249,7 @@ def ffmpeg_remux_args(
         src,
         "-map",
         "0:v:0",
-        "-map",
-        "0:a:0?",
+        *(["-map", "0:a:0?"] if audio else []),
         "-t",
         f"{duration:.3f}",
         "-c",
