@@ -30,7 +30,8 @@ bookmarks (with an event to notify from).
 - A dedicated DSM account without two-step verification (setup says so if
   DSM asks it for a code; exempt it from a policy that enforces 2FA).
 - For playback in the browser: H.265 decoding if the cameras record H.265
-  (see *Known limitations*); audio plays when it is AAC.
+  (see *Known limitations*); sound plays in whatever codec the camera sends
+  that the browser can play (AAC everywhere).
 - NAS, HA and the viewing devices on NTP: the card lines up SS's frame times
   with the device's clock, and "live" means within a few seconds of it.
 - Cameras with a **1-second I-frame interval** (GOP = frame rate) for exact
@@ -519,8 +520,10 @@ entities; there is no per-user camera permission.
 - The card's text is English; its times follow the HA profile's 12/24 h
   setting. Grid cells are 16:9.
 - A notification's image link stays valid for one to two days.
-- Audio other than AAC (G.711 / G.726) is not played; HLS playback (browsers
-  without MSE) leaves it out.
+- Sound is the camera's own codec, played if the browser can (AAC: all;
+  Opus / MP3: most; G.711 / G.726, many cameras' default: none, in MSE); the
+  Sound button says when it can't. HLS playback (browsers without MSE)
+  leaves out audio MP4 can't carry.
 
 ## ffmpeg / browser traps found while building this
 

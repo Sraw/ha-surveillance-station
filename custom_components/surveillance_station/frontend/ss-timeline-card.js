@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.12.0";
+const CARD_VERSION = "0.12.1";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -652,6 +652,35 @@ function codecOf(moov) {
   return null;
 }
 
+/** RFC 6381 codec string of an audio init segment's sample entry (AAC's object type from its esds). */
+function audioCodecOf(moov) {
+  const i = findBox(moov, "stsd");
+  if (i < 0) return "mp4a.40.2";
+  const entry = String.fromCharCode(...moov.subarray(i + 16, i + 20));
+  const named = { Opus: "opus", fLaC: "flac", "ac-3": "ac-3", "ec-3": "ec-3", ".mp3": "mp3", ulaw: "ulaw", alaw: "alaw" };
+  if (named[entry]) return named[entry];
+  if (entry !== "mp4a") return entry.trim();
+  // esds: ES_Descriptor (3) > DecoderConfigDescriptor (4): object type, then
+  // DecoderSpecificInfo (5): AAC's audio object type in its first 5 bits.
+  const e = findBox(moov, "esds");
+  if (e < 0) return "mp4a.40.2";
+  let k = e + 8; // past "esds" and version/flags
+  const descriptor = (tag) => {
+    while (k < moov.length && moov[k] !== tag) k++;
+    k++;
+    while (k < moov.length && moov[k] & 0x80) k++; // the length's continuation bytes
+    return ++k < moov.length;
+  };
+  if (!descriptor(0x03)) return "mp4a.40.2";
+  k += 3; // ES_ID, flags
+  if (!descriptor(0x04)) return "mp4a.40.2";
+  const oti = moov[k];
+  if (oti !== 0x40) return `mp4a.${oti.toString(16).padStart(2, "0")}`;
+  k += 13; // object type, stream type, buffer size, bitrates
+  const aot = descriptor(0x05) ? moov[k] >> 3 : 2;
+  return `mp4a.40.${aot || 2}`;
+}
+
 /**
  * One MediaSource + SourceBuffer fed fragment by fragment.
  * onAppended(meta): a fragment pushed with meta is in the buffer.
@@ -897,6 +926,7 @@ class Track {
 class StreamFeed {
   constructor(player, url, { at = null, speed = 1, onStart, onLanded, onEnd }) {
     this.player = player;
+    player.audioUnplayable = null; // until this stream's audio says otherwise
     this.video = player.video;
     this.live = at == null;
     this.speed = this.live ? 1 : speed;
@@ -917,7 +947,6 @@ class StreamFeed {
     this.paceAfter = 0; // until then (a speed change settling) pace is taken as 1
     this.audio = null;
     this.audioInit = null;
-    this.audioCodecOk = true;
     this.track = new Track(this.video, {
       onAppended: (meta, start, end) => this.appended(meta, start, end),
       onError: () => this.end("error"),
@@ -1004,7 +1033,6 @@ class StreamFeed {
       // Anything but (M)JPEG is checked against the browser on its moov: SS's
       // names for H.264/H.265 variants aren't all known.
       if (head.vdoCodec && /JPEG/i.test(head.vdoCodec)) return this.end("codec", head.vdoCodec);
-      this.audioCodecOk = /^(MPEG4-GENERIC|MP4A-LATM)$/i.test(head.adoCodec ?? ""); // AAC
       return;
     }
     const video = head.mediaType === "1";
@@ -1174,7 +1202,7 @@ class StreamFeed {
 
   /** Sound on (the master, unmuted, at 1x) or off. */
   setAudio(on) {
-    if (on && !this.audio && this.audioCodecOk) this.startAudio();
+    if (on && !this.audio && !this.player.audioUnplayable) this.startAudio();
     if (!on && this.audio) this.stopAudio();
   }
 
@@ -1207,8 +1235,16 @@ class StreamFeed {
     const a = this.audio;
     if (!a || a.inited) return;
     a.inited = true;
-    const mime = 'audio/mp4; codecs="mp4a.40.2"';
-    const ok = MSE.isTypeSupported(mime) && (await a.track.sink.init(this.audioInit, mime));
+    // Whatever the camera sends: the browser says whether it can play it.
+    const codec = audioCodecOf(this.audioInit[1]);
+    const mime = `audio/mp4; codecs="${codec}"`;
+    if (!MSE.isTypeSupported(mime)) {
+      this.player.audioUnplayable = codec;
+      this.player.card._syncMuteIcon();
+      if (this.audio === a) this.stopAudio();
+      return;
+    }
+    const ok = await a.track.sink.init(this.audioInit, mime);
     if (!ok && this.audio === a) this.stopAudio();
   }
 
@@ -2612,7 +2648,12 @@ class SSTimelineCard extends HTMLElement {
 
   _syncMuteIcon() {
     const muted = !this._master || this._master.video.muted;
-    this.shadowRoot.querySelector('[data-act="mute"] ha-icon')?.setAttribute("icon", muted ? "mdi:volume-off" : "mdi:volume-high");
+    const unplayable = this._master?.audioUnplayable;
+    const button = this.shadowRoot.querySelector('[data-act="mute"]');
+    button?.querySelector("ha-icon")?.setAttribute(
+      "icon", unplayable && !muted ? "mdi:volume-variant-off" : muted ? "mdi:volume-off" : "mdi:volume-high"
+    );
+    button?.setAttribute("title", unplayable ? `Sound: this browser can't play this camera's audio (${unplayable})` : "Sound");
   }
 
   _applyShows() {
