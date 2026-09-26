@@ -45,7 +45,7 @@ import re
 import time
 from typing import Any
 
-from synology_ss_playback import SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
+from synology_ss_playback import Camera, SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
 
 from homeassistant.components import mqtt
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
@@ -90,7 +90,8 @@ _REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9._-]{1,64})\]")
 
 
 def camera_key(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    """A camera name without case, spaces or punctuation (letters of any script kept)."""
+    return re.sub(r"[\W_]", "", name.casefold())
 
 
 def _rank(label: str) -> tuple[int, str]:
@@ -148,10 +149,8 @@ class FrigateBridge:
         self.objects = objects
         self.link = link
         self.quiet = quiet_minutes * 60
-        # Frigate camera -> SS camera (both as camera_key), where the names differ.
-        self._aliases = {
-            camera_key(f): camera_key(ss) for ss, frigate in (cameras or {}).items() for f in frigate_names(frigate)
-        }
+        # Frigate camera (as camera_key) -> SS camera (its exact name), where the names differ.
+        self._aliases = {camera_key(f): ss for ss, frigate in (cameras or {}).items() for f in frigate_names(frigate)}
         # Never "Person", whatever is passed.
         self.quiet_kinds = (quiet_kinds or set()) & set(FRIGATE_QUIET_KINDS)
         # (SS camera id, kind) -> when that kind was last active on that
@@ -163,6 +162,7 @@ class FrigateBridge:
         self._decided: OrderedDict[str, None] = OrderedDict()
         self._store: Store[dict[str, Any]] = Store(hass, 1, store_key(entry_id))
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
+        self._cameras_by_name: dict[str, tuple[int, str]] = {}  # SS name -> (SS id, SS name)
         self._cameras_at = -math.inf
         self._unknown: set[str] = set()  # Frigate cameras warned about
         self._tracked: OrderedDict[str, _Tracked] = OrderedDict()
@@ -267,6 +267,9 @@ class FrigateBridge:
             for key, review in stored.get("deferred") or []:
                 if isinstance(review, dict) and isinstance(review.get("after"), dict):
                     review.setdefault(_FAILED_AT, now)
+                    # Kept by a delayed save: it may have been bookmarked
+                    # after it (HA died before the next), so look first.
+                    review[_MAYBE_MADE] = True
                     self._deferred[str(key)] = review
         except (ValueError, TypeError, AttributeError, HomeAssistantError):
             _LOGGER.warning("Ignoring unreadable Frigate state %s", store_key(self.entry_id))
@@ -691,15 +694,20 @@ class FrigateBridge:
 
     async def _camera(self, frigate_camera: str) -> tuple[int, str] | None:
         key = camera_key(frigate_camera)
-        key = self._aliases.get(key, key)
+
+        def lookup() -> tuple[int, str] | None:
+            if (name := self._aliases.get(key)) is not None:  # mapped in the options: that SS camera exactly
+                return self._cameras_by_name.get(name)
+            return self._cameras.get(key)
+
         age = _monotonic() - self._cameras_at
         # Listed again at most once a minute for a camera not there (added or
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
-        if age > FRIGATE_CAMERAS_TTL or (key not in self._cameras and age > 60):
+        if age > FRIGATE_CAMERAS_TTL or (lookup() is None and age > 60):
             self._cameras_at = _monotonic()
-            self._cameras = {camera_key(c.name): (c.id, c.name) for c in await self.client.cameras()}
-        if (found := self._cameras.get(key)) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
+            self._set_cameras(await self.client.cameras())
+        if (found := lookup()) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
             self._unknown.add(frigate_camera)
             _LOGGER.warning(
                 "Frigate camera %r matches no Surveillance Station camera by name (map it in the integration's"
@@ -707,6 +715,10 @@ class FrigateBridge:
                 frigate_camera,
             )
         return found
+
+    def _set_cameras(self, cameras: list[Camera]) -> None:
+        self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
+        self._cameras_by_name = {c.name: (c.id, c.name) for c in cameras}
 
     def _announce(
         self,
@@ -799,8 +811,8 @@ class FrigateBridge:
             self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
         problems = {
             "frigate_mqtt": not self._subscribed and lasting(self._started_at),
-            # Refusals: of more than one review (one camera disabled in SS
-            # overnight is not "bookmarks failing").
+            # Refusals: of more than one review (a single review refused,
+            # nothing after it, is not "bookmarks failing").
             "frigate_failing": lasting(self._failing_since)
             or (lasting(self._rejected_since) and len(self._rejected) > 1),
             "frigate_offline": lasting(self._frigate_offline_since),
@@ -832,7 +844,7 @@ class FrigateBridge:
         except SSError as err:
             self._bookmark_error = str(err)[:300]
         else:
-            self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
+            self._set_cameras(cameras)
             self._cameras_at = _monotonic()
             self._ok(bookmark=False)  # SS answers; says nothing about refusals
         finally:

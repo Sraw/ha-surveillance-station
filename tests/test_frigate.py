@@ -89,6 +89,7 @@ def bridge(hass: HomeAssistant, setup_integration: MockConfigEntry, client: Magi
 def test_names() -> None:
     assert camera_key("drive_way") == camera_key("Drive Way") == "driveway"
     assert camera_key("BackyardPath") == camera_key("backyard_path")
+    assert camera_key("前门 (外)") == "前门外" != camera_key("后院")  # any script
     assert bookmark_name(["car", "person", "car", "license_plate"]) == "Car, Person, License plate"
     assert bookmark_name(["dog", "person", "cat", "bird"]) == "Animal, Person"
     assert bookmark_name([]) == "Detection"
@@ -287,7 +288,7 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
     assert result["errors"] == {"base": "duplicate_camera"}
     with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)) as start:
         result = await hass.config_entries.options.async_configure(
-            flow["flow_id"], {"Backyard": " back_yard , garden,", "Drive Way": " "}
+            flow["flow_id"], {"Backyard": " back_yard , garden, Garden,", "Drive Way": " "}  # a name twice: once
         )
         await hass.async_block_till_done()
     assert result["type"] == "create_entry"
@@ -301,17 +302,24 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         CONF_FRIGATE_CAMERAS: {"Backyard": "back_yard, garden"},
     }
     start.assert_awaited_once()  # reloaded with the bridge on
-    assert hass.data[DATA_FRIGATE][setup_integration.entry_id]._aliases == {"backyard": "backyard", "garden": "backyard"}
+    assert hass.data[DATA_FRIGATE][setup_integration.entry_id]._aliases == {"backyard": "Backyard", "garden": "Backyard"}
 
 
-@pytest.mark.parametrize("frigate", [True, False])
+@pytest.mark.parametrize("case", ["frigate_off", "ss_down", "not_loaded"])
 async def test_options_without_the_camera_step(
-    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, frigate: bool
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, case: str
 ) -> None:
-    """Frigate off, or SS not answering: saved at once, the mapping kept as it was."""
+    """Frigate off, SS not answering, or the entry not loaded: saved at once, the mapping kept as it was."""
     hass.config_entries.async_update_entry(setup_integration, options={CONF_FRIGATE_CAMERAS: {"Backyard": "garden"}})
     await hass.async_block_till_done()
-    mock_client.cameras.side_effect = SSConnectionError("x", "List", None)
+    frigate = case != "frigate_off"
+    if case == "ss_down":
+        mock_client.cameras.side_effect = SSConnectionError("x", "List", None)
+    elif case == "not_loaded":
+        assert await hass.config_entries.async_unload(setup_integration.entry_id)
+        if hasattr(setup_integration, "runtime_data"):
+            del setup_integration.runtime_data
+    before = mock_client.cameras.await_count
     flow = await hass.config_entries.options.async_init(setup_integration.entry_id)
     with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)):
         result = await hass.config_entries.options.async_configure(
@@ -320,6 +328,7 @@ async def test_options_without_the_camera_step(
         await hass.async_block_till_done()
     assert result["type"] == "create_entry"
     assert setup_integration.options[CONF_FRIGATE_CAMERAS] == {"Backyard": "garden"}
+    assert mock_client.cameras.await_count - before == (1 if case == "ss_down" else 0)  # asked only when it can answer
 
 
 async def test_better_frame_later(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
@@ -982,15 +991,20 @@ async def test_overflow_keeps_the_canary_and_the_dropped(hass: HomeAssistant, br
 
 async def test_mapped_camera(hass: HomeAssistant, setup_integration: MockConfigEntry, client: MagicMock) -> None:
     """A Frigate camera named otherwise than its SS camera: bookmarked on the one the options map it to."""
-    client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=12, name="前门", enabled=True)]
+    client.cameras.return_value = [
+        Camera(id=6, name="Drive Way", enabled=True), Camera(id=12, name="前门", enabled=True),
+        Camera(id=13, name="后院", enabled=True), Camera(id=14, name="Garage", enabled=True),
+        Camera(id=15, name="garage", enabled=True),
+    ]
     mapped = FrigateBridge(
         hass, setup_integration.entry_id, client, hass.data[DATA_MANAGER], "frigate", {"person"}, "",
-        cameras={"前门": "front_door, porch"},
+        cameras={"前门": "front_door, porch", "后院": "back_yard", "Garage": "garage"},
     )
     mapped.manager.thumbnail_when_recorded = AsyncMock(return_value=b"jpg")
-    await mapped.handle(review("new", camera="porch", rid="p"))
-    await mapped.handle(review("new", camera="drive_way", rid="d"))  # the others still by name
-    assert [c.args[0] for c in client.create_bookmark.await_args_list] == [12, 6]
+    for rid, camera in (("p", "porch"), ("b", "back_yard"), ("d", "drive_way"), ("g", "garage")):
+        await mapped.handle(review("new", camera=camera, rid=rid))
+    # Mapped: that SS camera exactly (not another whose name reduces alike); the others still by name.
+    assert [c.args[0] for c in client.create_bookmark.await_args_list] == [12, 13, 6, 14]
     await hass.async_block_till_done()
 
 
@@ -1066,6 +1080,7 @@ async def test_stored_without_a_date_expires_a_day_after_start(hass: HomeAssista
         assert await bridge.start()
     key, loaded = next(iter(bridge._pending.items()))  # tried at once, the canary
     assert key == bridge._canary_key == "r" and loaded["_failed_at"] == T + 2
+    assert loaded["_maybe_made"]  # saved while it waited: it may have been bookmarked after
     bridge._keep(*bridge._pending.popitem())
     with patch("custom_components.surveillance_station.frigate.time.time", return_value=T + 2 + 86401):
         bridge._check_health()
@@ -1082,3 +1097,11 @@ async def test_canary_mark_cleared_once_tried(hass: HomeAssistant, bridge: Friga
             await asyncio.sleep(0.01)
     assert client.create_bookmark.await_count == 1 and bridge._current is None
     bridge.stop()
+
+
+async def test_kept_again_keeps_what_the_earlier_told(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A review deferred twice: the later message, still known new and maybe bookmarked, dated from the first failure."""
+    bridge._keep("r", {**review("new", rid="r"), "_maybe_made": True, "_seen_new": True, "_failed_at": T - 50})
+    bridge._keep("r", review("end", rid="r", end=T + 9))
+    kept = bridge._deferred["r"]
+    assert (kept["type"], kept["_maybe_made"], kept["_seen_new"], kept["_failed_at"]) == ("end", True, True, T - 50)

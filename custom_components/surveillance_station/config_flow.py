@@ -32,7 +32,6 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
 )
 
-from .frigate import camera_key, frigate_names
 from .const import (
     CONF_FRIGATE,
     CONF_FRIGATE_CAMERAS,
@@ -50,6 +49,7 @@ from .const import (
     DEFAULT_PORT,
     DOMAIN,
 )
+from .frigate import camera_key, frigate_names
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -237,7 +237,8 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
             mapping = {
                 name: ", ".join(names)
                 for name in self._cameras
-                if (names := frigate_names(user_input.get(name, "")))
+                # A name entered twice for the same camera: once.
+                if (names := list({camera_key(n): n for n in reversed(frigate_names(user_input.get(name, "")))}.values())[::-1])
             }
             listed = [camera_key(n) for names in mapping.values() for n in frigate_names(names)]
             if len(listed) != len(set(listed)):

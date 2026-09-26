@@ -35,7 +35,7 @@ blueprint:
           custom_value: true
     severities:
       name: Severities
-      description: Frigate's review severity.
+      description: Frigate's review severity. Empty for all.
       default: [alert, detection]
       selector:
         select:
@@ -68,7 +68,7 @@ conditions:
   - condition: template
     value_template: "{{ not objects or detection.objects | select('in', objects) | list | count > 0 }}"
   - condition: template
-    value_template: "{{ detection.severity in severities }}"
+    value_template: "{{ not severities or detection.severity in severities }}"
 
 actions:
   - device_id: !input notify_device
@@ -76,11 +76,9 @@ actions:
     type: notify
     title: "{{ detection.objects | join(', ') }} at {{ detection.camera }}"
     message: "{{ detection.start | timestamp_custom(time_format) }}"
-    data:
-      image: "{{ detection.image }}"
-      # Android: clickAction; iOS: url. Without a dashboard path, the app opens.
-      clickAction: "{{ detection.url or '' }}"
-      url: "{{ detection.url or '' }}"
-      # One notification per review (a later one for it replaces it).
-      tag: "{{ detection.review_id }}"
-      group: surveillance_station
+    # The frame; one notification per review (a later one for it replaces
+    # it); and the link (Android: clickAction, iOS: url), left out without a
+    # dashboard path: tapping then opens the app.
+    data: >-
+      {% set d = {'image': detection.image, 'tag': detection.review_id, 'group': 'surveillance_station'} %}
+      {{ dict(d, clickAction=detection.url, url=detection.url) if detection.url else d }}

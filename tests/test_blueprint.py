@@ -84,15 +84,22 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
         detection(camera="Backyard"),  # another camera
         detection(objects=["Animal"]),  # other objects
         detection(url=None, review_id="r2", objects=["Car", "Person"]),
+        detection(review_id="r3", severity="detection"),
     ):
         hass.bus.async_fire(DETECTION_EVENT, data)
         await hass.async_block_till_done()
-    assert len(sent) == 1
+    assert len(sent) == 2
     call = sent[0].data
     assert call["title"] == "Car, Person at Drive Way"
     assert call["message"] == "14:13:20"
     assert call["target"] == "hook"
     assert call["data"] == {
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
-        "clickAction": "", "url": "", "tag": "r2", "group": "surveillance_station",
+        "tag": "r2", "group": "surveillance_station",  # no link: tapping opens the app
+    }
+    assert sent[1].data["data"] == {
+        "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
+        "tag": "r3", "group": "surveillance_station",
+        "clickAction": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
+        "url": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
     }
