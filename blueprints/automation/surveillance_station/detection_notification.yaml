@@ -41,6 +41,14 @@ blueprint:
         select:
           options: [alert, detection]
           multiple: true
+    channel:
+      name: Android notification channel
+      description: >-
+        Its sound and importance are set on the phone (Android only; created
+        on the first notification).
+      default: Detections
+      selector:
+        text:
     time_format:
       name: Time format
       description: strftime format of the time in the message.
@@ -60,6 +68,7 @@ variables:
   objects: !input objects
   severities: !input severities
   time_format: !input time_format
+  channel: !input channel
   detection: "{{ trigger.event.data }}"
 
 conditions:
@@ -77,8 +86,12 @@ actions:
     title: "{{ detection.objects | join(', ') }} at {{ detection.camera }}"
     message: "{{ detection.start | timestamp_custom(time_format) }}"
     # The frame; one notification per review (a later one for it replaces
-    # it); and the link (Android: clickAction, iOS: url), left out without a
-    # dashboard path: tapping then opens the app.
+    # it); Android's channel and icon; and the link (Android: clickAction,
+    # iOS: url), left out without a dashboard path: tapping then opens the app.
     data: >-
-      {% set d = {'image': detection.image, 'tag': detection.review_id, 'group': 'surveillance_station'} %}
+      {% set o = detection.objects %}
+      {% set d = {'image': detection.image, 'tag': detection.review_id, 'group': 'surveillance_station',
+                  'channel': channel,
+                  'notification_icon': 'mdi:walk' if 'Person' in o else 'mdi:car' if 'Car' in o
+                                       else 'mdi:paw' if 'Animal' in o else 'mdi:cctv'} %}
       {{ dict(d, clickAction=detection.url, url=detection.url) if detection.url else d }}

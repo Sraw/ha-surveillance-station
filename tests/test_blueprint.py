@@ -95,11 +95,12 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
     assert call["target"] == "hook"
     assert call["data"] == {
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
-        "tag": "r2", "group": "surveillance_station",  # no link: tapping opens the app
+        "tag": "r2", "group": "surveillance_station", "channel": "Detections", "notification_icon": "mdi:walk",
+        # no link: tapping opens the app
     }
     assert sent[1].data["data"] == {
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
-        "tag": "r3", "group": "surveillance_station",
+        "tag": "r3", "group": "surveillance_station", "channel": "Detections", "notification_icon": "mdi:walk",
         "clickAction": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
         "url": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
     }

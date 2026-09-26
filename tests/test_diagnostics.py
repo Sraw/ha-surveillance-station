@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.diagnostics import get_diagnostics_for_config_entry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
-from synology_ss_playback import SSError
+from synology_ss_playback import SSConnectionError, SSError
 
 from custom_components.surveillance_station.const import CONF_FRIGATE, CONF_FRIGATE_TOPIC, DOMAIN
 from homeassistant.core import HomeAssistant
@@ -53,3 +53,16 @@ async def test_diagnostics_when_surveillance_station_is_unreachable(
     diag = await get_diagnostics_for_config_entry(hass, hass_client, setup_integration)
     assert "error" in diag["surveillance_station"]
     assert "119" in diag["surveillance_station"]["error"]
+
+
+async def test_diagnostics_of_an_entry_not_loaded(
+    hass: HomeAssistant, mock_config_entry: MockConfigEntry, mock_client, hass_client: ClientSessionGenerator
+) -> None:
+    """Setup retrying (a new entry, the NAS unreachable): diagnostics say so rather than fail."""
+    entry = MockConfigEntry(domain=DOMAIN, data=mock_config_entry.data)  # its NAS not known yet
+    entry.add_to_hass(hass)
+    mock_client.login.side_effect = SSConnectionError("x", "Login", None)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    diag = await get_diagnostics_for_config_entry(hass, hass_client, entry)
+    assert diag["surveillance_station"] == {"error": "entry not loaded (setup_retry)"}
+    assert diag["frigate"] is None

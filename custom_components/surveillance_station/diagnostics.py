@@ -21,15 +21,19 @@ TO_REDACT = {CONF_HOST, CONF_PASSWORD, CONF_USERNAME, "serial", "unique_id"}
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: SurveillanceStationConfigEntry
 ) -> dict[str, Any]:
-    client = entry.runtime_data
     surveillance_station: dict[str, Any]
-    try:
-        surveillance_station = {
-            "info": asdict(await client.info()),
-            "cameras": [asdict(c) for c in await client.cameras()],
-        }
-    except SSError as err:
-        surveillance_station = {"error": str(err)}
+    # Not loaded (setup failed or retrying): exactly when diagnostics are
+    # wanted, so they say that rather than fail.
+    if (client := getattr(entry, "runtime_data", None)) is None:
+        surveillance_station = {"error": f"entry not loaded ({entry.state.value})"}
+    else:
+        try:
+            surveillance_station = {
+                "info": asdict(await client.info()),
+                "cameras": [asdict(c) for c in await client.cameras()],
+            }
+        except SSError as err:
+            surveillance_station = {"error": str(err)}
     return async_redact_data(
         {
             "entry": {"unique_id": entry.unique_id, "data": dict(entry.data)},
