@@ -22,6 +22,8 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     BOOKMARK_PAGE_MAX,
+    FRIGATE_SEARCH_MAX,
+    KIND_CHIPS_MAX,
     DOMAIN,
     LIVE_END_STALE_SECONDS,
     LIVE_URL,
@@ -30,17 +32,21 @@ from .const import (
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
+from .frigate import DATA_FRIGATE
+from .frigate_api import FrigateAPIError
+from .search import search
 from .views import DATA_MANAGER, VodManager, VodSession
 
 # A window whose end is at least this close to now becomes a live session.
 LIVE_THRESHOLD_SECONDS = 60
 
 ERR_SS = "surveillance_station_error"
+ERR_FRIGATE = "frigate_error"
 
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_live, ws_vod, ws_vod_runs):
+    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_search, ws_live, ws_vod, ws_vod_runs):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -88,6 +94,10 @@ async def _run(
         # SSError text is built from API names and SS error codes only.
         connection.send_error(msg["id"], ERR_SS, str(err))
         return
+    except FrigateAPIError as err:
+        # Ours too: a path, a status, Frigate's own message.
+        connection.send_error(msg["id"], ERR_FRIGATE, str(err))
+        return
     if entry_id or (entry_id := _first_entry_id(hass)):
         manager.track(entry_id, None)
     connection.send_result(msg["id"], result)
@@ -105,9 +115,12 @@ def _first_entry_id(hass: HomeAssistant) -> str | None:
 async def ws_cameras(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
+        bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
         return {
             "entry_id": entry_id,
             "cameras": [{"id": c.id, "name": c.name, "enabled": c.enabled} for c in await client.cameras()],
+            # Frigate's smart search can be asked (its URL is in the options).
+            "search": bridge is not None and bridge.api is not None,
         }
 
     await _run(hass, connection, msg, go())
@@ -191,6 +204,9 @@ async def ws_bookmarks(hass: HomeAssistant, connection: websocket_api.ActiveConn
         vol.Inclusive("before", "cursor"): vol.Coerce(int),
         vol.Inclusive("before_id", "cursor"): vol.Coerce(int),
         vol.Optional("limit", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=BOOKMARK_PAGE_MAX)),
+        # Only bookmarks of these kinds ("Person", "Car": the parts of a name
+        # like "Person, Car", ignoring case). Omitted or empty: all.
+        vol.Optional("kinds"): [str],
     }
 )
 @websocket_api.async_response
@@ -206,9 +222,9 @@ async def ws_bookmark_page(
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
         cams = msg.get("camera_ids")
-        matching = [
-            b for b in await _manager(hass).bookmarks(entry_id, client) if cams is None or b.camera_id in cams
-        ]
+        shown = [b for b in await _manager(hass).bookmarks(entry_id, client) if cams is None or b.camera_id in cams]
+        wanted = {k.strip().casefold() for k in msg.get("kinds") or [] if k.strip()}
+        matching = [b for b in shown if not wanted or wanted & {k.casefold() for k in name_kinds(b.name)}]
         if "before" in msg:
             cursor = (msg["before"], msg["before_id"])
             rest = [b for b in matching if (b.start, b.id) < cursor]
@@ -218,11 +234,57 @@ async def ws_bookmark_page(
         return {
             "total": len(matching),
             "more": len(rest) > len(page),
+            "kinds": _kind_counts(shown),
             "bookmarks": [
                 _bookmark(b, _manager(hass).sign_thumbnail(entry_id, b.camera_id, _manager(hass).frame(entry_id, b)))
                 for b in page
             ],
         }
+
+    await _run(hass, connection, msg, go())
+
+
+def name_kinds(name: str) -> list[str]:
+    """What a bookmark's name says was seen: "Person, Car" is Person and Car."""
+    return [k.strip() for k in name.split(",") if k.strip()]
+
+
+def _kind_counts(bookmarks: list[Bookmark]) -> list[list[Any]]:
+    """The kinds to filter the event list by: those of more than one bookmark
+    (a hand-made bookmark's own name is no kind), most common first."""
+    counts: dict[str, int] = {}
+    for b in bookmarks:
+        for k in name_kinds(b.name):
+            counts[k] = counts.get(k, 0) + 1
+    common = sorted((kc for kc in counts.items() if kc[1] > 1), key=lambda kc: (-kc[1], kc[0]))
+    return [[k, n] for k, n in common[:KIND_CHIPS_MAX]]
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "surveillance_station/search",
+        vol.Optional("entry_id"): str,
+        vol.Exclusive("query", "by"): vol.All(str, vol.Length(min=1, max=200)),
+        vol.Exclusive("bookmark_id", "by"): vol.Coerce(int),
+        vol.Optional("camera_ids"): [vol.Coerce(int)],
+        vol.Optional("limit", default=30): vol.All(vol.Coerce(int), vol.Range(min=1, max=FRIGATE_SEARCH_MAX)),
+    }
+)
+@websocket_api.async_response
+async def ws_search(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """Frigate's smart search (words, or "similar to" a bookmark), results placed on SS."""
+
+    async def go():
+        entry_id, _ = _client(hass, msg.get("entry_id"))
+        bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
+        if bridge is None:
+            raise ValueError("smart search needs Frigate detections turned on in the integration's options")
+        results = await search(
+            _manager(hass), entry_id, bridge,
+            query=msg.get("query"), bookmark_id=msg.get("bookmark_id"),
+            camera_ids=msg.get("camera_ids"), limit=msg["limit"],
+        )
+        return {"results": results}
 
     await _run(hass, connection, msg, go())
 

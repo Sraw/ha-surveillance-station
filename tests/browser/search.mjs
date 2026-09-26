@@ -1,0 +1,65 @@
+// Kind chips narrow the list and the pins; Frigate's smart search (words,
+// "similar to" a bookmark) lists results that play from SS.
+import { open, sleep } from "./harness.mjs";
+const { browser, page, ev } = await open({ prefs: { cameras: [6, 7, 10, 11], grid: true } });
+const fail = [];
+const check = (ok, what) => { console.log(ok ? "ok  " : "FAIL", what); if (!ok) fail.push(what); };
+await sleep(6000);
+const rows = () => ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items .ev")].map((b) => b.querySelector(".n").textContent));
+const state = () => ev((c) => ({
+  search: !c.shadowRoot.querySelector(".ev-search").hidden,
+  chips: [...c.shadowRoot.querySelectorAll(".ev-kinds button")].map((b) => b.textContent.trim()),
+  pins: c.shadowRoot.querySelectorAll(".bars .bm").length,
+  foot: c.shadowRoot.querySelector(".ev-foot").textContent,
+  sims: c.shadowRoot.querySelectorAll(".ev-items .sim").length,
+}));
+let s = await state();
+console.log("start:", JSON.stringify(s), (await rows()).slice(0, 5));
+check(s.search, "search box shown (Frigate URL set)");
+check(s.chips.length >= 2, "kind chips shown");
+check(s.sims > 0, "similar buttons on Frigate bookmarks");
+const pins0 = s.pins;
+
+// Only cars.
+await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-kinds button")].find((b) => b.dataset.kind === "Car").click());
+await sleep(2500);
+const cars = await rows();
+s = await state();
+console.log("Car only:", cars.slice(0, 6), "pins", pins0, "->", s.pins);
+check(cars.length > 0 && cars.every((n) => n.split(", ").includes("Car")), "list is only bookmarks with Car");
+check(s.pins <= pins0, "pins narrowed");
+await ev((c) => c.shadowRoot.querySelector('.ev-kinds button[data-kind="Car"]').click());
+await sleep(2000);
+
+// Words.
+await ev((c) => { const i = c.shadowRoot.querySelector(".ev-search input"); i.value = "white car"; i.form.requestSubmit(); });
+for (let i = 0; i < 20 && (await ev((c) => c._search?.loading)); i++) await sleep(500);
+const found = await ev((c) => c._search.items.map((r) => `${r.name}|${c._cameraName(r.camera_id)}|${new Date(r.start * 1000).toLocaleString()}|bm=${r.bookmark_id}`));
+console.log("white car:", found.slice(0, 6), "error:", await ev((c) => c._search.error));
+check(found.length > 0, "search found results");
+await sleep(3000);
+const imgs = await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items img")].slice(0, 5).map((i) => i.naturalWidth));
+console.log("thumbnail widths:", imgs);
+check(imgs.length > 0 && imgs.every((w) => w > 0), "result thumbnails load");
+await page.screenshot({ path: "search-results.png" });
+
+// Tap the first: plays that camera from 3 s before.
+const first = await ev((c) => c._search.items[0]);
+await ev((c) => c.shadowRoot.querySelector(".ev-items .ev").click());
+await sleep(5000);
+const at = await ev((c) => ({ cam: c._master.cameraId, wall: c._master.wall() }));
+console.log("played:", at.cam, "at", (at.wall - first.start).toFixed(1), "s from the result's start");
+check(at.cam === first.camera_id && Math.abs(at.wall - first.start) < 8, "result plays its camera near its time");
+
+// Back, then "similar" on a bookmark.
+await ev((c) => c.shadowRoot.querySelector('[data-act="search-close"]').click());
+await sleep(1500);
+check(!(await ev((c) => c._search)), "closing the search goes back to the bookmarks");
+await ev((c) => c.shadowRoot.querySelector(".ev-items .sim").click());
+for (let i = 0; i < 20 && (await ev((c) => c._search?.loading)); i++) await sleep(500);
+const sim = await ev((c) => ({ label: c.shadowRoot.querySelector(".ev-sq .t").textContent, n: c._search.items.length, err: c._search.error }));
+console.log("similar:", JSON.stringify(sim));
+check(sim.n > 0 && !sim.err, "similar to a bookmark finds results");
+await page.screenshot({ path: "search-similar.png" });
+console.log(fail.length ? `FAILED: ${fail.join("; ")}` : "PASS");
+await browser.close(); process.exit(fail.length ? 1 : 0);

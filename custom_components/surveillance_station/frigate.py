@@ -73,6 +73,9 @@ from .const import (
     FRIGATE_DECIDED_MAX,
     FRIGATE_DEFERRED_MAX_AGE,
     FRIGATE_EVENT_WAIT_SECONDS,
+    FRIGATE_IMAGE_BACKOFF_SECONDS,
+    FRIGATE_IMAGE_BUDGET_SECONDS,
+    FRIGATE_IMAGE_FALLBACK_SECONDS,
     FRIGATE_IMAGE_URL,
     FRIGATE_HEALTH_INTERVAL,
     FRIGATE_ISSUE_AFTER_SECONDS,
@@ -96,7 +99,12 @@ DATA_FRIGATE: HassKey[dict[str, FrigateBridge]] = HassKey(f"{DOMAIN}_frigate")
 # Patchable in tests (time.monotonic itself is the event loop's clock).
 _monotonic = time.monotonic
 
-_REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9._-]{1,64})\]")
+_REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]")
+
+
+def review_id_of(comment: str | None) -> str | None:
+    """The Frigate review a bookmark was made for (its comment names it)."""
+    return m.group(1) if (m := _REVIEW_ID.search(comment or "")) else None
 
 
 def camera_key(name: str) -> str:
@@ -228,8 +236,12 @@ class FrigateBridge:
         self._counts = {
             "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
             "announced": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
-            "images_frigate": 0, "images_ss": 0,
+            "images_frigate": 0, "images_ss": 0, "images_no_snapshot": 0,
         }
+        # Frigate's images: not asked again until then after a failure; its
+        # last error (apart from the bookmarks' last_error).
+        self._image_down_until = -math.inf
+        self._image_error: tuple[float, str] | None = None
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
         self._last_error: tuple[float, str] | None = None
@@ -262,6 +274,7 @@ class FrigateBridge:
             "issues": sorted(self._issues),
             "last_message": at(self._last_message),
             "last_error": self._last_error and {"at": at(self._last_error[0]), "error": self._last_error[1]},
+            "last_image_error": self._image_error and {"at": at(self._image_error[0]), "error": self._image_error[1]},
         }
 
     def _ignore(self, reason: str) -> None:
@@ -868,24 +881,60 @@ class FrigateBridge:
             return None
         review = await self.api.json(f"/api/review/{review_id}")
         data = review.get("data") if isinstance(review, dict) else None
-        ids = [i for i in _strings((data or {}).get("detections")) if FRIGATE_ID.fullmatch(i)]
-        found = await asyncio.gather(*(self.api.json(f"/api/events/{i}") for i in ids[:16]), return_exceptions=True)
-        if ids and all(isinstance(f, BaseException) for f in found):
-            raise FrigateAPIError(f"/api/events: {found[0]}")
-        events = [
-            e for e in found
-            if isinstance(e, dict) and e.get("label") in self.objects and e.get("has_snapshot")
+        ids = [i for i in _strings(data.get("detections") if isinstance(data, dict) else None) if FRIGATE_ID.fullmatch(i)]
+        ids = ids[:16]
+        found = await asyncio.gather(*(self.api.json(f"/api/events/{i}") for i in ids), return_exceptions=True)
+        # Not in Frigate's database yet: an object is written there a moment
+        # after it's first seen (once it has a snapshot), while its snapshot
+        # is served from memory already.
+        unwritten = [i for i, f in zip(ids, found, strict=True) if isinstance(f, FrigateAPIError) and f.status == 404]
+        if ids and all(isinstance(f, BaseException) for f in found) and not unwritten:
+            raise next((f for f in found if isinstance(f, FrigateAPIError)), FrigateAPIError("/api/events: no answer"))
+        best = self.foremost([e for e in found if isinstance(e, dict) and e.get("has_snapshot")])
+        if best is not None:
+            return await self.api.image(f"/api/events/{best['id']}/snapshot.jpg", {"bbox": 1, "quality": 90})
+        for i in unwritten:
+            try:
+                return await self.api.image(f"/api/events/{i}/snapshot.jpg", {"bbox": 1, "quality": 90})
+            except FrigateAPIError as err:
+                if err.status != 404:
+                    raise
+        return None
+
+    def foremost(self, events: list[Any]) -> dict[str, Any] | None:
+        """Of Frigate's tracked objects, the foremost chosen one: a person, a car, an animal; then the surest."""
+        chosen = [
+            e for e in events
+            if isinstance(e, dict) and isinstance(e.get("label"), str) and e["label"] in self.objects
             and FRIGATE_ID.fullmatch(str(e.get("id")))
         ]
-        if not events:
-            return None
-        best = min(events, key=lambda e: (_rank(str(e["label"])), -_score(e)))
-        return await self.api.image(f"/api/events/{best['id']}/snapshot.jpg", {"bbox": 1, "quality": 90})
+        return min(chosen, key=lambda e: (_rank(str(e["label"])), -_score(e)), default=None)
 
-    def count_image(self, frigate: bool, err: FrigateAPIError | None = None) -> None:
-        self._counts["images_frigate" if frigate else "images_ss"] += 1
-        if err is not None:
-            self._error(err)
+    async def ss_camera(self, frigate_camera: str) -> tuple[int, str] | None:
+        """The SS camera (id, name) a Frigate camera is, as its reviews are bookmarked on."""
+        return await self._camera(frigate_camera)
+
+    def image_from_frigate(self) -> bool:
+        """Whether to ask Frigate for an image now (it has an API, and didn't fail just now)."""
+        return self.api is not None and _monotonic() >= self._image_down_until
+
+    def count_image(self, frigate: bool, err: Exception | None = None) -> None:
+        """How an image went: Frigate's; SS's for want of a snapshot; SS's because Frigate failed (err)."""
+        if frigate:
+            self._counts["images_frigate"] += 1
+            if self._image_down_until > -math.inf:
+                _LOGGER.info("Frigate gives notification images again")
+            self._image_down_until = -math.inf
+            return
+        self._counts["images_ss"] += 1
+        if err is None:
+            self._counts["images_no_snapshot"] += 1
+            return
+        text = str(err) if isinstance(err, FrigateAPIError) else f"{type(err).__name__}: {str(err)[:200]}"
+        self._image_error = (time.time(), text)
+        if self._image_down_until == -math.inf:
+            _LOGGER.warning("No notification image from Frigate (%s); using Surveillance Station's frames for now", text)
+        self._image_down_until = _monotonic() + FRIGATE_IMAGE_BACKOFF_SECONDS
 
     def _url(self, camera_id: int, start: int) -> str | None:
         if not self.link:
@@ -990,7 +1039,7 @@ class FrigateImageView(HomeAssistantView):
     """
 
     requires_auth = False
-    url = FRIGATE_IMAGE_URL + r"/{entry_id}/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9._-]{1,64}}.jpg"
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.jpg"
     name = "api:surveillance_station:frigate_image"
 
     def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
@@ -1003,12 +1052,14 @@ class FrigateImageView(HomeAssistantView):
         if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
             raise web.HTTPNotFound()
         bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
-        if bridge is not None:
-            failed: FrigateAPIError | None = None
+        if bridge is not None and bridge.image_from_frigate():
+            failed: Exception | None = None
             try:
-                found = await bridge.review_image(review_id)
-            except FrigateAPIError as err:
-                _LOGGER.debug("Frigate snapshot for %s: %s", review_id, err)
+                # One budget for all of Frigate's requests: the phone is waiting.
+                async with asyncio.timeout(FRIGATE_IMAGE_BUDGET_SECONDS):
+                    found = await bridge.review_image(review_id)
+            except Exception as err:  # noqa: BLE001 - whatever Frigate did, SS's frame instead
+                _LOGGER.debug("Frigate snapshot for %s: %r", review_id, err)
                 found, failed = None, err
             if found is not None:
                 bridge.count_image(True)
@@ -1016,11 +1067,14 @@ class FrigateImageView(HomeAssistantView):
                 # It may get better while the review goes on; a phone fetches it once.
                 return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=60"})
             bridge.count_image(False, failed)
-        # No Frigate (unloaded, unreachable) or no snapshot: SS's frame of the moment.
+        # No Frigate (unloaded, unreachable, failing) or no snapshot: SS's frame of the moment.
         try:
-            jpg = await self.manager.thumbnail_when_recorded(
-                entry_id, int(camera_id), int(frame), FRIGATE_EVENT_WAIT_SECONDS, LARGE_IMAGE_WIDTH
-            )
+            async with asyncio.timeout(FRIGATE_IMAGE_FALLBACK_SECONDS):
+                jpg = await self.manager.thumbnail_when_recorded(
+                    entry_id, int(camera_id), int(frame), FRIGATE_IMAGE_FALLBACK_SECONDS - 5, LARGE_IMAGE_WIDTH
+                )
+        except TimeoutError:
+            raise web.HTTPGatewayTimeout() from None
         except SSError as err:
             _LOGGER.debug("Frame %s@%s failed: %s", camera_id, frame, err)
             raise web.HTTPBadGateway() from None
@@ -1064,3 +1118,30 @@ def _compact(review: dict[str, Any]) -> dict[str, Any]:
             "data": {k: data.get(k) for k in ("objects", "zones", "thumb_time")},
         },
     }
+
+
+class FrigateObjectView(HomeAssistantView):
+    """A tracked object's thumbnail from Frigate (a smart search result's), signed like the rest."""
+
+    requires_auth = False
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/object/{event_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.webp"
+    name = "api:surveillance_station:frigate_object"
+
+    def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
+        self.hass = hass
+        self.manager = manager
+
+    async def get(self, request: web.Request, entry_id: str, event_id: str) -> web.Response:
+        if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
+            raise web.HTTPNotFound()
+        bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
+        if bridge is None or bridge.api is None:
+            raise web.HTTPNotFound()
+        try:
+            body, content_type = await bridge.api.image(f"/api/events/{event_id}/thumbnail.webp")
+        except FrigateAPIError as err:
+            _LOGGER.debug("Frigate thumbnail %s: %s", event_id, err)
+            # Gone (Frigate's retention): as a missing thumbnail; else Frigate is the trouble.
+            raise (web.HTTPNotFound() if err.status == 404 else web.HTTPBadGateway()) from None
+        # A finished object's thumbnail doesn't change.
+        return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=86400"})

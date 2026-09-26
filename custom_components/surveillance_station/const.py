@@ -99,9 +99,21 @@ FRIGATE_EVENT_WAIT_SECONDS = 20
 # review's first moment (the object just coming into view, a cat taken for a
 # person before the person arrives) is rarely it.
 FRIGATE_SNAPSHOT_SETTLE_SECONDS = 3
-# Frigate's API answers within this, or the image falls back to SS's frame.
+# Frigate's API answers a request within this.
 FRIGATE_API_TIMEOUT = 10
+# A notification's image: Frigate's snapshot within this (all its requests
+# together), else SS's frame within the rest; a phone waits ~30 s at most.
+FRIGATE_IMAGE_BUDGET_SECONDS = 5
+FRIGATE_IMAGE_FALLBACK_SECONDS = 18
+# After Frigate failed to give an image, SS's frame straight away for this long.
+FRIGATE_IMAGE_BACKOFF_SECONDS = 60
 FRIGATE_IMAGE_URL = "/api/surveillance_station/frigate_image"
+# Smart search (Frigate's semantic search): results asked of Frigate, and
+# at most this many shown (one per review).
+FRIGATE_SEARCH_ASK = 100
+FRIGATE_SEARCH_MAX = 50
+# Kinds offered to filter the event list by, at most.
+KIND_CHIPS_MAX = 8
 FRIGATE_TRACKED_MAX = 256  # reviews in progress remembered
 FRIGATE_QUEUE_MAX = 1000  # reviews waiting for SS; the oldest are dropped beyond
 # A review bookmarked later than this after it began (SS was unreachable, HA

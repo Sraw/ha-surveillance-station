@@ -46,7 +46,7 @@ from .const import (
     DOMAIN,
     STATIC_URL,
 )
-from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, store_key as frigate_store_key
+from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, FrigateObjectView, store_key as frigate_store_key
 from .frigate_api import FrigateAPI
 from .views import (
     DATA_MANAGER,
@@ -80,6 +80,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     for view in (VodPlaylistView, VodInitView, VodSegmentView, ThumbnailView, LargeImageView, LiveStreamView):
         hass.http.register_view(view(manager))
     hass.http.register_view(FrigateImageView(hass, manager))
+    hass.http.register_view(FrigateObjectView(hass, manager))
     websocket.async_register(hass)
     await hass.http.async_register_static_paths(
         [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), False)]

@@ -22,6 +22,8 @@ from .test_frigate import T, review
 
 F = "http://frigate:5000"
 RID = "1790000000.1-abc"
+JPG = b"\xff\xd8\xff\xe0snap"
+WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 "
 
 
 def event(eid: str, label: str, score: float, snapshot: bool = True) -> dict:
@@ -64,12 +66,13 @@ async def test_foremost_object_snapshot(bridge: FrigateBridge, aioclient_mock: A
     mock_review(aioclient_mock, [
         event("e1", "car", 0.97), event("e2", "person", 0.71), event("e3", "person", 0.88),
         event("e4", "person", 0.99, snapshot=False), event("e5", "bicycle", 0.99),
-    ], extra_ids=["../../etc"])
-    aioclient_mock.get(f"{F}/api/events/e3/snapshot.jpg", content=b"snap", headers={"Content-Type": "image/jpeg"})
-    assert await bridge.review_image(RID) == (b"snap", "image/jpeg")
+    ], extra_ids=["../../etc", "..", "."])
+    aioclient_mock.get(f"{F}/api/events/e3/snapshot.jpg", content=JPG)
+    assert await bridge.review_image(RID) == (JPG, "image/jpeg")
     snap = aioclient_mock.mock_calls[-1]
     assert str(snap[1]).startswith(f"{F}/api/events/e3/snapshot.jpg") and snap[1].query == {"bbox": "1", "quality": "90"}
-    assert not any("etc" in str(c[1]) for c in aioclient_mock.mock_calls)  # not an id: never in a path
+    # Not ids: never in a path (a URL takes ".." as a step up).
+    assert [str(c[1]).split("/api/")[1] for c in aioclient_mock.mock_calls[1:-1]] == [f"events/e{i}" for i in range(1, 6)]
 
 
 async def test_no_snapshot_or_no_answer(bridge: FrigateBridge, aioclient_mock: AiohttpClientMocker) -> None:
@@ -94,7 +97,7 @@ async def test_api_errors(hass: HomeAssistant, aioclient_mock: AiohttpClientMock
     aioclient_mock.get(f"{F}/c", exc=asyncio.TimeoutError())
     with pytest.raises(FrigateAPIError, match="not JSON"):
         await api.json("/a")
-    with pytest.raises(FrigateAPIError, match="not an image"):
+    with pytest.raises(FrigateAPIError, match="not a JPEG or WebP"):
         await api.image("/b")
     with pytest.raises(FrigateAPIError, match="TimeoutError"):
         await api.json("/c")
@@ -113,27 +116,43 @@ async def test_announced_with_frigate_image(hass: HomeAssistant, bridge: Frigate
 
     http = await hass_client_no_auth()
     mock_review(aioclient_mock, [event("e1", "person", 0.9)])
-    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", content=b"snap", headers={"Content-Type": "image/jpeg"})
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", content=JPG)
     resp = await http.get(image)
-    assert resp.status == 200 and await resp.read() == b"snap"
+    assert resp.status == 200 and await resp.read() == JPG and resp.content_type == "image/jpeg"
     assert (await http.get(image.split("?")[0] + "?exp=1&sig=x")).status == 404  # unsigned
+    # A good signature doesn't open another review's, camera's or moment's image.
+    path, query = image.split("?")
+    for other in (path.replace(RID, "1790000000.2-abc"), path.replace("/6/", "/7/"), path.replace(f"/{T + 2}/", f"/{T + 3}/")):
+        assert (await http.get(f"{other}?{query}")).status == 404
 
-    # Frigate down: SS's frame of that moment instead, and it shows in the diagnostics.
+    # Frigate down: SS's frame of that moment instead, shown in the diagnostics apart from
+    # the bookmarks' errors; and not asked again for a minute (each phone would wait for it).
     aioclient_mock.clear_requests()
     aioclient_mock.get(f"{F}/api/review/{RID}", exc=asyncio.TimeoutError())
     resp = await http.get(image)
     assert resp.status == 200 and await resp.read() == b"ss-frame"
-    bridge.manager.thumbnail_when_recorded.assert_awaited_with(bridge.entry_id, 6, T + 2, 20, 1280)
+    bridge.manager.thumbnail_when_recorded.assert_awaited_with(bridge.entry_id, 6, T + 2, 13, 1280)
     stats = bridge.stats()
-    assert stats["images_frigate"] == 1 and stats["images_ss"] == 1 and "TimeoutError" in stats["last_error"]["error"]
+    assert stats["images_frigate"] == 1 and stats["images_ss"] == 1 and stats["images_no_snapshot"] == 0
+    assert "TimeoutError" in stats["last_image_error"]["error"] and stats["last_error"] is None
+    asked = len(aioclient_mock.mock_calls)
+    assert await (await http.get(image)).read() == b"ss-frame"
+    assert len(aioclient_mock.mock_calls) == asked
+    later = frigate_mod._monotonic() + 61
+    with patch.object(frigate_mod, "_monotonic", return_value=later):
+        aioclient_mock.clear_requests()
+        mock_review(aioclient_mock, [event("e1", "person", 0.9)])
+        aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", content=JPG)
+        assert await (await http.get(image)).read() == JPG  # back
 
-    # No snapshot there, and SS has no frame either: 404; SS failing: 502.
-    aioclient_mock.clear_requests()
-    mock_review(aioclient_mock, [])
-    bridge.manager.thumbnail_when_recorded.return_value = None
-    assert (await http.get(image)).status == 404
-    bridge.manager.thumbnail_when_recorded.side_effect = SSError("Recording", "Download", 400)
-    assert (await http.get(image)).status == 502
+        # No snapshot there, and SS has no frame either: 404; SS failing: 502.
+        aioclient_mock.clear_requests()
+        mock_review(aioclient_mock, [])
+        bridge.manager.thumbnail_when_recorded.return_value = None
+        assert (await http.get(image)).status == 404
+        assert bridge.stats()["images_no_snapshot"] == 1
+        bridge.manager.thumbnail_when_recorded.side_effect = SSError("Recording", "Download", 400)
+        assert (await http.get(image)).status == 502
 
     # The entry unloaded meanwhile: SS's frame (nothing to ask Frigate with).
     del hass.data[DATA_FRIGATE][bridge.entry_id]
@@ -143,10 +162,101 @@ async def test_announced_with_frigate_image(hass: HomeAssistant, bridge: Frigate
 
 
 async def test_without_frigate_api_the_ss_frame(hass: HomeAssistant, bridge: FrigateBridge) -> None:
-    """No Frigate URL (or an id not fit for a path): the SS frame as before, waited for."""
+    """No Frigate URL: the SS frame as before, waited for."""
     events = async_capture_events(hass, DETECTION_EVENT)
     bridge.api = None
     await bridge.handle(review("new", rid=RID))
     await hass.async_block_till_done()
     assert "/thumbnail/" in events[0].data["image"] and events[0].data["image"].split("?")[0].endswith("-large.jpg")
     bridge.manager.thumbnail_when_recorded.assert_awaited_once()
+
+
+async def test_objects_not_written_yet(bridge: FrigateBridge, aioclient_mock: AiohttpClientMocker) -> None:
+    """Seconds into a review Frigate may not have written its objects yet (404): their snapshots, from its memory."""
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"data": {"detections": ["e1", "e2"]}})
+    aioclient_mock.get(f"{F}/api/events/e1", status=404)
+    aioclient_mock.get(f"{F}/api/events/e2", status=404)
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", status=404)
+    aioclient_mock.get(f"{F}/api/events/e2/snapshot.jpg", content=WEBP)
+    assert await bridge.review_image(RID) == (WEBP, "image/webp")
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"data": {"detections": ["e1"]}})
+    aioclient_mock.get(f"{F}/api/events/e1", status=404)
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", status=404)
+    assert await bridge.review_image(RID) is None
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"data": {"detections": ["e1"]}})
+    aioclient_mock.get(f"{F}/api/events/e1", status=404)
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", status=500)
+    with pytest.raises(FrigateAPIError, match="HTTP 500"):
+        await bridge.review_image(RID)
+
+
+async def test_some_objects_failing(bridge: FrigateBridge, aioclient_mock: AiohttpClientMocker) -> None:
+    """One object's lookup failing doesn't lose the others; odd answers are skipped, not a crash."""
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"data": {"detections": ["e1", "e2", "e3"]}})
+    aioclient_mock.get(f"{F}/api/events/e1", status=500)
+    aioclient_mock.get(f"{F}/api/events/e2", json={"id": "e2", "label": ["person"], "has_snapshot": True})
+    aioclient_mock.get(f"{F}/api/events/e3", json=event("e3", "car", 0.5))
+    aioclient_mock.get(f"{F}/api/events/e3/snapshot.jpg", content=JPG)
+    assert await bridge.review_image(RID) == (JPG, "image/jpeg")
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"data": ["not", "a", "dict"]})
+    assert await bridge.review_image(RID) is None
+
+
+async def test_api_bounds(hass: HomeAssistant, aioclient_mock: AiohttpClientMocker) -> None:
+    api = FrigateAPI(async_get_clientsession(hass), F)
+    aioclient_mock.get(f"{F}/s", status=400, json={"success": False, "message": "Semantic search is not enabled"})
+    aioclient_mock.get(f"{F}/big", content=b"x" * 64)
+    with pytest.raises(FrigateAPIError, match=r"HTTP 400 \(Semantic search is not enabled\)") as err:
+        await api.json("/s")
+    assert err.value.status == 400
+    with patch("custom_components.surveillance_station.frigate_api.MAX_BODY_BYTES", 16), pytest.raises(
+        FrigateAPIError, match="too big"
+    ):
+        await api.json("/big")
+
+
+async def test_image_budget(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth) -> None:
+    """Frigate hanging costs the phone a few seconds, then SS's frame; SS hanging, a 504 in time."""
+    image = bridge._image_url(RID, 6, T + 2)
+
+    async def hang(*_):
+        await asyncio.sleep(60)
+
+    http = await hass_client_no_auth()
+    with patch.object(frigate_mod, "FRIGATE_IMAGE_BUDGET_SECONDS", 0.05), patch.object(bridge, "review_image", hang):
+        assert await (await http.get(image)).read() == b"ss-frame"
+    assert "TimeoutError" in bridge.stats()["last_image_error"]["error"]
+    bridge.manager.thumbnail_when_recorded.side_effect = hang
+    with patch.object(frigate_mod, "FRIGATE_IMAGE_FALLBACK_SECONDS", 0.05):
+        assert (await http.get(image)).status == 504
+
+
+async def test_unloaded_while_settling(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """Stopped during the wait for a better snapshot: no event, and still news for the review's next message."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    with patch.object(frigate_mod, "FRIGATE_SNAPSHOT_SETTLE_SECONDS", 3600):
+        await bridge.handle(review("new", rid=RID))
+        await asyncio.sleep(0)
+        bridge.stop()
+        await hass.async_block_till_done()
+    assert not events and RID in bridge._not_yet
+
+
+async def test_object_thumbnail(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth, aioclient_mock) -> None:
+    """A search result's thumbnail: Frigate's, signed; gone is 404, Frigate failing 502."""
+    manager = hass.data[DATA_MANAGER]
+    url = manager.sign_path(f"{FRIGATE_IMAGE_URL}/{bridge.entry_id}/object/e1.webp")
+    http = await hass_client_no_auth()
+    aioclient_mock.get(f"{F}/api/events/e1/thumbnail.webp", content=WEBP)
+    resp = await http.get(url)
+    assert resp.status == 200 and await resp.read() == WEBP and resp.content_type == "image/webp"
+    assert (await http.get(url.split("?")[0] + "?exp=1&sig=x")).status == 404
+    for status, want in ((404, 404), (500, 502)):
+        aioclient_mock.clear_requests()
+        aioclient_mock.get(f"{F}/api/events/e1/thumbnail.webp", status=status)
+        assert (await http.get(url)).status == want
+    bridge.api = None
+    assert (await http.get(url)).status == 404

@@ -274,7 +274,10 @@ def _frigate_url(text: str) -> str | None:
         url = URL(text)
     except ValueError:
         return None
-    if url.scheme not in ("http", "https") or not url.host or url.query_string or url.fragment:
+    if (
+        url.scheme not in ("http", "https") or not url.host or any(c.isspace() for c in text)
+        or url.query_string or url.fragment
+    ):
         return None
     return text
 

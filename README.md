@@ -126,6 +126,23 @@ playhead are highlighted. SS's own motion detections are not exposed by any
 documented API (in continuous mode every `Event` is a recording file), so
 bookmarks are the event source.
 
+- **Kinds**: chips above the list (Person, Car, Animal, …: the parts of the
+  bookmarks' names, those of more than one bookmark, most common first)
+  narrow the list and the timeline's pins to the kinds chosen; remembered per
+  browser.
+- **Smart search** (with Frigate, and its URL in the options): a search box
+  above the list asks Frigate's semantic search, in words ("white car",
+  "person with a box"; English, Frigate's CLIP model), or "similar to" a
+  bookmark (the button on a Frigate bookmark's row: by its review's foremost
+  object, image to image). Frigate finds; SS plays: each result is placed on
+  the SS camera its Frigate camera maps to, at its start time, and a review
+  is listed once, as its bookmark (name, comment) when it has one. Results
+  come best first, each with Frigate's crop of the object, and the kind chips
+  filter them too. Tapping one plays SS's recording from 3 s before it.
+  Needs `semantic_search.enabled` in Frigate. Frigate deletes a tracked
+  object, and so what can be found, with its snapshot
+  (`snapshots.retain`): keep that as long as SS keeps recordings.
+
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.
 
@@ -222,10 +239,11 @@ How it works:
   reaches it, e.g. `http://frigate:5000`, the internal port): Frigate's
   snapshot of the review's foremost object (a person before a car before an
   animal, then the surest), box drawn, at its detect resolution, as it is
-  when the phone fetches it. The object is in it by construction, and the
-  event goes out 3 s after the bookmark (time for a better frame than the
-  review's first). If Frigate doesn't answer, or has no snapshot of it, the
-  same URL gives SS's frame instead. Without a Frigate URL: SS's frame of
+  when the phone fetches it (needs `snapshots.enabled` in Frigate). The
+  object is in it by construction, and the event goes out 3 s after the
+  bookmark (time for a better frame than the review's first). If Frigate
+  doesn't answer within 5 s, or has no snapshot of it, the same URL gives
+  SS's frame instead, and Frigate isn't asked again for a minute. Without a Frigate URL: SS's frame of
   the moment Frigate picked (`thumb_time`) from the 4K main stream, 1280 px
   wide; the event waits for SS to have recorded it (SS lists recordings
   0-10 s behind; at most 20 s). That frame is also the bookmark's thumbnail
@@ -315,7 +333,9 @@ broker down, NAS unreachable at runtime and during HA's start):
   reads it.
 - Diagnostics show the bridge: subscribed, Frigate online, and every review
   message's fate (ignored and why, coalesced, dropped, retried, failed,
-  bookmarked, announced or not), plus the last error.
+  bookmarked, announced or not), plus the last error; with a Frigate URL,
+  how the notification images went (`images_frigate`, `images_ss`, of those
+  `images_no_snapshot`) and `last_image_error`.
 - The card retries a stream it gave up on every minute while on screen, so
   a wall display comes back after the NAS reboots.
 
@@ -403,6 +423,11 @@ paths (`async_sign_path`) were used at first and dropped: HA answers a stale
 one (after every HA restart, or after a day) with 401, and counts every 401 as
 a failed login, so a wall tablet left open would get its IP banned under
 `login_attempts_threshold`.
+
+Frigate's images (a notification's, a search result's) are signed the same
+way, under `/api/surveillance_station/frigate_image/…`; HA fetches them from
+Frigate and passes on only a JPEG or WebP (checked by its bytes). Only ids
+shaped like Frigate's (`1790406867.462609-6jc58g`) go into Frigate's URLs.
 
 Every HA user can use the card and so see every camera, like HA's own camera
 entities; there is no per-user camera permission.
@@ -534,8 +559,9 @@ entities; there is no per-user camera permission.
 - The card's text is English; its times follow the HA profile's 12/24 h
   setting. Grid cells are 16:9.
 - A notification's image link stays valid for one to two days. Without a
-  Frigate URL, and with SS recording on motion, a recording starting more
-  than ~8 s after Frigate's frame leaves the notification without an image.
+  Frigate URL (or when Frigate gives none and the image falls back to SS's
+  frame), with SS recording on motion, a recording starting more than ~8 s
+  after Frigate's frame leaves the notification without an image.
 - Sound is the camera's own codec, played if the browser can (AAC: all;
   Opus / MP3: most; G.711 / G.726, many cameras' default: none, in MSE); the
   Sound button says when it can't. HLS playback (browsers without MSE)

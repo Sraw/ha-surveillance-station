@@ -3,7 +3,7 @@
  * scrubbable wall-clock timeline and the SS bookmarks laid on top of it.
  *
  * Talks to the surveillance_station integration over the HA WebSocket:
- *   surveillance_station/cameras | recordings | bookmarks | bookmark_page |
+ *   surveillance_station/cameras | recordings | bookmarks | bookmark_page | search |
  *   live | vod | vod_runs
  * Video is SS's own stream (`live`: a single-use WebSocket URL, live or the
  * recordings from a time on), played through MSE by StreamFeed; each frame
@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.13.0";
+const CARD_VERSION = "0.14.0";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -452,6 +452,32 @@ const STYLE = `
   .evt .m i { width: 8px; height: 8px; border-radius: 50%; background: var(--cam); flex: none; }
   .evt .c { font-size: 12px; color: var(--secondary-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ev-foot { padding: 10px 4px; font-size: 12px; color: var(--secondary-text-color); text-align: center; }
+  /* Smart search (Frigate) and the kinds to show. */
+  .ev-tools { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 6px; }
+  .ev-tools:not(:has(> :not([hidden]))) { display: none; }
+  .ev-search { display: flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; border: 1px solid var(--divider-color);
+    border-radius: 18px; min-height: 34px; }
+  .ev-search:focus-within { border-color: var(--primary-color); }
+  .ev-search ha-icon { --mdc-icon-size: 18px; color: var(--secondary-text-color); flex: none; }
+  .ev-search input { flex: 1; min-width: 0; border: none; outline: none; background: transparent; font: inherit; font-size: 14px;
+    color: var(--primary-text-color); padding: 6px 0; }
+  .ev-sq { display: flex; align-items: center; gap: 4px; font-size: 13px; color: var(--secondary-text-color); padding-left: 4px; }
+  .ev-sq .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev-sq button.icon { width: 28px; min-width: 28px; height: 28px; --mdc-icon-size: 18px; }
+  .ev-kinds { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
+  .ev-kinds::-webkit-scrollbar { display: none; }
+  .ev-kinds button { min-height: 28px; font-size: 13px; padding: 0 10px; flex: none; color: var(--secondary-text-color); }
+  .ev-kinds button.on { color: var(--primary-text-color); }
+  .ev-kinds .n { font-size: 11px; opacity: .7; font-variant-numeric: tabular-nums; }
+  .evrow { position: relative; }
+  .evrow .sim { position: absolute; right: 4px; bottom: 4px; width: 28px; min-width: 28px; height: 28px; --mdc-icon-size: 18px;
+    color: var(--secondary-text-color); opacity: 0; }
+  .evrow:hover .sim, .evrow .sim:focus-visible { opacity: 1; }
+  .evrow:has(.sim) .evt { padding-right: 28px; }
+  @media (hover: none) { .evrow .sim { opacity: .75; } }
+  /* A tracked object's crop (a search result): whole, not filling the frame. */
+  .thumb.obj { background: #111; }
+  .thumb.obj img { object-fit: contain; }
 `;
 
 /**
@@ -2023,6 +2049,10 @@ class SSTimelineCard extends HTMLElement {
     this._grid = true; // grid mode: chips add / remove cameras; else they switch the one shown
     this._gridSet = []; // the grid's cameras, kept while one camera is shown
     this._evItems = []; // event list: bookmarks of the shown cameras, newest first, as loaded
+    this._kinds = new Set(prefs.get("kinds", [])); // only these kinds listed and on the timeline ("Person"); none: all
+    this._evKinds = []; // [kind, count]: what there is to choose from
+    this._search = null; // smart search shown instead of the bookmarks: {params, label, items, loading, error}
+    this._srSeq = 0;
     this._evSeq = 0;
     this._drag = false;
     this._onFullscreen = () => this._fullscreenChanged();
@@ -2174,6 +2204,8 @@ class SSTimelineCard extends HTMLElement {
       return;
     }
     this._cameras = res.cameras.filter((c) => c.enabled);
+    this._searchable = !!res.search;
+    if (this._searchForm) this._searchForm.hidden = !this._searchable;
     if (!this._cameras.length) {
       this._stageMessage("No enabled cameras in Surveillance Station", "empty");
       return;
@@ -2330,6 +2362,12 @@ class SSTimelineCard extends HTMLElement {
               <span class="spacer"></span>
               <button class="icon" data-act="events" title="Hide events">${icon("mdi:close")}</button>
             </div>
+            <div class="ev-tools">
+              <form class="ev-search" hidden>${icon("mdi:magnify")}<input type="search" enterkeyhint="search" autocomplete="off"
+                placeholder="Search: white car, person with a box…" aria-label="Smart search (Frigate)" /></form>
+              <div class="ev-sq" hidden><span class="t"></span><button type="button" class="icon" data-act="search-close" title="Back to all events">${icon("mdi:close")}</button></div>
+              <div class="ev-kinds" hidden></div>
+            </div>
             <div class="ev-list"><div class="ev-items"></div><div class="ev-foot"></div></div>
           </aside>
         </div>
@@ -2352,6 +2390,21 @@ class SSTimelineCard extends HTMLElement {
     this._evList = $(".ev-list");
     this._evItemsEl = $(".ev-items");
     this._evFoot = $(".ev-foot");
+    this._searchForm = $(".ev-search");
+    this._searchInput = $(".ev-search input");
+    this._searchHead = $(".ev-sq");
+    this._kindsEl = $(".ev-kinds");
+    this._searchForm.hidden = !this._searchable;
+    this._searchForm.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const q = this._searchInput.value.trim();
+      if (q) this._runSearch({ query: q }, `“${q}”`);
+      else this._endSearch();
+      this._searchInput.blur(); // a phone's keyboard goes away, the results show
+    });
+    // The field's own clear (×): back to all events.
+    this._searchInput.addEventListener("search", () => !this._searchInput.value && this._endSearch());
+    this._drawKinds();
     this._when = $(".when");
     this._jumpBox = $(".jump:not(.shows)");
     this._showsBox = $(".shows");
@@ -2774,6 +2827,28 @@ class SSTimelineCard extends HTMLElement {
       this._applyShows();
       return;
     }
+    if (b.dataset.kind) {
+      const k = b.dataset.kind;
+      if (this._kinds.has(k)) this._kinds.delete(k);
+      else this._kinds.add(k);
+      prefs.set("kinds", [...this._kinds]);
+      this._drawKinds();
+      this._drawTimeline();
+      if (this._search) this._drawEvents();
+      else this._resetEvents();
+      return;
+    }
+    if (b.dataset.similar) {
+      const id = Number(b.dataset.similar);
+      const ev = this._evItems.find((x) => x.id === id) ?? this._search?.items.find((x) => x.bookmark_id === id);
+      const what = ev ? `${ev.name} · ${this._cameraName(ev.camera_id)} ${fmtDate(ev.start)} ${fmtTime(ev.start)}` : "this event";
+      this._runSearch({ bookmark_id: id }, `Similar to ${what}`);
+      return;
+    }
+    if (b.dataset.act === "search-close") {
+      this._endSearch();
+      return;
+    }
     if (b.dataset.act === "shows") {
       this._jumpBox.hidden = true;
       this._showsBox.hidden = !this._showsBox.hidden;
@@ -2802,6 +2877,11 @@ class SSTimelineCard extends HTMLElement {
       this._centerOn(m.wall());
       this._markSpan();
       this._loadTimeline();
+      return;
+    }
+    if (b.dataset.sr) {
+      const r = this._search?.items.find((x) => x.key === b.dataset.sr);
+      if (r) this._jumpToEvent(r);
       return;
     }
     if (b.dataset.ev) {
@@ -2946,7 +3026,7 @@ class SSTimelineCard extends HTMLElement {
     let prev = -Infinity;
     let dense = false;
     for (const bm of this._bookmarks) {
-      if (bm.end < start || bm.start > end) continue;
+      if (bm.end < start || bm.start > end || !this._kindOk(bm.name)) continue;
       const at = (x(bm.start) * px) / 100;
       if (at - prev < 20) dense = true;
       prev = at;
@@ -2983,6 +3063,7 @@ class SSTimelineCard extends HTMLElement {
 
   /** Start the list over (the cameras shown changed, or first load). */
   _resetEvents() {
+    if (this._search) this._runSearch(this._search.params, this._search.label); // the cameras shown changed
     this._evSeq++;
     this._evItems = [];
     this._evMore = true;
@@ -3009,6 +3090,7 @@ class SSTimelineCard extends HTMLElement {
         type: "surveillance_station/bookmark_page",
         camera_ids: this._shown,
         limit: EVENT_PAGE,
+        ...this._kindsParam(),
         ...(last ? { before: last.start, before_id: last.id } : {}),
       });
     } catch (e) {
@@ -3025,6 +3107,7 @@ class SSTimelineCard extends HTMLElement {
     this._evItems.push(...res.bookmarks.filter((x) => !known.has(x.id)));
     this._evMore = res.more;
     this._evTotal = res.total;
+    this._setKinds(res.kinds);
     this._drawEvents();
     // Still room on screen (a tall sidebar): keep going.
     requestAnimationFrame(() => {
@@ -3050,11 +3133,14 @@ class SSTimelineCard extends HTMLElement {
     const seq = this._evSeq;
     let res;
     try {
-      res = await this._ws({ type: "surveillance_station/bookmark_page", camera_ids: this._shown, limit: EVENT_PAGE });
+      res = await this._ws({
+        type: "surveillance_station/bookmark_page", camera_ids: this._shown, limit: EVENT_PAGE, ...this._kindsParam(),
+      });
     } catch (e) {
       return;
     }
     if (seq !== this._evSeq || this._evLoading) return;
+    this._setKinds(res.kinds);
     const items = this._evItems;
     const page = res.bookmarks;
     // Newest first, as the server orders them.
@@ -3088,13 +3174,26 @@ class SSTimelineCard extends HTMLElement {
 
   _drawFoot() {
     if (!this._evFoot) return;
+    const s = this._search;
+    if (s) {
+      const n = this._searchShown().length;
+      this._evFoot.textContent = s.loading
+        ? "Searching…"
+        : s.error
+          ? `Search failed: ${s.error}`
+          : n
+            ? "Found by Frigate; plays from Surveillance Station"
+            : "No matches";
+      return;
+    }
+    const kinds = this._kinds.size ? `${[...this._kinds].join(" / ")} ` : "";
     this._evFoot.textContent = this._evError
       ? `Couldn't load events: ${this._evError}`
       : this._evLoading
         ? "Loading…"
         : this._evItems.length
           ? this._evMore ? "" : "No earlier events"
-          : `No bookmarks for ${this._shown.length === 1 ? this._cameraName(this._shown[0]) : "these cameras"}`;
+          : `No ${kinds}bookmarks for ${this._shown.length === 1 ? this._cameraName(this._shown[0]) : "these cameras"}`;
   }
 
   /**
@@ -3121,25 +3220,34 @@ class SSTimelineCard extends HTMLElement {
       }
       want.push(el);
     };
-    for (const e of this._evItems) {
+    const s = this._search;
+    // "Similar" is offered on Frigate's bookmarks when its search can be asked.
+    const similar = (id, comment) =>
+      this._searchable && id != null && /\[frigate [^\]]+\]/.test(comment ?? "")
+        ? `<button class="icon sim" data-similar="${id}" title="Find similar">${`<ha-icon icon="mdi:image-search-outline"></ha-icon>`}</button>`
+        : "";
+    for (const e of s ? this._searchShown() : this._evItems) {
       const d = new Date(e.start * 1000).toDateString();
-      if (d !== day) {
+      // Search results come best first: each says its day instead.
+      if (!s && d !== day) {
         day = d;
         const label = d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start);
         node(`d:${d}:${label}`, `<div class="ev-day">${label}</div>`);
       }
       const dur = e.end > e.start ? fmtDur(e.end - e.start) : "";
       const thumb = e.thumbnail ? `<img loading="lazy" decoding="async" alt="" src="${esc(e.thumbnail)}">` : "";
+      const when = s ? `${d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start)} ${fmtTime(e.start)}` : fmtTime(e.start);
+      const id = s ? e.bookmark_id : e.id;
       node(
-        `e:${e.id}:${e.start}:${e.end}:${e.camera_id}:${e.name}:${e.comment}`,
-        `<button class="ev" data-ev="${e.id}" style="--cam:${this._camColor(e.camera_id)}">
-          <span class="thumb"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
+        `${s ? "s:" + e.key : "e:" + e.id}:${e.start}:${e.end}:${e.camera_id}:${e.name}:${e.comment}:${this._searchable}`,
+        `<div class="evrow"><button class="ev" ${s ? `data-sr="${esc(e.key)}"` : `data-ev="${e.id}"`} style="--cam:${this._camColor(e.camera_id)}">
+          <span class="thumb${s ? " obj" : ""}"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
           <span class="evt">
             <span class="n">${esc(e.name || "(unnamed)")}</span>
-            <span class="m"><i></i>${esc(this._cameraName(e.camera_id))} · ${fmtTime(e.start)}</span>
+            <span class="m"><i></i>${esc(this._cameraName(e.camera_id))} · ${when}</span>
             ${e.comment ? `<span class="c">${esc(e.comment)}</span>` : ""}
           </span>
-        </button>`
+        </button>${similar(id, e.comment)}</div>`
       );
     }
     for (const key of [...this._evNodes.keys()]) if (!keys.has(key)) this._evNodes.delete(key);
@@ -3154,7 +3262,7 @@ class SSTimelineCard extends HTMLElement {
       cur.remove();
       cur = next;
     }
-    const total = this._evTotal ?? "";
+    const total = s ? (s.loading ? "" : this._searchShown().length) : (this._evTotal ?? "");
     for (const q of [".evcount", ".evtotal"]) {
       const el = this.shadowRoot.querySelector(q);
       if (el) {
@@ -3165,6 +3273,83 @@ class SSTimelineCard extends HTMLElement {
     this._drawFoot();
     this._activeEvent = undefined;
     this._markActiveEvent(this._currentWall());
+  }
+
+  // ---- kinds and smart search ----------------------------------------------
+
+  _kindsParam() {
+    return this._kinds.size ? { kinds: [...this._kinds] } : {};
+  }
+
+  /** Whether a bookmark (by its name, "Person, Car") or a result (its kind) is of a kind chosen. */
+  _kindOk(name) {
+    if (!this._kinds.size) return true;
+    const want = new Set([...this._kinds].map((k) => k.toLowerCase()));
+    return String(name ?? "").split(",").some((k) => want.has(k.trim().toLowerCase()));
+  }
+
+  _setKinds(kinds) {
+    if (!Array.isArray(kinds)) return;
+    const key = JSON.stringify(kinds);
+    if (key === this._evKindsKey) return;
+    this._evKindsKey = key;
+    this._evKinds = kinds;
+    this._drawKinds();
+  }
+
+  /** The kind chips: what the bookmarks have, and whatever is chosen (even if none are left). */
+  _drawKinds() {
+    const el = this._kindsEl;
+    if (!el) return;
+    const counts = new Map(this._evKinds);
+    for (const k of this._kinds) if (!counts.has(k)) counts.set(k, 0);
+    el.hidden = counts.size < 2 && !this._kinds.size; // one kind only: nothing to choose
+    el.innerHTML = [...counts]
+      .map(([k, n]) => {
+        const on = this._kinds.has(k);
+        return `<button type="button" data-kind="${esc(k)}" aria-pressed="${on}" class="${on ? "on" : ""}">${esc(k)}${
+          n ? ` <span class="n">${n}</span>` : ""
+        }</button>`;
+      })
+      .join("");
+  }
+
+  _searchShown() {
+    return (this._search?.items ?? []).filter((r) => this._kindOk(r.kind));
+  }
+
+  /** Ask Frigate (through the integration): {query} or {bookmark_id} (similar to it). */
+  async _runSearch(params, label) {
+    const seq = ++this._srSeq;
+    this._search = { params, label, items: [], loading: true, error: null };
+    this._searchHead.hidden = false;
+    this._searchHead.querySelector(".t").textContent = label;
+    if (!("query" in params)) this._searchInput.value = "";
+    this._evList.scrollTop = 0;
+    this._drawEvents();
+    let res;
+    try {
+      res = await this._ws({ type: "surveillance_station/search", ...params, camera_ids: this._shown, limit: 30 });
+    } catch (e) {
+      if (seq !== this._srSeq) return;
+      this._search.loading = false;
+      this._search.error = errText(e);
+      this._drawEvents();
+      return;
+    }
+    if (seq !== this._srSeq) return;
+    this._search.items = res.results;
+    this._search.loading = false;
+    this._drawEvents();
+  }
+
+  _endSearch() {
+    this._srSeq++;
+    if (!this._search) return;
+    this._search = null;
+    this._searchHead.hidden = true;
+    this._searchInput.value = "";
+    this._drawEvents();
   }
 
   /** Highlight the events the playhead is in (on the cameras shown). */
