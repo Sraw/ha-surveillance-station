@@ -209,7 +209,7 @@ async def test_bookmarks_listed_afresh(hass: HomeAssistant, bridge: FrigateBridg
 
 
 @pytest.mark.parametrize("expected_lingering_timers", [True])  # MQTT's own housekeeping
-async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: MockConfigEntry, client: MagicMock) -> None:
+async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: MockConfigEntry, client: MagicMock, caplog) -> None:
     """Options on: subscribed to <topic>/reviews; SS errors are logged, not fatal."""
     events = async_capture_events(hass, DETECTION_EVENT)
     entry = MockConfigEntry(
@@ -256,7 +256,10 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
         assert not stats["failing"]  # a3 went through after a1's failure
         assert stats["last_error"]["error"].startswith("x.Create failed")
         assert stats["last_error"]["at"].endswith("+00:00") and stats["last_message"]
-    assert await hass.config_entries.async_unload(entry.entry_id)
+    # Its state not saved (disk full...): logged, the unload still goes through.
+    with patch.object(bridge, "async_flush", AsyncMock(side_effect=OSError("disk full"))):
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    assert "Could not save the Frigate bridge's state" in caplog.text
 
 
 async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -576,8 +579,9 @@ async def test_announce_is_bounded(hass: HomeAssistant, bridge: FrigateBridge, c
     assert bridge.stats()["announce_failed"] == 1
 
 
-async def test_lasting_problems_become_repairs_issues(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+async def test_lasting_problems_become_repairs_issues(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
     registry = ir.async_get(hass)
+    client.cameras.side_effect = SSConnectionError("x", "List", None)  # the probe finds SS still down
     issue = f"frigate_failing_{bridge.entry_id}"
     bridge._subscribed = True
     bridge._failing_since = time.monotonic() - 30
@@ -852,3 +856,86 @@ async def test_given_up_after_a_day(hass: HomeAssistant, bridge: FrigateBridge) 
     bridge._deferred["r"]["_failed_at"] = T - 86401
     bridge._check_health()
     assert not bridge._deferred and bridge.stats()["dropped"] == 1
+
+
+async def test_older_message_failing_defers_nothing_when_a_newer_waits(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A review's "new" fails while its "update" waits: the update goes instead, knowing a bookmark may exist.
+
+    Deferring the "new" as well would replay it after the update was
+    bookmarked, and make a second bookmark."""
+    for queue in (bridge._pending, bridge._replay):
+        queue["r"] = review("update", rid="r")
+        bridge._defer("r", review("new", rid="r"))
+        assert not bridge._deferred and queue["r"]["_maybe_made"] and queue["r"]["type"] == "update"
+        queue.clear()
+
+
+async def test_stopped_before_ss_answered_still_expires(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """Kept on stop without ever reaching SS: dated, so a day later it is given up like the rest."""
+    bridge._pending["p"] = review("new", rid="p")
+    bridge.stop()
+    assert bridge._deferred["p"]["_failed_at"] == T + 2
+
+
+async def test_in_flight_review_is_kept_on_stop(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """Unloaded mid-request: tried again next time, looking for the bookmark first (it may have been made)."""
+    bridge._replay["old"] = review("new", rid="old")
+    bridge._current = ("c", review("new", rid="c"))
+    bridge._pending["c"] = review("update", rid="c")  # its newer message, not handled yet
+    bridge.stop()
+    assert list(bridge._deferred) == ["old", "c"]
+    assert bridge._deferred["c"]["type"] == "update" and bridge._deferred["c"]["_maybe_made"]
+
+
+async def test_dsm_common_codes_are_transient(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, no_retry_wait) -> None:
+    """DSM's 100-119 (SS package stopped or updating...): kept for later, not refused for good."""
+    client.create_bookmark.side_effect = SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", "Create", 102)
+    await bridge._process("r", review("new", rid="r"))
+    stats = bridge.stats()
+    assert (stats["rejected"], stats["deferred"], stats["failing"]) == (0, 1, True)
+
+
+async def test_refusals_that_last_become_an_issue(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, no_retry_wait) -> None:
+    """SS answers but refuses every bookmark (rights taken away): not "failing", yet a Repairs issue."""
+    registry = ir.async_get(hass)
+    issue = f"frigate_failing_{bridge.entry_id}"
+    bridge._subscribed = True
+    client.create_bookmark.side_effect = SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", "Create", 400)
+    await bridge._process("r", review("new", rid="r"))
+    assert not bridge.stats()["failing"] and bridge._rejected_since is not None
+    bridge._rejected_since -= 601
+    bridge._failing_since = bridge._rejected_since  # and a probe finds SS answering: still refused
+    bridge._check_health()
+    await hass.async_block_till_done()
+    assert not bridge._failing and bridge._rejected_since is not None
+    bridge._check_health()
+    assert registry.async_get_issue(DOMAIN, issue) is not None
+    client.create_bookmark.side_effect = None
+    await bridge._process("s", review("new", rid="s"))  # a bookmark made
+    bridge._check_health()
+    assert registry.async_get_issue(DOMAIN, issue) is None
+    bridge.stop()
+
+
+async def test_probe_runs_again_once_the_last_finished(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    bridge._subscribed = True
+    bridge._failing_since = time.monotonic()
+    client.cameras.side_effect = SSConnectionError("x", "List", None)
+    for _ in range(2):
+        bridge._check_health()
+        await hass.async_block_till_done()
+    assert client.cameras.await_count == 2 and bridge._failing
+    bridge.stop()
+
+
+async def test_overflow_keeps_the_canary_and_the_dropped(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """Too much waiting: the review being tried to see whether SS is back stays; the one pushed out waits for SS."""
+    with patch("custom_components.surveillance_station.frigate.FRIGATE_QUEUE_MAX", 2):
+        bridge._keep("k", review("new", rid="k"))
+        bridge._canary()
+        for rid in ("q1", "q2"):
+            bridge._received(MagicMock(payload=json.dumps(review("new", rid=rid))))
+        assert list(bridge._pending) == ["k", "q2"] and list(bridge._deferred) == ["q1"]
+        for rid in ("d1", "d2"):  # and what waits for SS is bounded too
+            bridge._keep(rid, review("new", rid=rid))
+    assert list(bridge._deferred) == ["d1", "d2"] and bridge.stats()["dropped"] == 2

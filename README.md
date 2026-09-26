@@ -232,8 +232,11 @@ broker down, NAS unreachable at runtime and during HA's start):
   every minute; once one goes through, the others are replayed (after
   anything fresh, and back to waiting if SS fails again): an outage loses
   no bookmark (and, past 2 minutes, sends no stale notification). Only a
-  bookmark made or found counts as SS being back, not reads that work. An
-  error code SS gives for a request is not kept: it would only come again.
+  bookmark made or found counts as SS being back, not reads that work.
+  DSM's common codes (100-119: the SS package stopped or updating) count as
+  unreachable. An error code SS gives for the request itself (400 and up)
+  is not kept: it would only come again. Reviews not handled yet at an
+  unload or restart, and the one in flight, are kept the same way.
 - Messages waiting for SS are one per review (a later one replaces the
   earlier: it says everything that one did), at most 1000 reviews.
 - The SS camera list is read again every 10 minutes and after any failure:
@@ -253,7 +256,8 @@ broker down, NAS unreachable at runtime and during HA's start):
   wrong password: no login for a minute, then again.
 - A problem lasting 10 minutes becomes an issue in **Settings → Repairs**,
   gone by itself once it clears: MQTT not available, bookmarks failing
-  (checked again every minute), Frigate offline (its `<prefix>/available`).
+  (checked again every minute) or refused by SS until one is made again,
+  Frigate offline (its `<prefix>/available`).
 - A notification cut short (unload, restart while waiting for the frame)
   isn't counted as sent: the review's next message sends it, within the
   2 minutes. The bridge's state is written on unload, before a reload

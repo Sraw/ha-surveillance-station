@@ -171,7 +171,12 @@ class FrigateBridge:
         # again meanwhile. An outage loses no bookmark.
         self._deferred: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._replay: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._current: tuple[str, dict[str, Any]] | None = None  # being handled
+        self._canary_key: str | None = None
         self._forget_bookmarks = False
+        # SS refusing bookmarks (an error code) while answering otherwise
+        # (rights taken away): since when, cleared by a bookmark made.
+        self._rejected_since: float | None = None
         self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._unsubscribe: list[Callable[[], None]] = []
@@ -251,6 +256,7 @@ class FrigateBridge:
                     self._last_seen[(int(camera_id), str(kind))] = (float(t), str(rid[0]) if rid else "")
             for key, review in stored.get("deferred") or []:
                 if isinstance(review, dict) and isinstance(review.get("after"), dict):
+                    review.setdefault(_FAILED_AT, now)
                     self._deferred[str(key)] = review
         except (ValueError, TypeError, AttributeError, HomeAssistantError):
             _LOGGER.warning("Ignoring unreadable Frigate state %s", store_key(self.entry_id))
@@ -295,11 +301,17 @@ class FrigateBridge:
     def stop(self) -> None:
         self._stopped = True
         self._subscribed = False
-        # Not handled yet: kept for next time (async_flush writes it).
-        for queue in (self._replay, self._pending):
-            for key, review in queue.items():
-                self._deferred.setdefault(key, review)
-            queue.clear()
+        # Not handled yet, or cut short: kept for next time (async_flush
+        # writes it). Oldest first, so a review's newest message wins.
+        waiting = [*self._replay.items()]
+        if self._current is not None:
+            key, review = self._current
+            waiting.append((key, {**review, _MAYBE_MADE: True}))
+        waiting += self._pending.items()
+        for key, review in waiting:
+            self._keep(key, review)
+        self._replay.clear()
+        self._pending.clear()
         for unsubscribe in self._unsubscribe:
             unsubscribe()
         self._unsubscribe = []
@@ -357,8 +369,10 @@ class FrigateBridge:
                 review[_MAYBE_MADE] = True
         self._pending[key] = review  # an existing key keeps its place
         if len(self._pending) > FRIGATE_QUEUE_MAX:
-            # SS stuck for a long while: newer reviews matter more.
-            self._pending.popitem(last=False)
+            # SS stuck for a long while: newer reviews matter more (but not
+            # the one being tried to see whether SS is back).
+            oldest = [k for k in list(self._pending)[:2] if k != self._canary_key][0]
+            self._keep(oldest, self._pending.pop(oldest))
             self._counts["dropped"] += 1
             if not self._dropping:
                 self._dropping = True
@@ -387,7 +401,13 @@ class FrigateBridge:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
-            await self._process(key, review)
+            self._current = (key, review)
+            try:
+                await self._process(key, review)
+            finally:
+                self._current = None
+                if key == self._canary_key:
+                    self._canary_key = None
 
     async def _process(self, key: str, review: dict[str, Any]) -> None:
         retries = 0
@@ -403,14 +423,20 @@ class FrigateBridge:
                 self._cameras_at = -math.inf
                 review = {**review, _MAYBE_MADE: True}
                 transient = _transient(err)
-                if not transient or self._failing or retries >= FRIGATE_RETRIES:
+                if not transient:
+                    # SS said no to this one (an error code): trying it again
+                    # every minute would only say no again. Not "failing"
+                    # (SS answers), but a Repairs issue if it lasts.
+                    self._counts["rejected"] += 1
+                    self._error(err)
+                    self._bookmark_error = str(err)[:300]
+                    if self._rejected_since is None:
+                        self._rejected_since = _monotonic()
+                    _LOGGER.warning("Surveillance Station refused the bookmark of Frigate review %s: %s", key, err)
+                    return
+                if self._failing or retries >= FRIGATE_RETRIES:
                     self._fail(err)
-                    if transient:
-                        self._defer(key, review)
-                    else:
-                        # SS said no to this one (an error code): trying it
-                        # again every minute would only say no again.
-                        self._counts["rejected"] += 1
+                    self._defer(key, review)
                     return
                 retries += 1
                 self._counts["retried"] += 1
@@ -437,13 +463,26 @@ class FrigateBridge:
             _LOGGER.warning("Frigate review not turned into a bookmark (tried again once SS answers): %s", err)
 
     def _defer(self, key: str, review: dict[str, Any]) -> None:
-        review.setdefault(_FAILED_AT, time.time())
+        for queue in (self._pending, self._replay):
+            if (newer := queue.get(key)) is not None:
+                # A newer message of the review is waiting: it goes instead
+                # (knowing the bookmark may exist); this one is older news.
+                newer[_MAYBE_MADE] = True
+                return
+        self._keep(key, review)
+        self._save()
+
+    def _keep(self, key: str, review: dict[str, Any]) -> None:
+        """Wait for SS (the review's latest message, with what earlier ones told)."""
+        earlier = self._deferred.pop(key, None) or {}
+        review = {**review, _FAILED_AT: earlier.get(_FAILED_AT) or review.get(_FAILED_AT) or time.time()}
+        for flag in (_MAYBE_MADE, _SEEN_NEW):
+            if earlier.get(flag):
+                review[flag] = True
         self._deferred[key] = _compact(review)
-        self._deferred.move_to_end(key)
         if len(self._deferred) > FRIGATE_QUEUE_MAX:
             self._deferred.popitem(last=False)
             self._counts["dropped"] += 1
-        self._save()
 
     def _canary(self) -> None:
         """Try the oldest review waiting for SS again, first in line."""
@@ -451,9 +490,10 @@ class FrigateBridge:
             key, review = self._deferred.popitem(last=False)
             self._pending.setdefault(key, review)
             self._pending.move_to_end(key, last=False)
+            self._canary_key = key
             self._wake.set()
 
-    def _ok(self) -> None:
+    def _ok(self, bookmark: bool = True) -> None:
         """A bookmark was made or changed: not failing, and what failed meanwhile is tried again.
 
         Or found: SS answering reads says nothing about bookmarks (a camera
@@ -462,6 +502,8 @@ class FrigateBridge:
         if self._failing:
             self._failing_since = None
             _LOGGER.info("Surveillance Station answers again: bookmarking Frigate detections")
+        if bookmark:
+            self._rejected_since = None
         if self._deferred:
             for key, review in self._deferred.items():
                 if key not in self._pending:  # a newer message waiting wins
@@ -708,12 +750,12 @@ class FrigateBridge:
         if self._subscribed and self._deferred:
             # The oldest again; if it goes through, _ok() brings the others.
             self._canary()
-        elif self._subscribed and self._failing and self._probe is None:
+        elif self._subscribed and self._failing and (self._probe is None or self._probe.done()):
             # Nothing waiting to go: is SS back at all?
             self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
         problems = {
             "frigate_mqtt": not self._subscribed and lasting(self._started_at),
-            "frigate_failing": lasting(self._failing_since),
+            "frigate_failing": lasting(self._failing_since) or lasting(self._rejected_since),
             "frigate_offline": lasting(self._frigate_offline_since),
         }
         for issue, present in problems.items():
@@ -745,7 +787,7 @@ class FrigateBridge:
         else:
             self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
             self._cameras_at = _monotonic()
-            self._ok()
+            self._ok(bookmark=False)  # SS answers; says nothing about refusals
         finally:
             self._probe = None
 
@@ -766,10 +808,18 @@ _FAILED_AT = "_failed_at"  # when it first failed (epoch), for giving up after a
 
 
 def _transient(err: SSError) -> bool:
-    """SS unreachable, overloaded or blocking us for now, or credentials refused
-    (a reauth fixes that): worth trying again later. An error code SS gives
-    for this request would only come again."""
-    return isinstance(err, (SSConnectionError, SSAuthError)) or err.code in (None, 407)
+    """Worth trying again later: SS unreachable, overloaded or blocking us for
+    now; credentials refused (a reauth fixes that); or one of DSM's common
+    codes (100-119: API or method not there, session...), as while the SS
+    package is stopped or updating. SS's own codes (400 and up) for this
+    request would only come again."""
+    code = err.code
+    return (
+        isinstance(err, (SSConnectionError, SSAuthError))
+        or code is None
+        or code == 407
+        or (isinstance(code, int) and 100 <= code < 120)
+    )
 
 
 def _compact(review: dict[str, Any]) -> dict[str, Any]:
