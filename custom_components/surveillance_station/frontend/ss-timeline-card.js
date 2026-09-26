@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.2";
+const CARD_VERSION = "0.14.3";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -429,7 +429,10 @@ const STYLE = `
   .ev-head { display: flex; align-items: center; gap: 8px; padding: 10px 8px 6px 12px; }
   .ev-title { font-weight: 500; }
   /* Under the video (narrow cards, and browsers without container queries). */
-  .ev-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; overscroll-behavior: contain; max-height: 60vh; }
+  .ev-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; max-height: 60vh; }
+  /* Only while it has something to scroll: a short list (a kind chosen) that
+     kept a swipe to itself would leave the page stuck under the finger. */
+  .ev-list.scrolls { overscroll-behavior: contain; }
   .side { border-top: 1px solid var(--divider-color); }
   .ev-day { position: sticky; top: 0; z-index: 1; padding: 8px 4px 4px; font-size: 12px; font-weight: 500;
     color: var(--secondary-text-color); background: var(--ha-card-background, var(--card-background-color, var(--primary-background-color))); }
@@ -3281,6 +3284,13 @@ class SSTimelineCard extends HTMLElement {
     this._drawFoot();
     this._activeEvent = undefined;
     this._markActiveEvent(this._currentWall());
+    this._markScrolls();
+  }
+
+  /** Whether the list has more than it shows (see .ev-list.scrolls). */
+  _markScrolls() {
+    const l = this._evList;
+    if (l) l.classList.toggle("scrolls", l.scrollHeight > l.clientHeight + 1);
   }
 
   // ---- kinds and smart search ----------------------------------------------
@@ -3452,6 +3462,7 @@ class SSTimelineCard extends HTMLElement {
    */
   _fit() {
     const st = this._stage;
+    requestAnimationFrame(() => this._markScrolls()); // the list's height follows the layout
     if (!st || !this._main || this.shadowRoot.fullscreenElement) return;
     this._vw = window.innerWidth;
     this._vh = window.innerHeight;
