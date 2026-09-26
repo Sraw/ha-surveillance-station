@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.1";
+const CARD_VERSION = "0.14.2";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -454,7 +454,6 @@ const STYLE = `
   .ev-foot { padding: 10px 4px; font-size: 12px; color: var(--secondary-text-color); text-align: center; }
   /* Smart search (Frigate) and the kinds to show. */
   .ev-tools { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 6px; }
-  .ev-tools[hidden] { display: none; }
   .ev-search { display: flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; border: 1px solid var(--divider-color);
     border-radius: 18px; min-height: 34px; }
   .ev-search:focus-within { border-color: var(--primary-color); }
@@ -2836,8 +2835,7 @@ class SSTimelineCard extends HTMLElement {
       prefs.set("kinds", [...this._kinds]);
       this._drawKinds();
       this._drawTimeline();
-      this._resetEvents(); // the bookmarks, of these kinds (a search shown is only redrawn)
-      if (this._search) this._drawEvents();
+      this._resetEvents(); // the bookmarks, of these kinds (drawn: a search shown, filtered anew)
       return;
     }
     if (b.dataset.similar) {
@@ -3304,6 +3302,13 @@ class SSTimelineCard extends HTMLElement {
     if (key === this._evKindsKey) return;
     this._evKindsKey = key;
     this._evKinds = kinds;
+    // A kind chosen as another spelling ("car" once, "Car" now): as it is written now.
+    const as = new Map(kinds.map(([k]) => [k.toLowerCase(), k]));
+    const chosen = new Set([...this._kinds].map((k) => as.get(k.toLowerCase()) ?? k));
+    if (chosen.size !== this._kinds.size || [...chosen].some((k) => !this._kinds.has(k))) {
+      this._kinds = chosen;
+      prefs.set("kinds", [...chosen]);
+    }
     this._drawKinds();
   }
 
@@ -3369,7 +3374,6 @@ class SSTimelineCard extends HTMLElement {
     this._searchHead.hidden = true;
     this._syncTools();
     this._searchInput.value = "";
-    this._activeEvent = undefined; // the bookmark rows are new: highlight again
     this._drawEvents();
     this._fillRoom();
   }

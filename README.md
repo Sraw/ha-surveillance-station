@@ -134,23 +134,26 @@ bookmarks are the event source.
   above the list asks Frigate's semantic search, in words ("white car",
   "person with a box"; English, Frigate's CLIP model), or "similar to" a
   bookmark (the button on a Frigate bookmark's row: by the foremost object
-  Frigate saw on that camera then, image to image). Frigate finds; SS plays:
-  each result is placed on the SS camera its Frigate camera maps to, at its
-  start time; one on a Frigate bookmark's camera and time is that bookmark
-  (name, comment), listed once. Matched by camera and time, not by Frigate's
-  review ids: Frigate deletes reviews with its own recordings (days), but
-  keeps tracked objects as long as their snapshots. Results come best first,
-  each with Frigate's crop of the object, and the kind chips filter them too
-  (a bookmarked one by its name). Tapping one plays SS's recording from 3 s
-  before it. Objects that never became a review (outside `required_zones`)
-  can be found too, without a bookmark. Needs `semantic_search.enabled` in
-  Frigate; on a machine whose iGPU also decodes and detects, keep it on the
-  CPU (`model_size: small`): with `large` on the iGPU, a burst of searches
-  here hung the GPU, and the cameras' decoders came back crippled until
-  Frigate restarted. Frigate (0.18) answers two semantic searches at once
-  with nothing, so this integration asks them one at a time. Frigate deletes a tracked object, and so what can be found, with
-  its snapshot (`snapshots.retain`): keep that as long as SS keeps
-  recordings.
+  seen in it, image to image). Frigate finds; SS plays: each result is
+  placed on the SS camera its Frigate camera maps to, at its start time. One
+  on a Frigate bookmark of its kind on that camera then (the one it began
+  in, else the one it overlaps most) is that bookmark, listed once. Matched
+  by camera and time, not by Frigate's review ids: Frigate deletes reviews
+  with its own recordings (days), but keeps tracked objects as long as their
+  snapshots. Results come best first, each with Frigate's crop of the
+  object, and the kind chips filter them too (a bookmarked one by its name).
+  Tapping one plays SS's recording from 3 s before it. Objects that never
+  became a review (outside `required_zones`) can be found too, without a
+  bookmark. Frigate ranks the best 100 of all cameras before filtering by
+  camera, so with a few cameras shown there may be fewer results.
+  Needs `semantic_search.enabled` in Frigate; on a machine whose iGPU also
+  decodes and detects, keep it on the CPU (`model_size: small`): with
+  `large` on the iGPU, a burst of searches here hung the GPU, and the
+  cameras' decoders came back crippled until Frigate restarted. Frigate
+  (0.18) answers two semantic searches at once with nothing, so this
+  integration asks them one at a time (and an empty answer once more).
+  Frigate deletes a tracked object, and so what can be found, with its
+  snapshot (`snapshots.retain`): keep that as long as SS keeps recordings.
 
 URL parameters override on load: `?ss_camera=<name|id>&ss_time=<epoch seconds>`.
 A notification can link straight to a moment this way.

@@ -32,7 +32,7 @@ from .const import (
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
-from .frigate import DATA_FRIGATE
+from .frigate import DATA_FRIGATE, name_kinds
 from .frigate_api import FrigateAPIError
 from .search import search
 from .views import DATA_MANAGER, VodManager, VodSession
@@ -242,11 +242,6 @@ async def ws_bookmark_page(
         }
 
     await _run(hass, connection, msg, go())
-
-
-def name_kinds(name: str) -> list[str]:
-    """What a bookmark's name says was seen: "Person, Car" is Person and Car."""
-    return [k.strip() for k in name.split(",") if k.strip()]
 
 
 def _kind_counts(bookmarks: list[Bookmark]) -> list[list[Any]]:

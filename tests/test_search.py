@@ -11,7 +11,7 @@ from pytest_homeassistant_custom_component.test_util.aiohttp import AiohttpClien
 from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 from synology_ss_playback import Bookmark, Camera
 
-from custom_components.surveillance_station import search as search_mod
+from custom_components.surveillance_station import frigate as frigate_mod, search as search_mod
 from custom_components.surveillance_station.const import FRIGATE_IMAGE_URL
 from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge
 from custom_components.surveillance_station.frigate_api import FrigateAPI
@@ -105,19 +105,72 @@ async def test_cameras_filter(hass: HomeAssistant, bridge: FrigateBridge, hass_w
     assert "cameras" not in query_of(aioclient_mock, "events/search")
 
 
+async def test_similar_by_review(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
+    """While Frigate has the bookmark's review: its foremost object, exactly."""
+    aioclient_mock.get(f"{F}/api/review/r1", json={"data": {"detections": ["o0", "o1"]}})
+    aioclient_mock.get(f"{F}/api/events/o0", json={"id": "o0", "label": "bicycle"})
+    aioclient_mock.get(f"{F}/api/events/o1", json={"id": "o1", "label": "car"})
+    aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o7", start=T0 + 905, end=T0 + 915, label="person")])
+    msg = await ask(hass, hass_ws_client, bookmark_id=21)
+    assert [r["key"] for r in msg["result"]["results"]] == ["b22"]
+    assert query_of(aioclient_mock, "events/search")["event_id"] == "o1"
+    assert not any(str(c[1]).endswith("/api/events") for c in aioclient_mock.mock_calls)
+
+
 async def test_similar_to_a_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
-    """By the foremost object Frigate saw on that camera then (its review may be gone); that bookmark not a result."""
+    """Its review gone: the foremost object Frigate saw on that camera then; that bookmark not a result."""
+    aioclient_mock.get(f"{F}/api/review/r1", status=404)
+    aioclient_mock.get(f"{F}/api/config", json=CONFIG)
     aioclient_mock.get(f"{F}/api/events", json=[
         obj("o0", label="bicycle"), obj("o9", camera="backyard", label="person"), obj("o1", label="car"),
         obj("o2", label="car", start=T0 + 300, end=T0 + 310),  # on the camera, not in the bookmark's time
     ])
-    aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o7", start=T0 + 905, end=T0 + 915)])
+    aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o7", start=T0 + 905, end=T0 + 915, label="person")])
     msg = await ask(hass, hass_ws_client, bookmark_id=21)
     assert [r["key"] for r in msg["result"]["results"]] == ["b22"]
     assert query_of(aioclient_mock, "events/search") == {"event_id": "o1", "search_type": "similarity", "limit": "100"}
+    # Back an hour (a car there long before its review), on that camera only.
     assert query_of(aioclient_mock, "/api/events?") == {
-        "after": str(T0 + 40), "before": str(T0 + 113), "has_snapshot": "1", "limit": "100",
+        "after": str(T0 + 100 - 3600), "before": str(T0 + 113), "has_snapshot": "1", "limit": "100", "cameras": "drive_way",
     }
+
+
+async def test_which_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
+    """A car there all day is the car bookmark it overlaps (not the newest one of the day, a person's); one
+    still being tracked, begun before its bookmark, is that bookmark; an object of no bookmark's kind, none."""
+    aioclient_mock.get(f"{F}/api/events/search", json=[
+        obj("o1", start=T0 + 50, end=T0 + 5000),
+        obj("o2", label="person", start=T0 + 895, end=None),
+        obj("o3", label="dog", start=T0 + 905, end=T0 + 910),
+    ])
+    with patch.object(search_mod.time, "time", return_value=T0 + 950):
+        msg = await ask(hass, hass_ws_client, query="car")
+    assert [(r["key"], r["name"]) for r in msg["result"]["results"]] == [("b21", "Car"), ("b22", "Person"), ("o3", "Animal")]
+
+
+async def test_empty_answer_asked_again(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
+    """Frigate answering nothing (another client's search at the same time): asked once more."""
+    answers = iter([[], [obj("o1")]])
+
+    async def frigate(path, params=None):
+        return next(answers) if "search" in path else {}
+
+    with patch.object(bridge.api, "json", frigate), patch.object(search_mod, "_EMPTY_RETRY_SECONDS", 0):
+        msg = await ask(hass, hass_ws_client, query="car")
+    assert [r["key"] for r in msg["result"]["results"]] == ["b21"]
+
+
+async def test_frigate_cameras_listed_again(hass: HomeAssistant, bridge: FrigateBridge, aioclient_mock) -> None:
+    """A camera Frigate didn't have: its list asked again after a minute (added or renamed), not every search."""
+    aioclient_mock.get(f"{F}/api/config", json={"cameras": {"drive_way": {}}})
+    assert await bridge.frigate_cameras([6, 7]) == ["drive_way"]
+    assert await bridge.frigate_cameras([6, 7]) == ["drive_way"]
+    assert len(aioclient_mock.mock_calls) == 1
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/config", json=CONFIG)
+    later = frigate_mod._monotonic() + 61
+    with patch.object(frigate_mod, "_monotonic", return_value=later):
+        assert await bridge.frigate_cameras([6, 7]) == ["drive_way", "backyard"]
 
 
 async def test_errors(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
@@ -131,8 +184,13 @@ async def test_errors(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client
     for bookmark_id in (20, 99):
         msg = await ask(hass, hass_ws_client, bookmark_id=bookmark_id)
         assert msg["error"]["code"] == "invalid_format" and "isn't one of Frigate's" in msg["error"]["message"]
+    aioclient_mock.get(f"{F}/api/review/r1", status=404)
+    aioclient_mock.get(f"{F}/api/config", status=500)
     aioclient_mock.get(f"{F}/api/events", json={"odd": "answer"})
     assert "no longer has" in (await ask(hass, hass_ws_client, bookmark_id=21))["error"]["message"]
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(f"{F}/api/review/r1", status=500)
+    assert (await ask(hass, hass_ws_client, bookmark_id=21))["error"]["code"] == "frigate_error"
     # Nothing to search by, both, blank words; no Frigate URL; Frigate detections off.
     for bad in ({}, {"query": "car", "bookmark_id": 21}, {"query": ""}):
         assert (await ask(hass, hass_ws_client, **bad))["error"]["code"] == "invalid_format"
@@ -150,7 +208,7 @@ async def test_search_time_limit(hass: HomeAssistant, bridge: FrigateBridge, has
 
     with patch.object(search_mod, "SEARCH_TIMEOUT_SECONDS", 0.05), patch.object(bridge.api, "json", hang):
         msg = await ask(hass, hass_ws_client, query="car")
-    assert msg["error"] == {"code": "frigate_error", "message": "search: no answer in time"}
+    assert msg["error"] == {"code": "frigate_error", "message": "search: no answer in time (Frigate or Surveillance Station)"}
 
 
 async def test_cameras_say_search(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client) -> None:

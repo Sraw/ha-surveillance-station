@@ -102,6 +102,11 @@ _monotonic = time.monotonic
 _REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]")
 
 
+def name_kinds(name: str) -> list[str]:
+    """What a bookmark's name says was seen: "Person, Car" is Person and Car."""
+    return [k.strip() for k in name.split(",") if k.strip()]
+
+
 def review_id_of(comment: str | None) -> str | None:
     """The Frigate review a bookmark was made for (its comment names it)."""
     return m.group(1) if (m := _REVIEW_ID.search(comment or "")) else None
@@ -924,18 +929,33 @@ class FrigateBridge:
         """Frigate's cameras that are these SS cameras (None: Frigate's list unknown)."""
         if self.api is None:
             return None
-        if _monotonic() - self._frigate_cameras_at > FRIGATE_CAMERAS_TTL:
+        wanted = set(ss_ids)
+
+        async def names() -> list[str]:
+            return [n for n in self._frigate_camera_names if (c := await self._camera(n)) is not None and c[0] in wanted]
+
+        age = _monotonic() - self._frigate_cameras_at
+        found = await names() if age <= FRIGATE_CAMERAS_TTL else []
+        # Listed again every FRIGATE_CAMERAS_TTL, or after a minute for a
+        # camera not among them (added or renamed in Frigate).
+        if age > FRIGATE_CAMERAS_TTL or (len({self._ss_id(n) for n in found} & wanted) < len(wanted) and age > 60):
+            self._frigate_cameras_at = _monotonic()  # also after a failure: not every search
             try:
                 config = await self.api.json("/api/config")
             except FrigateAPIError:
-                return None
+                return None  # not known now: the caller filters Frigate's answer itself
             cameras = config.get("cameras") if isinstance(config, dict) else None
-            self._frigate_camera_names = [c for c in cameras if isinstance(c, str)] if isinstance(cameras, dict) else []
-            self._frigate_cameras_at = _monotonic()
+            if isinstance(cameras, dict):
+                self._frigate_camera_names = [c for c in cameras if isinstance(c, str)]
+            found = await names()
         if not self._frigate_camera_names:
             return None
-        wanted = set(ss_ids)
-        return [n for n in self._frigate_camera_names if (c := await self._camera(n)) is not None and c[0] in wanted]
+        return found
+
+    def _ss_id(self, frigate_camera: str) -> int | None:
+        key = camera_key(frigate_camera)
+        found = self._cameras_by_name.get(self._aliases[key]) if key in self._aliases else self._cameras.get(key)
+        return found[0] if found else None
 
     def image_from_frigate(self) -> bool:
         """Whether to ask Frigate for an image now (it has an API, and didn't fail just now)."""
