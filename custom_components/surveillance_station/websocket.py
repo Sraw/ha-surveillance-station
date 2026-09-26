@@ -253,11 +253,15 @@ def _kind_counts(bookmarks: list[Bookmark]) -> list[list[Any]]:
     """The kinds to filter the event list by: those of more than one bookmark
     (a hand-made bookmark's own name is no kind), most common first."""
     counts: dict[str, int] = {}
+    spellings: dict[str, dict[str, int]] = {}  # "car": {"Car": 3, "car": 1}
     for b in bookmarks:
         for k in name_kinds(b.name):
-            counts[k] = counts.get(k, 0) + 1
+            key = k.casefold()
+            counts[key] = counts.get(key, 0) + 1
+            spellings.setdefault(key, {})[k] = spellings.setdefault(key, {}).get(k, 0) + 1
     common = sorted((kc for kc in counts.items() if kc[1] > 1), key=lambda kc: (-kc[1], kc[0]))
-    return [[k, n] for k, n in common[:KIND_CHIPS_MAX]]
+    # Each kind as it is mostly written.
+    return [[max(spellings[k].items(), key=lambda s: s[1])[0], n] for k, n in common[:KIND_CHIPS_MAX]]
 
 
 @websocket_api.websocket_command(

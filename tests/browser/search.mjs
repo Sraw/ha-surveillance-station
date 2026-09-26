@@ -43,6 +43,18 @@ console.log("thumbnail widths:", imgs);
 check(imgs.length > 0 && imgs.every((w) => w > 0), "result thumbnails load");
 await page.screenshot({ path: "search-results.png" });
 
+// A chip chosen during a search: after closing it, the list is of that kind.
+await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-kinds button")].find((b) => b.dataset.kind === "Person").click());
+await sleep(2500);
+await ev((c) => c.shadowRoot.querySelector('[data-act="search-close"]').click());
+await sleep(1500);
+const persons = await rows();
+check(persons.length > 0 && persons.every((n) => n.split(", ").includes("Person")), "after the search, the list is of the chip chosen meanwhile");
+await ev((c) => c.shadowRoot.querySelector('.ev-kinds button[data-kind="Person"]').click());
+await sleep(2000);
+await ev((c) => { const i = c.shadowRoot.querySelector(".ev-search input"); i.value = "white car"; i.form.requestSubmit(); });
+for (let i = 0; i < 20 && (await ev((c) => c._search?.loading)); i++) await sleep(500);
+
 // Tap the first: plays that camera from 3 s before.
 const first = await ev((c) => c._search.items[0]);
 await ev((c) => c.shadowRoot.querySelector(".ev-items .ev").click());

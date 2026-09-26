@@ -242,6 +242,12 @@ class FrigateBridge:
         # last error (apart from the bookmarks' last_error).
         self._image_down_until = -math.inf
         self._image_error: tuple[float, str] | None = None
+        # Frigate's camera names (its config), for searching some cameras only.
+        self._frigate_camera_names: list[str] = []
+        self._frigate_cameras_at = -math.inf
+        # Frigate's semantic search answers two queries at once with nothing
+        # (0.18, measured: empty lists, no error): ours go one at a time.
+        self.search_lock = asyncio.Lock()
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
         self._last_error: tuple[float, str] | None = None
@@ -914,12 +920,30 @@ class FrigateBridge:
         """The SS camera (id, name) a Frigate camera is, as its reviews are bookmarked on."""
         return await self._camera(frigate_camera)
 
+    async def frigate_cameras(self, ss_ids: list[int]) -> list[str] | None:
+        """Frigate's cameras that are these SS cameras (None: Frigate's list unknown)."""
+        if self.api is None:
+            return None
+        if _monotonic() - self._frigate_cameras_at > FRIGATE_CAMERAS_TTL:
+            try:
+                config = await self.api.json("/api/config")
+            except FrigateAPIError:
+                return None
+            cameras = config.get("cameras") if isinstance(config, dict) else None
+            self._frigate_camera_names = [c for c in cameras if isinstance(c, str)] if isinstance(cameras, dict) else []
+            self._frigate_cameras_at = _monotonic()
+        if not self._frigate_camera_names:
+            return None
+        wanted = set(ss_ids)
+        return [n for n in self._frigate_camera_names if (c := await self._camera(n)) is not None and c[0] in wanted]
+
     def image_from_frigate(self) -> bool:
         """Whether to ask Frigate for an image now (it has an API, and didn't fail just now)."""
         return self.api is not None and _monotonic() >= self._image_down_until
 
-    def count_image(self, frigate: bool, err: Exception | None = None) -> None:
-        """How an image went: Frigate's; SS's for want of a snapshot; SS's because Frigate failed (err)."""
+    def count_image(self, frigate: bool, err: Exception | None = None, asked: bool = True) -> None:
+        """How an image went: Frigate's; SS's for want of a snapshot; SS's because Frigate
+        failed (err); SS's without asking Frigate (not asked: it failed just now)."""
         if frigate:
             self._counts["images_frigate"] += 1
             if self._image_down_until > -math.inf:
@@ -927,10 +951,13 @@ class FrigateBridge:
             self._image_down_until = -math.inf
             return
         self._counts["images_ss"] += 1
+        if not asked:
+            return
         if err is None:
             self._counts["images_no_snapshot"] += 1
             return
-        text = str(err) if isinstance(err, FrigateAPIError) else f"{type(err).__name__}: {str(err)[:200]}"
+        detail = str(err)[:200]
+        text = str(err) if isinstance(err, FrigateAPIError) else f"{type(err).__name__}: {detail}" if detail else type(err).__name__
         self._image_error = (time.time(), text)
         if self._image_down_until == -math.inf:
             _LOGGER.warning("No notification image from Frigate (%s); using Surveillance Station's frames for now", text)
@@ -1067,6 +1094,8 @@ class FrigateImageView(HomeAssistantView):
                 # It may get better while the review goes on; a phone fetches it once.
                 return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=60"})
             bridge.count_image(False, failed)
+        elif bridge is not None and bridge.api is not None:
+            bridge.count_image(False, asked=False)
         # No Frigate (unloaded, unreachable, failing) or no snapshot: SS's frame of the moment.
         try:
             async with asyncio.timeout(FRIGATE_IMAGE_FALLBACK_SECONDS):

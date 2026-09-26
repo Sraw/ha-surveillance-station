@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.0";
+const CARD_VERSION = "0.14.1";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -454,7 +454,7 @@ const STYLE = `
   .ev-foot { padding: 10px 4px; font-size: 12px; color: var(--secondary-text-color); text-align: center; }
   /* Smart search (Frigate) and the kinds to show. */
   .ev-tools { display: flex; flex-direction: column; gap: 6px; padding: 0 8px 6px; }
-  .ev-tools:not(:has(> :not([hidden]))) { display: none; }
+  .ev-tools[hidden] { display: none; }
   .ev-search { display: flex; align-items: center; gap: 6px; padding: 0 4px 0 10px; border: 1px solid var(--divider-color);
     border-radius: 18px; min-height: 34px; }
   .ev-search:focus-within { border-color: var(--primary-color); }
@@ -471,10 +471,10 @@ const STYLE = `
   .ev-kinds .n { font-size: 11px; opacity: .7; font-variant-numeric: tabular-nums; }
   .evrow { position: relative; }
   .evrow .sim { position: absolute; right: 4px; bottom: 4px; width: 28px; min-width: 28px; height: 28px; --mdc-icon-size: 18px;
-    color: var(--secondary-text-color); opacity: 0; }
-  .evrow:hover .sim, .evrow .sim:focus-visible { opacity: 1; }
-  .evrow:has(.sim) .evt { padding-right: 28px; }
-  @media (hover: none) { .evrow .sim { opacity: .75; } }
+    color: var(--secondary-text-color); opacity: 0; pointer-events: none; }
+  .evrow:hover .sim, .evrow .sim:focus-visible { opacity: 1; pointer-events: auto; }
+  .evrow.has-sim .evt { padding-right: 28px; }
+  @media (hover: none) { .evrow .sim { opacity: .75; pointer-events: auto; } }
   /* A tracked object's crop (a search result): whole, not filling the frame. */
   .thumb.obj { background: #111; }
   .thumb.obj img { object-fit: contain; }
@@ -2206,6 +2206,7 @@ class SSTimelineCard extends HTMLElement {
     this._cameras = res.cameras.filter((c) => c.enabled);
     this._searchable = !!res.search;
     if (this._searchForm) this._searchForm.hidden = !this._searchable;
+    this._syncTools();
     if (!this._cameras.length) {
       this._stageMessage("No enabled cameras in Surveillance Station", "empty");
       return;
@@ -2405,6 +2406,7 @@ class SSTimelineCard extends HTMLElement {
     // The field's own clear (×): back to all events.
     this._searchInput.addEventListener("search", () => !this._searchInput.value && this._endSearch());
     this._drawKinds();
+    this._syncTools();
     this._when = $(".when");
     this._jumpBox = $(".jump:not(.shows)");
     this._showsBox = $(".shows");
@@ -2834,8 +2836,8 @@ class SSTimelineCard extends HTMLElement {
       prefs.set("kinds", [...this._kinds]);
       this._drawKinds();
       this._drawTimeline();
+      this._resetEvents(); // the bookmarks, of these kinds (a search shown is only redrawn)
       if (this._search) this._drawEvents();
-      else this._resetEvents();
       return;
     }
     if (b.dataset.similar) {
@@ -3063,7 +3065,9 @@ class SSTimelineCard extends HTMLElement {
 
   /** Start the list over (the cameras shown changed, or first load). */
   _resetEvents() {
-    if (this._search) this._runSearch(this._search.params, this._search.label); // the cameras shown changed
+    // A search follows the cameras shown (not a reconnect or a periodic start-over).
+    const s = this._search;
+    if (s && s.cams !== this._shown.join()) this._runSearch(s.params, s.label);
     this._evSeq++;
     this._evItems = [];
     this._evMore = true;
@@ -3078,7 +3082,7 @@ class SSTimelineCard extends HTMLElement {
 
   /** The next page, older than the last event listed. */
   async _loadMoreEvents() {
-    if (this._evLoading || !this._evMore || !this._shown.length) return;
+    if (this._evLoading || !this._evMore || !this._shown.length || this._search) return;
     const seq = this._evSeq;
     const last = this._evItems.at(-1);
     this._evLoading = true;
@@ -3109,7 +3113,11 @@ class SSTimelineCard extends HTMLElement {
     this._evTotal = res.total;
     this._setKinds(res.kinds);
     this._drawEvents();
-    // Still room on screen (a tall sidebar): keep going.
+    this._fillRoom();
+  }
+
+  /** Still room on screen (a tall sidebar): the next page. */
+  _fillRoom() {
     requestAnimationFrame(() => {
       const r = this._evList.getBoundingClientRect();
       const f = this._evFoot.getBoundingClientRect();
@@ -3183,7 +3191,9 @@ class SSTimelineCard extends HTMLElement {
           ? `Search failed: ${s.error}`
           : n
             ? "Found by Frigate; plays from Surveillance Station"
-            : "No matches";
+            : s.items.length
+              ? `No ${[...this._kinds].join(" / ")} matches`
+              : "No matches";
       return;
     }
     const kinds = this._kinds.size ? `${[...this._kinds].join(" / ")} ` : "";
@@ -3240,7 +3250,7 @@ class SSTimelineCard extends HTMLElement {
       const id = s ? e.bookmark_id : e.id;
       node(
         `${s ? "s:" + e.key : "e:" + e.id}:${e.start}:${e.end}:${e.camera_id}:${e.name}:${e.comment}:${this._searchable}`,
-        `<div class="evrow"><button class="ev" ${s ? `data-sr="${esc(e.key)}"` : `data-ev="${e.id}"`} style="--cam:${this._camColor(e.camera_id)}">
+        `<div class="evrow${similar(id, e.comment) ? " has-sim" : ""}"><button class="ev" ${s ? `data-sr="${esc(e.key)}"` : `data-ev="${e.id}"`} style="--cam:${this._camColor(e.camera_id)}">
           <span class="thumb${s ? " obj" : ""}"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
           <span class="evt">
             <span class="n">${esc(e.name || "(unnamed)")}</span>
@@ -3304,6 +3314,7 @@ class SSTimelineCard extends HTMLElement {
     const counts = new Map(this._evKinds);
     for (const k of this._kinds) if (!counts.has(k)) counts.set(k, 0);
     el.hidden = counts.size < 2 && !this._kinds.size; // one kind only: nothing to choose
+    this._syncTools();
     el.innerHTML = [...counts]
       .map(([k, n]) => {
         const on = this._kinds.has(k);
@@ -3314,15 +3325,23 @@ class SSTimelineCard extends HTMLElement {
       .join("");
   }
 
+  /** The tools row takes no room when it has nothing to show. */
+  _syncTools() {
+    const tools = this._searchForm?.parentElement;
+    if (tools) tools.hidden = [...tools.children].every((c) => c.hidden);
+  }
+
   _searchShown() {
-    return (this._search?.items ?? []).filter((r) => this._kindOk(r.kind));
+    // As the list does: a bookmark by its name ("Person, Car" found by its car is a Person too).
+    return (this._search?.items ?? []).filter((r) => this._kindOk(r.bookmark_id != null ? r.name : r.kind));
   }
 
   /** Ask Frigate (through the integration): {query} or {bookmark_id} (similar to it). */
   async _runSearch(params, label) {
     const seq = ++this._srSeq;
-    this._search = { params, label, items: [], loading: true, error: null };
+    this._search = { params, label, items: [], loading: true, error: null, cams: this._shown.join() };
     this._searchHead.hidden = false;
+    this._syncTools();
     this._searchHead.querySelector(".t").textContent = label;
     if (!("query" in params)) this._searchInput.value = "";
     this._evList.scrollTop = 0;
@@ -3348,8 +3367,11 @@ class SSTimelineCard extends HTMLElement {
     if (!this._search) return;
     this._search = null;
     this._searchHead.hidden = true;
+    this._syncTools();
     this._searchInput.value = "";
+    this._activeEvent = undefined; // the bookmark rows are new: highlight again
     this._drawEvents();
+    this._fillRoom();
   }
 
   /** Highlight the events the playhead is in (on the cameras shown). */

@@ -238,7 +238,7 @@ async def test_bookmark_page_kinds(
     hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator, mock_client
 ) -> None:
     """Only the kinds asked for (a part of the name, any case); the kinds there are to choose, most common first."""
-    names = ["Person", "Person, Car", "Car", "Animal", "My mark", "car"]
+    names = ["Person", "Person, Car", "Car", "Animal", "My mark", "car"]  # "car" counts as Car
     mock_client.list_bookmarks.return_value = [
         Bookmark(id=10 - i, camera_id=6, name=n, comment="", start=T0 + 100 * (10 - i), end=T0 + 100 * (10 - i) + 5)
         for i, n in enumerate(names)
@@ -247,12 +247,13 @@ async def test_bookmark_page_kinds(
     await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", "kinds": ["car"]})
     res = (await ws.receive_json())["result"]
     assert [b["name"] for b in res["bookmarks"]] == ["Person, Car", "Car", "car"] and res["total"] == 3
-    # Counted over every bookmark of the cameras (not just the kinds shown); one-offs aren't kinds.
-    assert res["kinds"] == [["Car", 2], ["Person", 2]]
+    # Counted over every bookmark of the cameras (not just the kinds shown), any case, as mostly written;
+    # one-offs aren't kinds.
+    assert res["kinds"] == [["Car", 3], ["Person", 2]]
     await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", "kinds": [" Person ", "Animal"]})
     res = (await ws.receive_json())["result"]
     assert [b["name"] for b in res["bookmarks"]] == ["Person", "Person, Car", "Animal"]
-    assert res["kinds"] == [["Car", 2], ["Person", 2]]
+    assert res["kinds"] == [["Car", 3], ["Person", 2]]
     await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page", "kinds": []})
     assert (await ws.receive_json())["result"]["total"] == 6
 
