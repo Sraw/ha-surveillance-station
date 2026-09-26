@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.5";
+const CARD_VERSION = "0.14.6";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -479,9 +479,6 @@ const STYLE = `
   .evrow:hover .sim, .evrow .sim:focus-visible { opacity: 1; pointer-events: auto; }
   .evrow.has-sim .evt { padding-right: 28px; }
   @media (hover: none) { .evrow .sim { opacity: .75; pointer-events: auto; } }
-  /* A tracked object's crop (a search result): whole, not filling the frame. */
-  .thumb.obj { background: #111; }
-  .thumb.obj img { object-fit: contain; }
 `;
 
 /**
@@ -3258,7 +3255,7 @@ class SSTimelineCard extends HTMLElement {
       node(
         `${s ? "s:" + e.key : "e:" + e.id}:${e.start}:${e.end}:${e.camera_id}:${e.name}:${e.comment}:${this._searchable}`,
         `<div class="evrow${similar(id, e.comment) ? " has-sim" : ""}"><button class="ev" ${s ? `data-sr="${esc(e.key)}"` : `data-ev="${e.id}"`} style="--cam:${this._camColor(e.camera_id)}">
-          <span class="thumb${s ? " obj" : ""}"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
+          <span class="thumb"><ha-icon icon="mdi:cctv"></ha-icon>${thumb}${dur ? `<span class="dur">${dur}</span>` : ""}</span>
           <span class="evt">
             <span class="n">${esc(e.name || "(unnamed)")}</span>
             <span class="m"><i></i>${esc(this._cameraName(e.camera_id))} · ${when}</span>

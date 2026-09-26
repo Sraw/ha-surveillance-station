@@ -300,20 +300,3 @@ async def test_unloaded_while_settling(hass: HomeAssistant, bridge: FrigateBridg
         bridge.stop()
         await hass.async_block_till_done()
     assert not events and RID in bridge._not_yet
-
-
-async def test_object_thumbnail(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth, aioclient_mock) -> None:
-    """A search result's thumbnail: Frigate's, signed; gone is 404, Frigate failing 502."""
-    manager = hass.data[DATA_MANAGER]
-    url = manager.sign_path(f"{FRIGATE_IMAGE_URL}/{bridge.entry_id}/object/e1.webp")
-    http = await hass_client_no_auth()
-    aioclient_mock.get(f"{F}/api/events/e1/thumbnail.webp", content=WEBP)
-    resp = await http.get(url)
-    assert resp.status == 200 and await resp.read() == WEBP and resp.content_type == "image/webp"
-    assert (await http.get(url.split("?")[0] + "?exp=1&sig=x")).status == 404
-    for status, want in ((404, 404), (500, 502)):
-        aioclient_mock.clear_requests()
-        aioclient_mock.get(f"{F}/api/events/e1/thumbnail.webp", status=status)
-        assert (await http.get(url)).status == want
-    bridge.api = None
-    assert (await http.get(url)).status == 404

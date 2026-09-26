@@ -38,9 +38,12 @@ const found = await ev((c) => c._search.items.map((r) => `${r.name}|${c._cameraN
 console.log("white car:", found.slice(0, 6), "error:", await ev((c) => c._search.error));
 check(found.length > 0, "search found results");
 await sleep(3000);
-const imgs = await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items img")].slice(0, 5).map((i) => i.naturalWidth));
-console.log("thumbnail widths:", imgs);
-check(imgs.length > 0 && imgs.every((w) => w > 0), "result thumbnails load");
+for (let i = 0; i < 20 && !(await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items img")].slice(0, 5).every((img) => img.naturalWidth))); i++) await sleep(1000);
+const imgs = await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items img")].slice(0, 5).map((i) => [i.naturalWidth, i.naturalHeight]));
+console.log("thumbnail sizes:", JSON.stringify(imgs));
+check(imgs.length > 0 && imgs.every(([w]) => w > 0), "result thumbnails load");
+// These cameras' main streams are all 16:9 (not a square crop).
+check(imgs.every(([w, h]) => Math.abs(w / h - 16 / 9) < 0.05), "result thumbnails are 16:9 (the bookmark's SS frame)");
 await page.screenshot({ path: "search-results.png" });
 
 // A chip chosen during a search: after closing it, the list is of that kind.

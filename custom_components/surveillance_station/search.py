@@ -23,7 +23,7 @@ from typing import Any
 
 from synology_ss_playback import Bookmark
 
-from .const import FRIGATE_IMAGE_URL, FRIGATE_SEARCH_ASK, FRIGATE_SEARCH_MAX
+from .const import FRIGATE_SEARCH_ASK, FRIGATE_SEARCH_MAX
 from .frigate import FrigateBridge, kinds, name_kinds, review_id_of
 from .frigate_api import FRIGATE_ID, FrigateAPIError
 from .views import VodManager
@@ -142,7 +142,9 @@ async def _search(
                 "bookmark_id": bm.id,
                 "name": bm.name,
                 "comment": bm.comment,
-                "thumbnail": manager.sign_path(f"{FRIGATE_IMAGE_URL}/{entry_id}/object/{obj['id']}.webp"),
+                # The bookmark's own (SS's main stream, as the event list shows it): the camera's
+                # frame, sharp, where Frigate's crop of the object is a small square.
+                "thumbnail": manager.sign_thumbnail(entry_id, bm.camera_id, manager.frame(entry_id, bm)),
             }
         )
         if len(results) >= min(limit, FRIGATE_SEARCH_MAX):

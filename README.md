@@ -134,23 +134,24 @@ bookmarks are the event source.
   above the list asks Frigate's semantic search, in words ("white car",
   "person with a box"; English, Frigate's CLIP model), or "similar to" a
   bookmark (the button on a Frigate bookmark's row: by the foremost object
-  seen in it of the bookmark's kinds, image to image). Frigate finds; SS plays: each result is
-  placed on the SS camera its Frigate camera maps to, at its start time, and
-  only one on a Frigate bookmark of its kind on that camera then (the one it
-  began in, else the one it overlaps most) is a result: that bookmark,
-  listed once. What Frigate saw and let go (outside the zones that count, a
-  kind not bookmarked) isn't an event, so it isn't found either. Matched
-  by camera and time, not by Frigate's review ids: Frigate deletes reviews
-  with its own recordings (days), but keeps tracked objects as long as their
-  snapshots. Results come best first, each with Frigate's crop of the
-  object, and the kind chips filter them too (by the bookmark's name, before
-  the first 30 are taken). Tapping one plays SS's recording from 3 s before
-  the object appears in its bookmark (one there since before the bookmark
-  plays from the bookmark's start). Frigate ranks the best 100 of all cameras before filtering by
-  camera, so with a few cameras shown there may be fewer results.
-  Needs `semantic_search.enabled` in Frigate; on a machine whose iGPU also
-  decodes and detects, keep it on the CPU (`model_size: small`): with
-  `large` on the iGPU, a burst of searches here hung the GPU, and the
+  seen in it of the bookmark's kinds, image to image). Frigate finds; SS
+  plays: each result is placed on the SS camera its Frigate camera maps to,
+  at its start time, and only one on a Frigate bookmark of its kind on that
+  camera then (the one it began in, else the one it overlaps most) is a
+  result: that bookmark, listed once. What Frigate saw and let go (outside
+  the zones that count, a kind not bookmarked) isn't an event, so it isn't
+  found either. Matched by camera and time, not by Frigate's review ids:
+  Frigate deletes reviews with its own recordings (days), but keeps tracked
+  objects as long as their snapshots. Results come best first, each with its
+  bookmark's thumbnail (SS's frame, as in the event list), and the kind
+  chips filter them too (by the bookmark's name, before the first 30 are
+  taken). Tapping one plays SS's recording from 3 s before the object
+  appears in its bookmark (one there since before the bookmark plays from
+  the bookmark's start). Frigate ranks the best 100 of all cameras before
+  filtering by camera, so with a few cameras shown there may be fewer
+  results. Needs `semantic_search.enabled` in Frigate; on a machine whose
+  iGPU also decodes and detects, keep it on the CPU (`model_size: small`):
+  with `large` on the iGPU, a burst of searches here hung the GPU, and the
   cameras' decoders came back crippled until Frigate restarted. Frigate
   (0.18) answers two semantic searches at once with nothing, so this
   integration asks them one at a time (and an empty answer once more).
@@ -446,9 +447,9 @@ one (after every HA restart, or after a day) with 401, and counts every 401 as
 a failed login, so a wall tablet left open would get its IP banned under
 `login_attempts_threshold`.
 
-Frigate's images (a notification's, a search result's) are signed the same
-way, under `/api/surveillance_station/frigate_image/…`; HA fetches them from
-Frigate and passes on only a JPEG or WebP (checked by its bytes). Only ids
+A notification's Frigate image is signed the same way, under
+`/api/surveillance_station/frigate_image/…`; HA fetches it from Frigate
+and passes on only a JPEG or WebP (checked by its bytes). Only ids
 shaped like Frigate's (`1790406867.462609-6jc58g`) go into Frigate's URLs.
 
 Every HA user can use the card and so see every camera, like HA's own camera

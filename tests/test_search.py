@@ -12,7 +12,6 @@ from pytest_homeassistant_custom_component.typing import WebSocketGenerator
 from synology_ss_playback import Bookmark, Camera
 
 from custom_components.surveillance_station import frigate as frigate_mod, search as search_mod
-from custom_components.surveillance_station.const import FRIGATE_IMAGE_URL
 from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge
 from custom_components.surveillance_station.frigate_api import FrigateAPI
 from custom_components.surveillance_station.views import DATA_MANAGER
@@ -77,7 +76,9 @@ async def test_words(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client,
         "start": T0 + 98, "end": T0 + 111, "bookmark_id": 21, "name": "Car",
         "comment": "Frigate alert in driveway [frigate r1]", "thumbnail": first["thumbnail"],
     }  # not the hand-made bookmark over the same time
-    assert first["thumbnail"].startswith(f"{FRIGATE_IMAGE_URL}/{bridge.entry_id}/object/o1.webp?exp=")
+    # The bookmark's SS thumbnail (16:9, as the event list's), not Frigate's square crop.
+    manager = hass.data[DATA_MANAGER]
+    assert first["thumbnail"] == manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, bridge.client.list_bookmarks.return_value[2]))
     # Frigate asked for the cameras shown only (its names for them).
     assert query_of(aioclient_mock, "events/search") == {
         "query": "white car", "search_type": "thumbnail,description", "limit": "100", "cameras": "drive_way",

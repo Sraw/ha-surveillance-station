@@ -1198,30 +1198,3 @@ def _compact(review: dict[str, Any]) -> dict[str, Any]:
             "data": {k: data.get(k) for k in ("objects", "zones", "thumb_time")},
         },
     }
-
-
-class FrigateObjectView(HomeAssistantView):
-    """A tracked object's thumbnail from Frigate (a smart search result's), signed like the rest."""
-
-    requires_auth = False
-    url = FRIGATE_IMAGE_URL + r"/{entry_id}/object/{event_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.webp"
-    name = "api:surveillance_station:frigate_object"
-
-    def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
-        self.hass = hass
-        self.manager = manager
-
-    async def get(self, request: web.Request, entry_id: str, event_id: str) -> web.Response:
-        if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
-            raise web.HTTPNotFound()
-        bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
-        if bridge is None or bridge.api is None:
-            raise web.HTTPNotFound()
-        try:
-            body, content_type = await bridge.api.image(f"/api/events/{event_id}/thumbnail.webp")
-        except FrigateAPIError as err:
-            _LOGGER.debug("Frigate thumbnail %s: %s", event_id, err)
-            # Gone (Frigate's retention): as a missing thumbnail; else Frigate is the trouble.
-            raise (web.HTTPNotFound() if err.status == 404 else web.HTTPBadGateway()) from None
-        # Not for long: an object still tracked gets a better thumbnail.
-        return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=600"})
