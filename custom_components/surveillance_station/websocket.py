@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from synology_ss_playback import (
+    CODECS,
     Bookmark,
     SSConnectionError,
     SSError,
     SurveillanceStationClient,
+    TimelapseRecording,
+    TranscodeSpec,
+    covered,
     live_edge,
+    output_size,
+    plan_day,
     plan_segments,
     recordings_from,
     runs_from_segments,
@@ -46,7 +54,10 @@ ERR_FRIGATE = "frigate_error"
 
 @callback
 def async_register(hass: HomeAssistant) -> None:
-    for handler in (ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_search, ws_live, ws_vod, ws_vod_runs):
+    for handler in (
+        ws_cameras, ws_recordings, ws_bookmarks, ws_bookmark_page, ws_search, ws_live, ws_vod, ws_vod_runs,
+        ws_timelapse_days, ws_timelapse,
+    ):
         websocket_api.async_register_command(hass, handler)
 
 
@@ -380,6 +391,161 @@ async def ws_vod_runs(hass: HomeAssistant, connection: websocket_api.ActiveConne
         session = _manager(hass).get_session(msg["token"])
         if session is None:
             raise KeyError("playback session expired")
+        if session.transcode:
+            raise KeyError("not a recordings session (time-lapse runs come with the session)")
         return _describe(session)
+
+    await _run(hass, connection, msg, go())
+
+
+def _day_bounds(day: date, tz: ZoneInfo) -> tuple[float, float]:
+    """[midnight, next midnight) of a NAS-local day (23 or 25 h across DST)."""
+    return _local(day, tz, 0), _local(day + timedelta(days=1), tz, 0)
+
+
+def _local(day: date, tz: ZoneInfo, hour: int) -> float:
+    return datetime(day.year, day.month, day.day, hour, tzinfo=tz).timestamp()
+
+
+def _camera_files(files: list[TimelapseRecording], camera_id: int) -> list[TimelapseRecording]:
+    """A camera's files, of one task: the one it recorded most recently with.
+
+    Two tasks of one camera (different rates, overlapping days) can't be
+    stitched into one day; SS's UI keeps them apart too.
+    """
+    mine = [f for f in files if f.camera_id == camera_id]
+    if not mine:
+        return []
+    task = max(mine, key=lambda f: f.start).task_id
+    return [f for f in mine if f.task_id == task]
+
+
+def _days(files: list[TimelapseRecording], tz: ZoneInfo) -> list[dict[str, Any]]:
+    """The NAS-local days one camera's files cover, newest first, with the stretches covered."""
+    stretches = sorted(covered(f) for f in files)
+    days: dict[date, list[list[float]]] = {}
+    for lo, hi in stretches:
+        if hi - lo < 60:
+            continue
+        day = datetime.fromtimestamp(lo, tz).date()
+        while True:
+            start, end = _day_bounds(day, tz)
+            if start >= hi:
+                break
+            a, b = max(lo, start), min(hi, end)
+            if b > a:
+                spans = days.setdefault(day, [])
+                if spans and a <= spans[-1][1] + 60:
+                    spans[-1][1] = max(spans[-1][1], b)
+                else:
+                    spans.append([a, b])
+            day += timedelta(days=1)
+    out = []
+    for day in sorted(days, reverse=True):
+        start, end = _day_bounds(day, tz)
+        out.append({
+            "date": day.isoformat(), "start": start, "end": end, "covered": days[day],
+            # Where 06:00, 12:00 and 18:00 fall (not a quarter of the day apart across DST).
+            "hours": {h: _local(day, tz, h) for h in (6, 12, 18)},
+        })
+    return out
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): "surveillance_station/timelapse_days", vol.Optional("entry_id"): str}
+)
+@websocket_api.async_response
+async def ws_timelapse_days(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """The cameras with a time-lapse task, and the days (NAS-local) each can show."""
+
+    async def go():
+        entry_id, client = _client(hass, msg.get("entry_id"))
+        manager = _manager(hass)
+        files = await manager.timelapse_files(entry_id, client)
+        tz = await client.timezone()
+        names = {c.id: c.name for c in await client.cameras()}
+        by_camera = {cid: _camera_files(files, cid) for cid in {f.camera_id for f in files}}
+        return {
+            "entry_id": entry_id,
+            "timezone": str(tz),
+            "hardware": await manager.hardware(),
+            "cameras": [
+                {"id": cid, "name": names.get(cid, str(cid)), "days": _days(by_camera[cid], tz)}
+                for cid in sorted(by_camera, key=lambda c: names.get(c, str(c)).lower())
+            ],
+        }
+
+    await _run(hass, connection, msg, go())
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "surveillance_station/timelapse",
+        vol.Optional("entry_id"): str,
+        vol.Required("camera_id"): vol.Coerce(int),
+        vol.Required("date"): vol.All(str, vol.Length(max=10), vol.Match(r"^\d{4}-\d{2}-\d{2}$")),
+        vol.Optional("codec", default="hevc"): vol.In(CODECS),
+    }
+)
+@websocket_api.async_response
+async def ws_timelapse(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """A playback session for one camera's time-lapse of one NAS-local day.
+
+    Its playlist and segments are the VOD views' (the same token scheme);
+    every segment is transcoded to ``codec`` (H.264 only without a GPU).
+    ``runs`` maps playlist time to wall time: each run is a stretch of one
+    file, played ``rate`` times faster than real time.
+    """
+
+    async def go():
+        entry_id, client = _client(hass, msg.get("entry_id"))
+        manager = _manager(hass)
+        day = date.fromisoformat(msg["date"])
+        tz = await client.timezone()
+        try:
+            start, end = _day_bounds(day, tz)
+        except OverflowError:
+            raise ValueError("date out of range") from None
+        files = _camera_files(await manager.timelapse_files(entry_id, client), msg["camera_id"])
+        segments, runs = plan_day(files, start, end)
+        hardware = await manager.hardware()
+        codec = msg["codec"] if hardware else "h264"
+        result: dict[str, Any] = {
+            "date": day.isoformat(), "start": start, "end": end, "codec": codec, "hardware": hardware,
+        }
+        if not segments:
+            return {**result, "url": None, "duration": 0, "runs": []}
+        by_id = {f.id: f for f in files}
+        transcode = {}
+        for rid in {seg.recording_id for seg in segments}:
+            f = by_id[rid]
+            width, height = output_size(f.width, f.height)
+            transcode[rid] = TranscodeSpec(codec, hardware, f.hevc, width, height)
+        session = VodSession(
+            entry_id, msg["camera_id"], start, segments, time.time() + VOD_SESSION_TTL_SECONDS, transcode=transcode
+        )
+        token = manager.create_timelapse_session(session)
+        last = segments[-1]
+        return {
+            **result,
+            "url": f"{VOD_URL}/{token}/index.m3u8",
+            "duration": last.media_start + last.duration,
+            "runs": [
+                {"media_start": r.media_start, "duration": r.duration, "wall_start": r.wall_start, "rate": r.rate}
+                for r in runs
+            ],
+            # Where the segments are, for a player that fetches them itself:
+            # <index i> starts at media time segments[i]. Every file's first
+            # segment has an init segment (init/<i>.mp4, the playlist's
+            # EXT-X-MAP); files transcoded to the same size give identical ones.
+            "segments": [s.media_start for s in segments],
+            "maps": [
+                {"index": s.index, "size": f"{transcode[s.recording_id].width}x{transcode[s.recording_id].height}"}
+                for s in segments
+                if s.new_map
+            ],
+        }
 
     await _run(hass, connection, msg, go())

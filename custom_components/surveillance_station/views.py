@@ -23,7 +23,9 @@ import hashlib
 import hmac
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Any
 import logging
+import math
 import re
 import secrets
 import time
@@ -36,8 +38,12 @@ from synology_ss_playback import (
     SSConnectionError,
     SSError,
     SurveillanceStationClient,
+    TimelapseRecording,
+    TranscodeSpec,
     fetch_segment,
     fetch_snapshot,
+    fetch_timelapse_segment,
+    hardware_transcode_available,
     live_edge,
     plan_segments,
     recordings_from,
@@ -64,6 +70,7 @@ from .const import (
     LIVE_URL,
     MAX_LIVE_STREAMS,
     MAX_PARALLEL_FETCHES,
+    MAX_PARALLEL_TRANSCODES,
     MAX_PARALLEL_THUMBNAILS,
     RECORDING_GAP_SECONDS,
     SEGMENT_CACHE_BYTES,
@@ -76,6 +83,9 @@ from .const import (
     THUMBNAIL_URL,
     THUMBNAIL_URL_TTL_HOURS,
     THUMBNAIL_WIDTH,
+    HARDWARE_RECHECK_SECONDS,
+    TIMELAPSE_HARDWARE,
+    TIMELAPSE_LIST_SECONDS,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
@@ -103,6 +113,9 @@ class VodSession:
     live: bool = False
     max_end: float = 0.0
     planned_end: float = 0.0
+    # A time-lapse session: how each file's segments are transcoded (by
+    # recording id). Empty for recordings, which are stream-copied.
+    transcode: dict[int, TranscodeSpec] = field(default_factory=dict)
     playlist: str = field(init=False, default="")
     lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
@@ -132,6 +145,21 @@ class VodManager:
         self._waiters: dict[tuple, int] = {}
         self._started: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
+        # Time-lapse segments: ~200 MB from the NAS and a GPU transcode each.
+        self._transcode_sem = asyncio.Semaphore(MAX_PARALLEL_TRANSCODES)
+        # ...of which one at a time on the GPU (see fetch_timelapse_segment).
+        self._gpu = asyncio.Semaphore(1)
+        # Time-lapse sessions ended by a newer one (answered 410, not 404, so
+        # a player doesn't open its day again and end the newer one in turn).
+        self.superseded: OrderedDict[str, None] = OrderedDict()
+        self._hardware: bool | None = None
+        self._hardware_checked = -math.inf  # when an undecided check ended
+        self._hardware_task: asyncio.Task | None = None
+        # entry_id -> (fetched at, every time-lapse file).
+        self._timelapse: dict[str, tuple[float, list[TimelapseRecording]]] = {}
+        self._timelapse_lock = asyncio.Lock()
+        self.transcoded = 0
+        self.transcode_failures = 0
         # (entry_id, camera_id, ts) -> (made at, JPEG or b"" for "nothing
         # recorded then"), the jobs making them and how many requests wait on each.
         # Keys are (entry_id, camera_id, ts, width).
@@ -233,8 +261,9 @@ class VodManager:
                 self.hass.async_create_task(stream[1].close(code=aiohttp.WSCloseCode.GOING_AWAY))
         self._unreachable.discard(entry_id)
         self._bookmarks.pop(entry_id, None)
+        self._timelapse.pop(entry_id, None)
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, Any]:
         return {
             "sessions": len(self._sessions),
             "cached_segments": len(self._cache),
@@ -247,7 +276,61 @@ class VodManager:
             "disk_images": len(self.disk_large),
             "disk_image_bytes": self.disk_large.bytes,
             "live_streams": len(self.live_streams),
+            "timelapse_hardware": self._hardware,
+            "timelapse_transcoded": self.transcoded,
+            "timelapse_transcode_failures": self.transcode_failures,
         }
+
+    async def hardware(self) -> bool:
+        """Whether time-lapse segments can be transcoded on an Intel GPU.
+
+        Checked once; a check that couldn't tell (timed out) counts as no and
+        is repeated after HARDWARE_RECHECK_SECONDS. One check at a time,
+        shared by everyone asking, and not abandoned by a caller leaving.
+        """
+        if self._hardware is not None:
+            return self._hardware
+        if not TIMELAPSE_HARDWARE:
+            self._hardware = False
+            return False
+        if self._hardware_task is None and _monotonic() - self._hardware_checked >= HARDWARE_RECHECK_SECONDS:
+            self._hardware_task = self.hass.async_create_background_task(
+                self._check_hardware(), "surveillance_station GPU check", eager_start=False
+            )
+        if self._hardware_task is not None:
+            return bool(await asyncio.shield(self._hardware_task))
+        return False
+
+    async def _check_hardware(self) -> bool | None:
+        try:
+            found = await hardware_transcode_available(get_ffmpeg_manager(self.hass).binary)
+        finally:
+            self._hardware_task = None
+        if found is None:
+            self._hardware_checked = _monotonic()
+            _LOGGER.warning("Time-lapse: the Intel GPU check timed out; software transcoding for now")
+        else:
+            self._hardware = found
+            _LOGGER.info(
+                "Time-lapse transcoding: %s",
+                "Intel QSV (H.265 or H.264)" if found else "software (H.264): no usable Intel GPU",
+            )
+        return found
+
+    async def timelapse_files(self, entry_id: str, client: SurveillanceStationClient) -> list[TimelapseRecording]:
+        """Every time-lapse file of the entry's NAS, at most TIMELAPSE_LIST_SECONDS old."""
+        async with self._timelapse_lock:
+            hit = self._timelapse.get(entry_id)
+            if hit is not None and _monotonic() - hit[0] < TIMELAPSE_LIST_SECONDS:
+                return hit[1]
+            try:
+                files = await client.timelapse_recordings()
+            except SSError as err:
+                self.track(entry_id, err)
+                raise
+            self.track(entry_id, None)
+            self._timelapse[entry_id] = (_monotonic(), files)
+            return files
 
     async def bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
         """Every bookmark of every camera, newest first, at most a few seconds old.
@@ -447,6 +530,23 @@ class VodManager:
         self._sessions[token] = session
         return token
 
+    def create_timelapse_session(self, session: VodSession) -> str:
+        """Like create_session, but the only time-lapse session: one stream at a time.
+
+        Each is a heavy transcode fed from a ~30 MB/s cut on the NAS, so an
+        earlier one (another camera or day, another viewer) ends here: its
+        playlist and segments are gone and its segments on the way cancelled.
+        """
+        for token in [t for t, s in self._sessions.items() if s.transcode]:
+            del self._sessions[token]
+            self.superseded[token] = None
+        while len(self.superseded) > VOD_MAX_SESSIONS:
+            self.superseded.popitem(last=False)
+        for key, task in list(self._inflight.items()):
+            if key[-1] is not None:
+                task.cancel()  # a running transcode still finishes, see fetch
+        return self.create_session(session)
+
     def get_session(self, token: str) -> VodSession | None:
         session = self._sessions.get(token)
         now = time.time()
@@ -489,7 +589,12 @@ class VodManager:
             session.render()
 
     async def fetch(self, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
-        key = (session.entry_id, seg.recording_id, seg.offset_ms, round(seg.duration, 3), round(seg.media_start, 3))
+        spec = session.transcode.get(seg.recording_id) if session.transcode else None
+        # The spec is part of the key: time-lapse files and recordings number
+        # their ids separately, and the same cut transcodes differently per codec.
+        key = (
+            session.entry_id, seg.recording_id, seg.offset_ms, round(seg.duration, 3), round(seg.media_start, 3), spec
+        )
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -503,7 +608,7 @@ class VodManager:
             # set, and the finished task would then answer for that segment
             # for good.
             task = self.hass.async_create_background_task(
-                self._fetch_and_cache(key, session.entry_id, seg),
+                self._fetch_and_cache(key, session.entry_id, seg, spec),
                 f"surveillance_station segment {seg.recording_id}@{seg.offset_ms}",
                 eager_start=False,
             )
@@ -515,18 +620,23 @@ class VodManager:
         finally:
             if left := self._waiters.pop(key) - 1:
                 self._waiters[key] = left
-            elif not task.done() and task not in self._started:
+            elif not task.done() and (task not in self._started or spec is not None):
                 # Everyone gave up on it before it reached the NAS (a seek, a
                 # camera taken off the grid): don't let it hold up the queue
-                # for the segments that are wanted now.
+                # for the segments that are wanted now. A time-lapse one goes
+                # even while downloading (~150 MB the new position waits
+                # behind); its transcode, once running, finishes regardless
+                # (see fetch_timelapse_segment).
                 task.cancel()
 
-    async def _fetch_and_cache(self, key: tuple, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
+    async def _fetch_and_cache(
+        self, key: tuple, entry_id: str, seg: Segment, spec: TranscodeSpec | None = None
+    ) -> tuple[bytes, bytes]:
         me = asyncio.current_task()
         try:
-            async with self._sem:
+            async with self._sem if spec is None else self._transcode_sem:
                 self._started.add(me)
-                result = await self._fetch_uncached(entry_id, seg)
+                result = await self._fetch_uncached(entry_id, seg, spec)
         finally:
             self._started.discard(me)
             if self._inflight.get(key) is me:
@@ -538,12 +648,23 @@ class VodManager:
             self._cache_bytes -= len(init) + len(media)
         return result
 
-    async def _fetch_uncached(self, entry_id: str, seg: Segment) -> tuple[bytes, bytes]:
+    async def _fetch_uncached(
+        self, entry_id: str, seg: Segment, spec: TranscodeSpec | None = None
+    ) -> tuple[bytes, bytes]:
         client = self.client(entry_id)
         if client is None:
             raise SSError("vod", "fetch", None, "Surveillance Station entry is not loaded")
+        ffmpeg = get_ffmpeg_manager(self.hass).binary
         try:
-            result = await fetch_segment(client, seg, get_ffmpeg_manager(self.hass).binary)
+            if spec is None:
+                result = await fetch_segment(client, seg, ffmpeg)
+            else:
+                try:
+                    result = await fetch_timelapse_segment(client, seg, ffmpeg, spec, gpu=self._gpu)
+                except SSError:
+                    self.transcode_failures += 1
+                    raise
+                self.transcoded += 1
         except SSError as err:
             self.track(entry_id, err)
             raise
@@ -695,6 +816,8 @@ class _VodBaseView(HomeAssistantView):
     def _session(self, token: str) -> VodSession:
         session = self.manager.get_session(token)
         if session is None:
+            if token in self.manager.superseded:
+                raise web.HTTPGone()
             raise web.HTTPNotFound()
         return session
 
@@ -705,12 +828,14 @@ class _VodBaseView(HomeAssistantView):
             raise web.HTTPNotFound()
         return session.segments[i]
 
-    async def _get_parts(self, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
+    async def _get_parts(self, token: str, session: VodSession, seg: Segment) -> tuple[bytes, bytes]:
         try:
             return await self.manager.fetch(session, seg)
         except SSConnectionError:
             raise web.HTTPBadGateway() from None  # logged once by VodManager.track
         except SSError as err:
+            if token in self.manager.superseded:
+                raise web.HTTPGone() from None  # its queued segments were cancelled
             _LOGGER.warning("Segment %s of recording %s failed: %s", seg.index, seg.recording_id, err)
             raise web.HTTPBadGateway() from None
 
@@ -735,7 +860,7 @@ class VodInitView(_VodBaseView):
 
     async def get(self, request: web.Request, token: str, index: str) -> web.Response:
         session = self._session(token)
-        init, _ = await self._get_parts(session, self._segment(session, index))
+        init, _ = await self._get_parts(token, session, self._segment(session, index))
         return web.Response(body=init, content_type="video/mp4", headers=_NO_STORE)
 
 
@@ -745,7 +870,7 @@ class VodSegmentView(_VodBaseView):
 
     async def get(self, request: web.Request, token: str, index: str) -> web.Response:
         session = self._session(token)
-        _, media = await self._get_parts(session, self._segment(session, index))
+        _, media = await self._get_parts(token, session, self._segment(session, index))
         return web.Response(body=media, content_type="video/iso.segment", headers=_NO_STORE)
 
 

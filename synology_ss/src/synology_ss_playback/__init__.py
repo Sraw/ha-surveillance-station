@@ -1,4 +1,4 @@
-"""Play back Synology Surveillance Station recordings as HLS."""
+"""Play back Synology Surveillance Station recordings (and time-lapse) as HLS."""
 
 from .client import (
     OTP_ERRORS,
@@ -10,8 +10,25 @@ from .client import (
     SSError,
     SSInfo,
     SurveillanceStationClient,
+    TimelapseRecording,
 )
-from .segment import fetch_segment, fetch_snapshot, recordings_from, remove_stale_temp_files
+from .segment import (
+    drain_transcodes,
+    fetch_segment,
+    fetch_snapshot,
+    fetch_timelapse_segment,
+    recordings_from,
+    remove_stale_temp_files,
+)
+from .timelapse import (
+    CODECS,
+    TimelapseRun,
+    TranscodeSpec,
+    covered,
+    hardware_transcode_available,
+    output_size,
+    plan_day,
+)
 from .vod import (
     Recording,
     Run,
@@ -23,6 +40,7 @@ from .vod import (
 )
 
 __all__ = [
+    "CODECS",
     "OTP_ERRORS",
     "Bookmark",
     "Camera",
@@ -35,9 +53,18 @@ __all__ = [
     "SSInfo",
     "Segment",
     "SurveillanceStationClient",
+    "TimelapseRecording",
+    "TimelapseRun",
+    "TranscodeSpec",
+    "covered",
+    "drain_transcodes",
     "fetch_segment",
     "fetch_snapshot",
+    "fetch_timelapse_segment",
+    "hardware_transcode_available",
     "live_edge",
+    "output_size",
+    "plan_day",
     "plan_segments",
     "recordings_from",
     "remove_stale_temp_files",

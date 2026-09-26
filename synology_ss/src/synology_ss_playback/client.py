@@ -2,7 +2,7 @@
 
 Only what playback needs: login, cameras, recordings (with start/stop times),
 bookmarks (listed, and created/edited/deleted for detections from elsewhere),
-and cutting a time range out of a recording.
+time-lapse files, and cutting a time range out of a recording.
 
 API notes (verified against SS 9.x, see the repo README):
 * ``SYNO.SurveillanceStation.Event`` ``List`` v5 is the call that returns
@@ -23,6 +23,13 @@ API notes (verified against SS 9.x, see the repo README):
   epoch seconds and are exact to the second. A NAS-local time without an
   offset is read an hour late in summer time (the same bug as SnapShot);
   one with an offset, or unquoted, is taken as 1970.
+* Time-lapse (undocumented; what SS's own UI calls, verified on SS 9.x):
+  ``SYNO.SurveillanceStation.TimeLapse.Recording`` ``List`` v1 lists the
+  files (``lapseId`` -1 = every task). ``Recording.Download`` v6 cuts them
+  with ``recEvtType=3``; offsets are in the file's video time, and the cut
+  starts exactly on the frame asked for (every frame is a keyframe) and
+  holds the whole seconds asked for plus 29 frames. A file still being written
+  can be cut too, but SS reads it about a third as fast.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import os
 import time
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -65,6 +73,11 @@ REQUIRED_APIS = {
     "SYNO.SurveillanceStation.ThirdParty.Bookmark": 1,
 }
 VIDEO_CODEC_H265 = 6
+# Recording.Download's recEvtType for a time-lapse file (SYNO.SS.Event.RecType.TIMELAPSE).
+REC_EVT_TIMELAPSE = 3
+TIMELAPSE_PAGE = 100  # the most TimeLapse.Recording.List returns at once
+DOWNLOAD_CHUNK = 1 << 20
+DOWNLOAD_ERROR_MAX = 64 * 1024  # of a JSON error reply read
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
 RECORDING_LOOKBACK_SECONDS = 4 * 3600
@@ -145,6 +158,28 @@ class RecordingInfo:
     mount_id: int
     live: bool
     hevc: bool
+
+
+@dataclass(frozen=True)
+class TimelapseRecording:
+    """One file of a Surveillance Station time-lapse task.
+
+    A task writes a video of at most its "truncate length" (6 min by default,
+    at TIMELAPSE_FPS) and then starts the next file; at the task's compression
+    (240x by default) that's a day of wall time. Slowed-down stretches (SS's
+    own events) fill it faster, so a file can cover less than that.
+    """
+
+    id: int
+    camera_id: int
+    task_id: int
+    start: int  # wall time of the first frame
+    span: int  # wall seconds the file covers so far (SS's rangeMinute, whole minutes)
+    frames: int
+    width: int
+    height: int
+    hevc: bool
+    live: bool  # still being written
 
 
 @dataclass(frozen=True)
@@ -416,6 +451,10 @@ class SurveillanceStationClient:
             self._tz = ZoneInfo("UTC")
         return info
 
+    async def timezone(self) -> ZoneInfo:
+        """The NAS's time zone (SS reports local times in it)."""
+        return await self._timezone()
+
     async def _timezone(self) -> ZoneInfo:
         if self._tz is None:
             await self.info()
@@ -473,6 +512,55 @@ class SurveillanceStationClient:
             except _BAD_ITEM:
                 total = 0
             if not events or offset >= total:
+                break
+        out.sort(key=lambda r: r.start)
+        return out
+
+    async def timelapse_recordings(self) -> list[TimelapseRecording]:
+        """Every time-lapse file of every task, oldest first.
+
+        ``SYNO.SurveillanceStation.TimeLapse.Recording`` is undocumented (what
+        SS's own UI calls). Its fromTime/toTime filter only matches a file's
+        start, so everything is listed and callers pick; a camera keeps one
+        file per day of its task's retention.
+        """
+        out: list[TimelapseRecording] = []
+        offset = 0
+        while True:
+            data = await self._call(
+                "SYNO.SurveillanceStation.TimeLapse.Recording", "List", 1,
+                lapseId=-1, start=offset, limit=TIMELAPSE_PAGE,
+            )
+            files = _items(data, "events")
+            for e in files:
+                try:
+                    if e.get("markAsDel"):
+                        continue
+                    frames = int(e["frameCount"])
+                    if frames <= 0:
+                        continue
+                    out.append(
+                        TimelapseRecording(
+                            id=int(e["id"]),
+                            camera_id=int(e["cameraId"]),
+                            task_id=int(e.get("taskId") or 0),
+                            start=int(e["startTime"]),
+                            span=int(e["rangeMinute"]) * 60,
+                            frames=frames,
+                            width=int(e.get("imgWidth") or 0),
+                            height=int(e.get("imgHeight") or 0),
+                            hevc=_is_hevc(e.get("video_type")),
+                            live=bool(e.get("recording")),
+                        )
+                    )
+                except _BAD_ITEM:
+                    _LOGGER.debug("Skipping a time-lapse file SS lists as %r", e)
+            offset += len(files)
+            try:
+                total = int(data.get("total", 0))
+            except _BAD_ITEM:
+                total = 0
+            if not files or offset >= total:
                 break
         out.sort(key=lambda r: r.start)
         return out
@@ -546,8 +634,13 @@ class SurveillanceStationClient:
             end=_local_ts(b["endTime"], tz) if b.get("endTime") else start,
         )
 
-    async def download(self, recording_id: int, mount_id: int, offset_ms: int, duration_ms: int) -> bytes:
-        """Cut [offset, offset+duration) out of one recording as MP4 bytes."""
+    async def download(
+        self, recording_id: int, mount_id: int, offset_ms: int, duration_ms: int, timelapse: bool = False
+    ) -> bytes:
+        """Cut [offset, offset+duration) out of one recording as MP4 bytes.
+
+        ``timelapse``: the id is a time-lapse file's (offsets in its video time).
+        """
         for attempt in (1, 2):
             if self._sid is None:
                 await self.login(stale_sid=None)
@@ -558,6 +651,8 @@ class SurveillanceStationClient:
                 "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
                 "_sid": sid,
             }
+            if timelapse:
+                params["recEvtType"] = REC_EVT_TIMELAPSE
             body, ctype = await self._request("entry.cgi", params, False, 60)
             if "json" not in ctype and not body.startswith(b"{"):
                 return body
@@ -573,6 +668,75 @@ class SurveillanceStationClient:
                 continue
             raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def download_to(
+        self,
+        fd: int,
+        recording_id: int,
+        mount_id: int,
+        offset_ms: int,
+        duration_ms: int,
+        timelapse: bool = False,
+        timeout: float = 120,
+    ) -> int:
+        """Like download(), but streamed into the file ``fd`` (bytes written).
+
+        For cuts too big to hold twice in memory: a second of daytime
+        time-lapse video is ~30 MB.
+        """
+        api, method = "SYNO.SurveillanceStation.Recording", "Download"
+        for attempt in (1, 2):
+            if self._sid is None:
+                await self.login(stale_sid=None)
+            sid = self._sid
+            params: dict[str, Any] = {
+                "api": api, "method": method, "version": 6,
+                "id": recording_id, "mountId": mount_id,
+                "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
+                "_sid": sid,
+            }
+            if timelapse:
+                params["recEvtType"] = REC_EVT_TIMELAPSE
+            try:
+                async with self._session.get(
+                    f"{self._base}/entry.cgi", params=params, timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as resp:
+                    if resp.status >= 400:
+                        raise SSError(api, method, None, f"HTTP {resp.status}")
+                    first = await resp.content.read(DOWNLOAD_CHUNK)
+                    if "json" in resp.headers.get("Content-Type", "") or first.startswith(b"{"):
+                        body = first
+                        while len(body) < DOWNLOAD_ERROR_MAX and (more := await resp.content.read(DOWNLOAD_CHUNK)):
+                            body += more
+                    else:
+                        try:
+                            written = _write_all(fd, first)
+                            async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK):
+                                written += _write_all(fd, chunk)
+                        except OSError as err:  # out of memory for the file
+                            raise SSError(api, method, None, f"writing the cut: {type(err).__name__}") from None
+                        return written
+            except (aiohttp.ClientError, TimeoutError) as err:
+                raise SSConnectionError(api, method, None, type(err).__name__) from None
+            try:
+                err = json.loads(body)
+            except (ValueError, RecursionError):
+                err = {}
+            if not isinstance(err, dict):
+                err = {}
+            code = _error_code(err)
+            if code in SESSION_ERRORS and attempt == 1:
+                await self.login(stale_sid=sid)
+                continue
+            raise SSError(api, method, code, err.get("error"))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _write_all(fd: int, data: bytes) -> int:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+    return len(data)
 
 
 def _quoted(text: str) -> str:

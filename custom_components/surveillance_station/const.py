@@ -20,6 +20,17 @@ VOD_MAX_WINDOW_SECONDS = 24 * 3600
 SEGMENT_CACHE_BYTES = 96 * 1024 * 1024
 # Parallel Download+remux jobs against the NAS.
 MAX_PARALLEL_FETCHES = 4
+# Parallel time-lapse jobs: each pulls ~30 MB per second of daytime video
+# from the NAS (the gigabit link is the limit) and holds the cut in memory;
+# their transcodes run one at a time (the GPU is Frigate's too).
+MAX_PARALLEL_TRANSCODES = 3
+# Intel QSV for time-lapse transcoding, where the container has a usable GPU.
+TIMELAPSE_HARDWARE = True
+# A GPU check that couldn't tell (timed out) is repeated after this long.
+HARDWARE_RECHECK_SECONDS = 300
+# The list of time-lapse files is fetched again after this long (a file
+# grows by a frame every 8 s; new files start once a day).
+TIMELAPSE_LIST_SECONDS = 60
 
 LIVE_URL = "/api/surveillance_station/live"
 # A live-stream token must be used (the socket opened) within this long.

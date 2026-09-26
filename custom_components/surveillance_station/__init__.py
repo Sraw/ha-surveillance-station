@@ -11,6 +11,7 @@ from synology_ss_playback import (
     SSError,
     SSInfo,
     SurveillanceStationClient,
+    drain_transcodes,
     remove_stale_temp_files,
 )
 
@@ -19,8 +20,15 @@ from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.lovelace.const import LOVELACE_DATA
 from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.const import (
+    CONF_HOST,
+    CONF_PASSWORD,
+    CONF_PORT,
+    CONF_SSL,
+    CONF_USERNAME,
+    EVENT_HOMEASSISTANT_STOP,
+)
+from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -82,6 +90,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.http.register_view(FrigateImageView(hass, manager))
     hass.http.register_view(FrigateThumbnailView(hass, manager))
     websocket.async_register(hass)
+
+    async def _drain(_: Event) -> None:
+        # A running GPU transcode must not be killed by the loop's teardown
+        # (see synology_ss_playback.fetch_timelapse_segment).
+        await drain_transcodes()
+
+    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _drain)
     await hass.http.async_register_static_paths(
         [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), False)]
     )

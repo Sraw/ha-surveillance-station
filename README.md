@@ -4,23 +4,24 @@ Play back **Synology Surveillance Station** recordings inside Home Assistant,
 with a scrubbable wall-clock timeline and SS bookmarks drawn on it. SS keeps
 recording, archiving and doing timelapse. This integration only reads from it,
 except for one optional write: Frigate detections become SS bookmarks.
-Video is never transcoded: SS cuts the requested range out of its own
+Recordings are never transcoded: SS cuts the requested range out of its own
 recording, HA stream-copies it into fragmented MP4, and the browser decodes the
-original H.265/H.264.
+original H.265/H.264. SS's time-lapse video is the exception (see *Time-lapse*).
 
-Status: playback, the card, notification links, and Frigate detections as SS
-bookmarks (with an event to notify from).
+Status: playback, the card, notification links, Frigate detections as SS
+bookmarks (with an event to notify from), and a day-by-day time-lapse card.
 
 ## Pieces
 
 | Part | What it does |
 |---|---|
-| `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts), the 10 s segment planner and playlist renderer, and `fetch_segment` (download + ffmpeg remux + fMP4 split) |
+| `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; ready for PyPI, not published yet): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts, time-lapse files), the 10 s segment planner and playlist renderer, `fetch_segment` (download + ffmpeg remux + fMP4 split), and for time-lapse the day planner (`plan_day`) and `fetch_timelapse_segment` (streamed download + transcode) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics (including the Frigate bridge: subscribed?, review messages (several per review) and how each ended — ignored by reason, dropped, failed, or bookmarked then announced / not announced — queue, failing now, last error) |
 | `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
 | `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*); with a Frigate URL, the notification image and the Frigate bookmarks' thumbnails (Frigate's snapshots, `/api/surveillance_station/frigate_image/…`) |
-| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE) |
+| `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE), `/timelapse_days`, `/timelapse` (a time-lapse session: one camera, one day) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
+| `…/frontend/ss-timelapse-card.js` | `custom:ss-timelapse-card`, loaded by the timeline card (same version, no resource of its own) |
 
 ## Requirements
 
@@ -406,6 +407,45 @@ the address, so going back or closing a dialog doesn't return to it; a
 camera it adds to the grid is added for now, not to the grid saved for next
 time.
 
+## Time-lapse
+
+`custom:ss-timelapse-card` plays a camera's **Surveillance Station
+time-lapse** (a task set up in SS; this only reads it) one day at a time:
+camera chips, a row of days, the video with the time it shows, and a
+00:00-24:00 bar with what the day has (click or drag to go there). Options:
+`camera` (name or id to start on) and `entry_id`. There is no speed control:
+time-lapse is already fast (240x by default).
+
+A time-lapse task writes files of up to 6 minutes of video, each rolling over
+when full (about a day at 240x, from whenever the task started, not at
+midnight; SS's slowed-down stretches around its own events fill a file
+sooner). A day is the parts of the files that fall between the NAS's
+midnights, found by mapping wall time linearly across each file as SS's own
+player does; its boundaries are whole seconds of video (4 minutes at 240x).
+
+SS stores time-lapse as all-intra H.265 at the camera's full resolution
+(4512x2512 here: 90-240 Mbps), too much for a browser, so HA **transcodes**
+it to 1280 wide: H.265 where the browser plays it (~2 Mbps), else H.264.
+Segments are 4 s of video, cut on the NAS (`recEvtType=3`), streamed into
+memory, transcoded and served as HLS fMP4 under the same session tokens as
+recordings; the card fetches them itself into MSE (the playlist goes to
+`<video>` where there is no MSE). A day opens in ~3 s and a seek to
+something not yet fetched plays in ~2 s: the segment there is fetched alone
+(the NAS link is the limit, see below), then three at a time ahead.
+
+**Only one time-lapse plays at a time**, whoever watches: opening one ends
+the previous session (its URLs answer 410, and its card offers to take it
+back rather than reopening by itself).
+
+Transcoding uses an **Intel GPU (QSV)** when the container has one (checked
+once, logged, and in diagnostics as `timelapse_hardware`); otherwise
+software H.264, which on a 12-thread i5-1235U takes all the CPU while playing (seeks ~9 s). A
+check that times out (the GPU busy) is repeated after 5 minutes. The
+official HA image ships ffmpeg with QSV but no GPU driver: this repo's owner
+runs it with `intel-media-driver` + `onevpl-intel-gpu` added and `/dev/dri`
+passed in. Transcodes run one at a time, and a hardware one is never
+stopped by its viewer leaving (see *Known limitations*).
+
 ## Resource use
 
 Every buffer has a cap, and the only thing kept on disk is thumbnails:
@@ -415,6 +455,7 @@ Every buffer has a cap, and the only thing kept on disk is thumbnails:
 | HA memory | remuxed segments (a 10 s segment is 3.5-6.5 MB here) | `SEGMENT_CACHE_BYTES` = 96 MB, LRU |
 | HA memory | playback sessions (segment plan + playlist text) | 64 sessions, 4 h idle TTL, 24 h window |
 | HA memory | downloads being remuxed | 4 at a time (`MAX_PARALLEL_FETCHES`) |
+| HA memory | time-lapse cuts being transcoded (4 s of 4K all-intra: 50-200 MB each, in an anonymous in-memory file, never on disk) | 3 at a time (`MAX_PARALLEL_TRANSCODES`), 1 of them on the GPU; one time-lapse session at a time |
 | HA memory | queued segment fetches (HLS) | cancelled once every client that asked has gone, unless already downloading |
 | HA `/tmp` | one scratch file per remux (ffmpeg needs a seekable input) | deleted when the remux ends; `ss_vod_*.mp4` left by a crash are swept at startup |
 | HA | live relays | pass-through (a slow viewer slows the read from SS, nothing queues in HA); 16 at most |
@@ -468,6 +509,17 @@ Every HA user can use the card and so see every camera, like HA's own camera
 entities; there is no per-user camera permission.
 
 ## Surveillance Station API notes (verified on SS 9.x, DSM 7)
+
+- Time-lapse (undocumented; what SS's UI calls):
+  `SYNO.SurveillanceStation.TimeLapse.Recording` `List` v1 (`lapseId` -1 = all
+  tasks, `start`/`limit` ≤ 100) lists the files with `startTime`,
+  `rangeMinute` (wall time covered so far), `frameCount` (30 fps),
+  `imgWidth`/`imgHeight`, `video_type` (6 = H.265), `recording` (still being
+  written); its `fromTime`/`toTime` match a file's start only.
+  `Recording.Download` v6 with `recEvtType=3` cuts a file by video time: the
+  cut starts on exactly the frame asked for (all frames are keyframes) and
+  holds the whole seconds asked for plus 29 frames. The SS stream socket
+  ignores `recEvtType` (it plays recordings only).
 
 - `SYNO.SurveillanceStation.Event` `List` v5 returns per-recording
   `startTime`/`stopTime`/`recording` (in progress)/`mountId`/`videoCodec`.
@@ -547,6 +599,21 @@ entities; there is no per-user camera permission.
   every camera records continuously and Frigate's bookmarks are the events.
 
 ## Known limitations
+
+- **Time-lapse and the GPU**: SIGKILLing `hevc_qsv` decodes of SS's
+  4512x2512 time-lapse while other QSV sessions run hung an Iris Xe iGPU
+  (i915 `GPU HANG ... in hevc_qsv`, reproduced: 4 hangs in 36 transcodes
+  with random kills, none in 35 kills of a lone one or in 33 parallel
+  transcodes left to finish). The reset also stalled Frigate's QSV decoders
+  on the same GPU until Frigate was restarted. Hence one transcode at a
+  time; a hardware one, once running, finishes whoever leaves (only waiting
+  for its turn is cancelled), HA's shutdown waits for it, and a 30 s timeout
+  stops it with SIGTERM before SIGKILL.
+- Time-lapse throughput is bounded by the NAS: a second of daytime 4K
+  time-lapse is ~30 MB, the gigabit link carries ~110 MB/s from a finished
+  file, and SS reads the file it is still writing at only ~50 MB/s. Today's
+  time-lapse can therefore stall in daylight, and faster playback is not
+  offered.
 
 - A bookmark in the hour repeated when DST ends is placed in the first of the
   two (SS lists bookmark times as local times without an offset).

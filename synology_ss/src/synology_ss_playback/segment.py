@@ -1,5 +1,5 @@
-"""Fetch one planned segment (cut on the NAS, remuxed to fragmented MP4), or
-a single frame of a recording as a JPEG.
+"""Fetch one planned segment (cut on the NAS, remuxed to fragmented MP4; a
+time-lapse one transcoded), or a single frame of a recording as a JPEG.
 
 ``Recording.Download`` returns a plain MP4 with the ``moov`` box at the end
 and no Range support, so ffmpeg needs it as a seekable file. The scratch file
@@ -20,12 +20,15 @@ import tempfile
 import time
 
 from .client import RecordingInfo, SSError, SurveillanceStationClient
+from .timelapse import TranscodeSpec, ffmpeg_transcode_args
 from .vod import Recording, Segment, ffmpeg_remux_args, split_fmp4
 
 _LOGGER = logging.getLogger(__name__)
 
 TEMP_PREFIX = "ss_vod_"
 REMUX_TIMEOUT_SECONDS = 30
+# A process asked to stop with SIGTERM gets this long before SIGKILL.
+TERM_GRACE_SECONDS = 5
 SNAPSHOT_WIDTH = 320
 
 
@@ -98,15 +101,34 @@ async def _run_ffmpeg(
         fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
     except OSError as err:
         raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
-    proc = None
     try:
         try:
             await asyncio.to_thread(_write_and_close, fd, raw)
+        except OSError as err:
+            raise SSError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
+        return await _exec_ffmpeg(args(path), timeout)
+    finally:
+        await asyncio.to_thread(_unlink, path)
+
+
+async def _exec_ffmpeg(
+    argv: list[str], timeout: float, pass_fds: tuple[int, ...] = (), gentle: bool = False
+) -> bytes:
+    """Run ffmpeg to completion and return its stdout; any failure is an SSError.
+
+    ``gentle``: stop it (timeout, cancellation) with SIGTERM first, which
+    lets ffmpeg close its codecs, and SIGKILL only if it hasn't gone in
+    TERM_GRACE_SECONDS (see fetch_timelapse_segment for why).
+    """
+    proc = None
+    try:
+        try:
             proc = await asyncio.create_subprocess_exec(
-                *args(path),
+                *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                pass_fds=pass_fds,
             )
         except OSError as err:
             raise SSError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
@@ -120,9 +142,129 @@ async def _run_ffmpeg(
         return out
     finally:
         if proc is not None and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-        await asyncio.to_thread(_unlink, path)
+            await _stop(proc, gentle)
+
+
+async def _stop(proc: asyncio.subprocess.Process, gentle: bool) -> None:
+    if gentle:
+        try:
+            proc.terminate()
+            async with asyncio.timeout(TERM_GRACE_SECONDS):
+                await proc.wait()
+            return
+        except (TimeoutError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    await proc.wait()
+
+
+# Hardware transcodes that are running (whoever asked for them), for
+# drain_transcodes; and the lock hardware transcodes take when the caller
+# brings none.
+_JOBS: set[asyncio.Task] = set()
+_DEFAULT_GPU = asyncio.Semaphore(1)
+
+
+async def fetch_timelapse_segment(
+    client: SurveillanceStationClient,
+    seg: Segment,
+    ffmpeg: str,
+    spec: TranscodeSpec,
+    timeout: float = REMUX_TIMEOUT_SECONDS,
+    gpu: asyncio.Semaphore | None = None,
+) -> tuple[bytes, bytes]:
+    """Return (init, media) of one time-lapse segment, transcoded per ``spec``.
+
+    The cut (up to ~200 MB of daytime 4K) goes into an anonymous in-memory
+    file rather than a scratch file on disk: an hour of viewing would
+    otherwise write ~100 GB. ffmpeg reads it through /proc/self/fd, which is
+    seekable (the moov box is at the end).
+
+    Transcodes run one at a time under ``gpu`` (a hardware one under a
+    module-wide lock if none is given). A hardware transcode, once started,
+    is never killed by its caller going away: it finishes (under a second)
+    on its own, then frees the lock. SIGKILLing hevc_qsv decodes mid-way
+    while others run hung an Intel iGPU (i915 "GPU HANG", reproduced), and
+    the reset stalls everything else on it. Waiting for the lock is
+    cancellable: a cut nobody wants any more never reaches the GPU. On
+    shutdown, drain_transcodes() lets the running one finish; the timeout
+    stops one with SIGTERM before SIGKILL.
+    """
+    if gpu is None and spec.hardware:
+        gpu = _DEFAULT_GPU
+    started = time.monotonic()
+    try:
+        fd = os.memfd_create("ss_timelapse", os.MFD_CLOEXEC)
+    except (AttributeError, OSError) as err:
+        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
+    cut = _Cut(fd)
+    try:
+        size = await client.download_to(
+            fd, seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000), timelapse=True
+        )
+        fetched = time.monotonic()
+        if gpu is not None:
+            await gpu.acquire()
+            cut.lock = gpu
+    except BaseException:
+        cut.close()
+        raise
+    argv = ffmpeg_transcode_args(ffmpeg, f"/proc/self/fd/{fd}", seg.duration, seg.media_start, spec)
+    job = asyncio.ensure_future(_transcode(argv, cut, timeout, spec.hardware))
+    # Whatever happens to the job - even cancelled before it ran (loop
+    # teardown) - the file is closed and the lock freed, exactly once.
+    job.add_done_callback(lambda t: (cut.close(), t.cancelled() or t.exception()))
+    if spec.hardware:
+        _JOBS.add(job)
+        job.add_done_callback(_JOBS.discard)
+        data = await asyncio.shield(job)
+    else:
+        data = await job
+    init, media = split_fmp4(data)
+    if not init or not media:
+        raise SSError("transcode", "split", None, f"empty output for segment {seg.index}")
+    _LOGGER.debug(
+        "time-lapse segment %s rec=%s off=%sms dur=%.0fs: download %.2fs (%d MB), transcode %.2fs (%d KB, %s%s)",
+        seg.index, seg.recording_id, seg.offset_ms, seg.duration, fetched - started, size >> 20,
+        time.monotonic() - fetched, len(media) >> 10, spec.codec, " qsv" if spec.hardware else "",
+    )
+    return init, media
+
+
+class _Cut:
+    """A downloaded cut's file, and the transcode lock taken for it: released once."""
+
+    def __init__(self, fd: int) -> None:
+        self.fd: int | None = fd
+        self.lock: asyncio.Semaphore | None = None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        if self.lock is not None:
+            self.lock.release()
+            self.lock = None
+
+
+async def _transcode(argv: list[str], cut: _Cut, timeout: float, hardware: bool) -> bytes:
+    """Run the transcode on the cut (then closed, and its lock freed)."""
+    try:
+        return await _exec_ffmpeg(argv, timeout, pass_fds=(cut.fd,), gentle=hardware)
+    finally:
+        cut.close()
+
+
+async def drain_transcodes(timeout: float = REMUX_TIMEOUT_SECONDS + TERM_GRACE_SECONDS) -> None:
+    """Wait (at most timeout) for the hardware transcodes running to finish.
+
+    Call it before the event loop goes away: its teardown would kill them.
+    """
+    if _JOBS:
+        await asyncio.wait(list(_JOBS), timeout=timeout)
 
 
 async def fetch_snapshot(

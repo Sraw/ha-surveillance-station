@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.7";
+const CARD_VERSION = "0.15.0";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -3566,5 +3566,9 @@ async function register() {
     description: "Play back Synology Surveillance Station recordings with a timeline and bookmarks.",
   });
   console.info(`%c SS-TIMELINE-CARD %c ${CARD_VERSION} `, "background:#1976d2;color:#fff", "");
+  // The time-lapse card rides along (same version, no resource of its own).
+  import(new URL(`./ss-timelapse-card.js?v=${CARD_VERSION}`, import.meta.url).href).catch((e) =>
+    console.error("ss-timelapse-card failed to load", e)
+  );
 }
 register();

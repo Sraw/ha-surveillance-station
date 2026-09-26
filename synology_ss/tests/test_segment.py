@@ -232,3 +232,9 @@ async def test_run_ffmpeg_no_scratch_space_is_an_sserror() -> None:
     with patch.object(seg_mod.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")):
         with pytest.raises(SSError, match="scratch file"):
             await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5)
+
+
+async def test_run_ffmpeg_scratch_write_error_is_an_sserror() -> None:
+    with patch.object(seg_mod, "_write_and_close", side_effect=OSError(28, "No space left on device")):
+        with pytest.raises(SSError, match="OSError"):
+            await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg"], 5)
