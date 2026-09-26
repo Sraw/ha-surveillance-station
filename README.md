@@ -440,6 +440,19 @@ entities; there is no per-user camera permission.
   at the end with no Range support. Errors come back as JSON with HTTP 200.
   Planning therefore uses whole-second boundaries, and ffmpeg `-t` trims the tail.
 
+- Motion / object events (looked into, not used; SS 9.3, 2026-09-25):
+  `SYNO.SurveillanceStation.Event.List` filters by recording reason (2
+  motion, 3 alarm, 9 action rule, 10 advanced continuous...), so cameras
+  that SS records *on motion* have events with start and end that a
+  timeline could draw. Under continuous recording there are none: each
+  30-minute file only carries a `trigger_label` bitmask (0x101: motion
+  somewhere in it), and the response's `reason`/`mode` (0 / 5 for
+  continuous) don't match the request's documented codes. SS's own timeline
+  marks come from undocumented calls. Object detection needs a DVA model;
+  camera-side person/vehicle detection isn't exposed (HA's Reolink
+  integration reads it from the camera). Not built: untestable here, where
+  every camera records continuously and Frigate's bookmarks are the events.
+
 ## Known limitations
 
 - A bookmark in the hour repeated when DST ends is placed in the first of the
