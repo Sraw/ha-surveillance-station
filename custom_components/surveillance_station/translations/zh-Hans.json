@@ -1,0 +1,104 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Surveillance Station",
+        "description": "请使用一个专用的 DSM 账户，它的 Surveillance Station 权限配置文件需允许回放和下载，且不能开启两步验证。",
+        "data": {
+          "host": "主机",
+          "port": "端口",
+          "ssl": "使用 HTTPS",
+          "verify_ssl": "验证 SSL 证书",
+          "username": "用户名",
+          "password": "密码"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Surveillance Station 登录",
+        "description": "{username} 的密码被拒绝，请输入当前密码。",
+        "data": {
+          "password": "密码"
+        }
+      },
+      "reconfigure": {
+        "title": "Surveillance Station",
+        "description": "修改地址或 DSM 账户。必须是同一台 NAS。",
+        "data": {
+          "host": "主机",
+          "port": "端口",
+          "ssl": "使用 HTTPS",
+          "verify_ssl": "验证 SSL 证书",
+          "username": "用户名",
+          "password": "密码"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接 Surveillance Station。",
+      "invalid_auth": "登录被拒绝。",
+      "no_cameras": "已登录，但此账户看不到任何摄像头。请检查它的 Surveillance Station 权限配置文件。",
+      "unknown": "意外错误。"
+    },
+    "abort": {
+      "already_configured": "这台 Surveillance Station 已经配置过了。",
+      "reauth_successful": "密码已更新。",
+      "reconfigure_successful": "设置已更新。",
+      "wrong_device": "这不是此条目当初配置的那台 NAS。"
+    }
+  },
+  "exceptions": {
+    "invalid_auth": {
+      "message": "Surveillance Station 拒绝了登录。请重新输入密码以继续。"
+    },
+    "cannot_connect": {
+      "message": "无法连接 Surveillance Station：{error}"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Frigate 检测",
+        "description": "把 Frigate 的 review 转成 Surveillance Station 书签（需要 MQTT 集成，并连接到 Frigate 使用的 broker）。Frigate 摄像头按名称与 Surveillance Station 摄像头匹配（忽略大小写、空格和标点）；名称不同的在下一步映射。每个新书签还会触发一个 surveillance_station_detection 事件，供自动化发送通知。",
+        "data": {
+          "frigate": "为 Frigate 检测创建书签",
+          "frigate_topic": "Frigate MQTT 主题前缀",
+          "frigate_objects": "要创建书签的对象",
+          "frigate_link": "时间轴卡片所在的仪表盘路径",
+          "frigate_quiet_minutes": "静默期（分钟）",
+          "frigate_quiet_kinds": "静默期适用于"
+        },
+        "data_description": {
+          "frigate_topic": "即 Frigate 的 mqtt.topic_prefix；review 从该前缀的 /reviews 主题读取。",
+          "frigate_link": "例如 /ss-playback/playback。事件会带上一个链接，打开卡片并定位到检测时刻。",
+          "frigate_objects": "Frigate 标签。review 含其中任意一个就创建书签，alert 和 detection 都算。动物（dog、cat、bird……）统一命名为 Animal。",
+          "frigate_quiet_minutes": "某摄像头的 review 如果只含下面所选的类别，且这些类别在该摄像头上这么多分钟内都出现过（走开又回来的狗），就不触发 surveillance_station_detection 事件；书签照常创建。0：每个 review 都触发。",
+          "frigate_quiet_kinds": "人永远不静默：又来了一个人，总是会通知。"
+        }
+      },
+      "cameras": {
+        "title": "Frigate 摄像头",
+        "description": "对每个名称与其 Frigate 摄像头不一致（忽略大小写、空格和标点）的 Surveillance Station 摄像头，填入 Frigate 配置里的摄像头名（多个用逗号分隔）。其余留空。"
+      }
+    },
+    "error": {
+      "invalid_topic": "请输入不含通配符的主题前缀。",
+      "invalid_link": "请输入以 / 开头的路径，例如 /ss-playback/playback。",
+      "no_objects": "至少选择一个对象。",
+      "duplicate_camera": "一个 Frigate 摄像头只能对应一个 Surveillance Station 摄像头。"
+    }
+  },
+  "issues": {
+    "frigate_mqtt": {
+      "title": "Frigate 检测：MQTT 不可用",
+      "description": "Home Assistant 的 MQTT 集成已超过 10 分钟不可用，`{topic}/reviews` 上的 Frigate review 没有被转成 Surveillance Station 书签或通知。请检查 MQTT 集成及其 broker；MQTT 恢复后此问题会自动消失。"
+    },
+    "frigate_failing": {
+      "title": "Frigate 检测没有生成书签",
+      "description": "超过 10 分钟以来，Surveillance Station 拒绝或未能处理每一个 Frigate review，检测既没有书签也没有通知。最近的错误：{error}。书签成功创建后此问题会自动消失。"
+    },
+    "frigate_offline": {
+      "title": "Frigate 离线",
+      "description": "Frigate 在 `{topic}/available` 上报告离线已超过 10 分钟，目前没有任何检测。请检查 Frigate 容器；Frigate 重新上线后此问题会自动消失。"
+    }
+  }
+}

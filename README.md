@@ -169,6 +169,16 @@ the recorder, each Frigate **review item** with an object of interest
 bookmark on the same camera, so it is on the card's timeline and in its
 event list, and in DS cam / the SS client. Every animal is called "Animal".
 
+Needs, on Frigate's side (verified on 0.18; the review topic is 0.14+):
+
+- **Recording enabled** for the cameras (`record.enabled: true`): Frigate
+  makes no review items, and publishes nothing on `<prefix>/reviews`, for a
+  camera that doesn't record. SS doing the recording, Frigate's own can be
+  small: alerts and detections only, of the detect stream, a few days.
+- Frigate on the MQTT broker HA's MQTT integration uses.
+- Zones and `review.*.required_zones` decide what becomes a review; this
+  integration takes every review with an object of interest.
+
 - Read from `<prefix>/reviews` on MQTT (HA's MQTT integration, connected to
   Frigate's broker). Frigate cameras are matched to SS cameras by name,
   ignoring case, spaces and punctuation (`drive_way` = "Drive Way"); where
