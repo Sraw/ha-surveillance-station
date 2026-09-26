@@ -494,6 +494,11 @@ entities; there is no per-user camera permission.
 - The browser must decode HEVC itself. Chrome/Edge with hardware decode,
   Safari and the HA Android/iOS apps generally can. Firefox and headless
   Chromium cannot. The card says so when `MediaSource` reports no `hvc1`.
+  There is deliberately no transcoding to H.264: HA would have to decode 4K
+  HEVC per viewer (several CPU cores each without a GPU in its container),
+  and SS's WebSocket stream has no documented way to pick a camera's H.264
+  sub stream. Cameras SS records as H.264 pass through the same way as
+  HEVC ones (no `hvc1` tag), but have not been tried against a real SS.
 
 ## Tests
 
