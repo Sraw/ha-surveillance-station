@@ -395,6 +395,8 @@ actions:
         clickAction: "{{ trigger.event.data.url }}"  # Android
         url: "{{ trigger.event.data.url }}"          # iOS
         tag: "{{ trigger.event.data.review_id }}"
+        ttl: 0            # Android: deliver now; at normal priority an idle
+        priority: high    # phone (Doze) held one for 8 minutes
 ```
 
 The card follows such a link also when it is already on screen (HA navigates

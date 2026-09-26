@@ -86,12 +86,14 @@ actions:
     title: "{{ detection.objects | join(', ') }} at {{ detection.camera }}"
     message: "{{ detection.start | timestamp_custom(time_format) }}"
     # The frame; one notification per review (a later one for it replaces
-    # it); Android's channel and icon; and the link (Android: clickAction,
-    # iOS: url), left out without a dashboard path: tapping then opens the app.
+    # it); Android's channel and icon, and high priority with no TTL (at
+    # normal priority an idle phone in Doze holds it for minutes); and the
+    # link (Android: clickAction, iOS: url), left out without a dashboard
+    # path: tapping then opens the app.
     data: >-
       {% set o = detection.objects %}
       {% set d = {'image': detection.image, 'tag': detection.review_id, 'group': 'surveillance_station',
-                  'channel': channel,
+                  'channel': channel, 'ttl': 0, 'priority': 'high',
                   'notification_icon': 'mdi:walk' if 'Person' in o else 'mdi:car' if 'Car' in o
                                        else 'mdi:paw' if 'Animal' in o else 'mdi:cctv'} %}
       {{ dict(d, clickAction=detection.url, url=detection.url) if detection.url else d }}
