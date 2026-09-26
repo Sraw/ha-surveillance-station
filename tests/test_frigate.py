@@ -1117,7 +1117,7 @@ async def test_person_joining_a_quiet_review_is_announced(hass: HomeAssistant, b
     await bridge.handle(review("update", objects=("dog", "person"), rid="d2", start=T + 30))  # once
     await hass.async_block_till_done()
     assert [(e.data["review_id"], e.data["objects"]) for e in events] == [("d1", ["Animal"]), ("d2", ["Person", "Animal"])]
-    assert bridge.stats()["not_announced"] == 1
+    assert (bridge.stats()["held_quiet"], bridge.stats()["not_announced"]) == (1, 0)
 
 
 async def test_quiet_review_ending_quiet_is_decided(hass: HomeAssistant, bridge: FrigateBridge) -> None:
@@ -1127,7 +1127,8 @@ async def test_quiet_review_ending_quiet_is_decided(hass: HomeAssistant, bridge:
     await bridge.handle(review("end", objects=("dog",), rid="d2", start=T + 30, end=T + 60))
     await hass.async_block_till_done()
     assert [e.data["review_id"] for e in events] == ["d1"]
-    assert "d2" in bridge._decided and "d2" not in bridge._not_yet and bridge.stats()["not_announced"] == 1
+    assert "d2" in bridge._decided and "d2" not in bridge._not_yet
+    assert (bridge.stats()["held_quiet"], bridge.stats()["not_announced"]) == (1, 1)
 
 
 async def test_object_of_interest_minutes_into_a_review(hass: HomeAssistant, bridge: FrigateBridge, clock) -> None:
@@ -1151,3 +1152,72 @@ async def test_replayed_message_is_no_news(hass: HomeAssistant, bridge: FrigateB
     await bridge.handle({**review("update", objects=("person",), rid="b"), "_received_at": T + 100})
     await hass.async_block_till_done()
     assert not events and bridge.stats()["bookmarked"] == 1
+
+
+async def test_quiet_review_survives_a_restart(
+    hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock, hass_storage, clock
+) -> None:
+    """A review kept quiet, HA restarts: the dog stays quiet, a person joining minutes later is announced."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await bridge.handle(review("new", objects=("dog",), rid="d2", start=T + 30))
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    await hass.async_block_till_done()
+    bridge.stop()
+    await bridge.async_flush()
+
+    again = FrigateBridge(hass, bridge.entry_id, client, bridge.manager, "frigate", {"person", "dog"}, "", 5, {"Animal"})
+    again.manager.thumbnail_when_recorded = AsyncMock(return_value=b"jpg")
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ), patch.object(again, "_work", AsyncMock()):
+        await again.start()
+    client.list_bookmarks.return_value = [Bookmark(100 + i, 6, "Animal", f"Frigate alert [frigate {r}]", T, T + 30) for i, r in enumerate(("d1", "d2"))]
+    await again.handle(review("update", objects=("dog",), rid="d2", start=T + 30))  # still quiet
+    clock.return_value = T + 400
+    await again.handle(review("update", objects=("dog", "person"), rid="d2", start=T + 30))
+    await again.handle(review("update", objects=("bicycle", "person"), rid="b"))
+    await hass.async_block_till_done()
+    assert [(e.data["review_id"], e.data["objects"]) for e in events] == [
+        ("d1", ["Animal"]), ("d2", ["Person", "Animal"]), ("b", ["Person"])
+    ]
+    again.stop()
+
+
+async def test_merged_message_keeps_when_the_news_came(hass: HomeAssistant, bridge: FrigateBridge, clock) -> None:
+    """A person seen at +60 s waited for SS (down); an update at +1500 s joins it: still 24 minutes old news."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    clock.return_value = T + 60
+    bridge._received(MagicMock(payload=json.dumps(review("update", objects=("bicycle", "person"), rid="b"))))
+    bridge._keep("b", bridge._pending.pop("b"))  # SS down: deferred
+    clock.return_value = T + 1500
+    bridge._received(MagicMock(payload=json.dumps(review("update", objects=("bicycle", "person"), rid="b"))))
+    key, message = bridge._pending.popitem()
+    assert message["_received_at"] == T + 60
+    await bridge.handle(message)
+    await hass.async_block_till_done()
+    assert not events and bridge.stats()["bookmarked"] == 1
+
+
+async def test_merged_message_without_news_is_fresh(hass: HomeAssistant, bridge: FrigateBridge, clock) -> None:
+    """Bicycles only in the earlier message: nothing old to carry, the new one is the news."""
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    bridge._received(MagicMock(payload=json.dumps(review("update", objects=("bicycle",), rid="b"))))
+    clock.return_value = T + 300
+    bridge._received(MagicMock(payload=json.dumps(review("update", objects=("person",), rid="b"))))
+    assert bridge._pending["b"]["_received_at"] == T + 300
+
+
+async def test_review_ending_without_objects_is_forgotten(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    await bridge.handle(review("new", objects=("bicycle",), rid="b"))
+    assert "b" in bridge._not_yet
+    await bridge.handle(review("end", objects=("bicycle",), rid="b", end=T + 9))
+    assert "b" not in bridge._not_yet
+
+
+async def test_not_yet_is_bounded(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    with patch("custom_components.surveillance_station.frigate.FRIGATE_TRACKED_MAX", 2):
+        for rid in ("a", "b", "c"):
+            bridge._note_not_yet(rid)
+    assert list(bridge._not_yet) == ["b", "c"]

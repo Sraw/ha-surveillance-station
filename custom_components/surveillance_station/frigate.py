@@ -215,7 +215,7 @@ class FrigateBridge:
         # announced or not_announced).
         self._counts = {
             "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
-            "announced": 0, "not_announced": 0, "announce_failed": 0,
+            "announced": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
         }
         self._ignored: dict[str, int] = {}
         self._last_message: float | None = None
@@ -266,6 +266,8 @@ class FrigateBridge:
             now = time.time()
             for review_id in stored.get("decided") or []:
                 self._decide(str(review_id))
+            for review_id, quiet in stored.get("not_yet") or []:
+                self._note_not_yet(str(review_id), [str(k) for k in quiet])
             for camera_id, kind, t, *rid in stored.get("last_seen") or []:
                 if now - float(t) < self.quiet:
                     self._last_seen[(int(camera_id), str(kind))] = (float(t), str(rid[0]) if rid else "")
@@ -391,6 +393,10 @@ class FrigateBridge:
                 review[_SEEN_NEW] = True
             if earlier.get(_MAYBE_MADE):
                 review[_MAYBE_MADE] = True
+            # News since the earlier one came (it had an object of interest,
+            # waited for SS): as old as that, or a replay would seem fresh.
+            if earlier.get(_RECEIVED_AT) and self._selected(earlier):
+                review[_RECEIVED_AT] = min(review[_RECEIVED_AT], earlier[_RECEIVED_AT])
         self._pending[key] = review  # an existing key keeps its place
         if len(self._pending) > FRIGATE_QUEUE_MAX:
             # SS stuck for a long while: the oldest (but not the one being
@@ -583,7 +589,9 @@ class FrigateBridge:
         tracked = self._tracked.get(review_id)
         if tracked is None and not objects:
             self._ignore("no_objects")  # none of the chosen objects (yet)
-            if self._live(review):
+            if kind == "end":
+                self._not_yet.pop(review_id, None)
+            elif self._live(review):
                 self._note_not_yet(review_id)
             return
         camera = await self._camera(str(after.get("camera") or ""))
@@ -654,13 +662,12 @@ class FrigateBridge:
                 )
             elif news and kind != "end":
                 # Only quiet kinds seen lately: not now, but a later message
-                # adding another kind is news. Counted once.
-                if review_id not in self._not_yet:
-                    self._counts["not_announced"] += 1
+                # adding another kind is news.
+                if set(kinds(objects)) - self._not_yet.get(review_id, frozenset()):
+                    self._counts["held_quiet"] += 1
                 self._note_not_yet(review_id, kinds(objects))
             else:
-                if review_id not in self._not_yet:
-                    self._counts["not_announced"] += 1
+                self._counts["not_announced"] += 1
                 self._not_yet.pop(review_id, None)
                 self._decide(review_id)
         # Bookmarked: its kinds count as seen here (still going on: now;
@@ -688,6 +695,11 @@ class FrigateBridge:
         else:
             self.manager.forget_bookmarks(self.entry_id)
 
+    def _selected(self, review: dict[str, Any]) -> bool:
+        """Does the message have any of the objects bookmarked?"""
+        data = review["after"].get("data") if isinstance(review["after"].get("data"), dict) else {}
+        return any(str(o).removesuffix("-verified") in self.objects for o in _strings(data.get("objects")))
+
     def _live(self, review: dict[str, Any]) -> bool:
         """Received just now, not replayed after an outage (a message handled directly: now)."""
         return time.time() - review.get(_RECEIVED_AT, time.time()) <= FRIGATE_ANNOUNCE_MAX_AGE
@@ -707,6 +719,7 @@ class FrigateBridge:
         return {
             "decided": list(self._decided),
             "last_seen": [[c, k, t, rid] for (c, k), (t, rid) in self._last_seen.items()],
+            "not_yet": [[rid, sorted(quiet)] for rid, quiet in self._not_yet.items()],
             "deferred": [[key, review] for key, review in self._waiting().items()],
         }
 

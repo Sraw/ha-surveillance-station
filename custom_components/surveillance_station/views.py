@@ -70,7 +70,9 @@ from .const import (
     THUMBNAIL_CACHE_BYTES,
     THUMBNAIL_DISK_BYTES,
     THUMBNAIL_ENTRY_BYTES,
+    NOT_RECORDING_GRACE_SECONDS,
     THUMBNAIL_MISS_SECONDS,
+    THUMBNAIL_RECENT_MISS_SECONDS,
     THUMBNAIL_URL,
     THUMBNAIL_URL_TTL_HOURS,
     THUMBNAIL_WIDTH,
@@ -298,6 +300,7 @@ class VodManager:
         (an earlier keyframe) or empty, and that would be kept.
         """
         deadline = _monotonic() + wait
+        grace = _monotonic() + min(wait, NOT_RECORDING_GRACE_SECONDS)
         while True:
             client = self.client(entry_id)
             try:
@@ -305,9 +308,12 @@ class VodManager:
                     recordings = await client.recordings(camera_id, ts - RECORDING_GAP_SECONDS, ts + 1)
                     if any(r.start <= ts and r.end >= ts + 1 for r in recordings):
                         return await self.thumbnail(entry_id, camera_id, ts, width)
-                    if not any(r.live or r.end >= ts - RECORDING_GAP_SECONDS for r in recordings):
-                        # SS isn't recording this camera (motion-only, or
-                        # not at all): nothing to wait for.
+                    if _monotonic() >= grace and not any(
+                        r.live or r.end >= ts - RECORDING_GAP_SECONDS for r in recordings
+                    ):
+                        # SS isn't recording this camera (motion-only, and
+                        # its trigger not come by now; or not at all):
+                        # nothing to wait for.
                         return None
             except SSError:
                 pass
@@ -354,8 +360,9 @@ class VodManager:
         if (hit := self._thumbs.get(key)) is not None:
             at, data = hit
             # A miss is only remembered briefly: the recording may just not
-            # have been listed yet.
-            if data or _monotonic() - at < THUMBNAIL_MISS_SECONDS:
+            # have been listed yet (a moment just past: a few seconds).
+            recent = time.time() - ts < RECORDING_GAP_SECONDS
+            if data or _monotonic() - at < (THUMBNAIL_RECENT_MISS_SECONDS if recent else THUMBNAIL_MISS_SECONDS):
                 self._thumbs.move_to_end(key)
                 return data or None
             self._drop_thumbnail(key)

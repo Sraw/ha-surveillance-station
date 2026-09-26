@@ -48,7 +48,12 @@ THUMBNAIL_ENTRY_BYTES = 256
 # moment isn't being recorded then (motion-only recording): not waited for.
 # Longer than SS's gap between two files of a continuous recording.
 RECORDING_GAP_SECONDS = 60
-# "Nothing recorded then" is re-checked after this long.
+# ...but only after this long: an SS recording on motion may start (or be
+# listed) a few seconds after Frigate saw the object.
+NOT_RECORDING_GRACE_SECONDS = 8
+# "Nothing recorded then" is re-checked after this long (a moment less than
+# RECORDING_GAP_SECONDS ago: after THUMBNAIL_RECENT_MISS_SECONDS).
+THUMBNAIL_RECENT_MISS_SECONDS = 5
 THUMBNAIL_MISS_SECONDS = 300
 # Parallel thumbnail jobs: fewer than playback's, which must not wait on them.
 MAX_PARALLEL_THUMBNAILS = 2

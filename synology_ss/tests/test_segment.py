@@ -55,16 +55,39 @@ async def test_fetch_segment_success() -> None:
     client.download.assert_awaited_once_with(1, 1, 0, 10 * 1000 + 1000)
 
 
-async def test_fetch_segment_without_audio_mp4_cannot_carry() -> None:
+async def test_fetch_segment_without_audio_mp4_cannot_carry(monkeypatch: pytest.MonkeyPatch) -> None:
     """ffmpeg refuses the camera's audio (G.711 in MP4): the segment again without it, not a failure."""
     client = MagicMock()
     client.download = AsyncMock(return_value=b"raw-mp4")
+    monkeypatch.setattr(seg_mod, "_NO_AUDIO", seg_mod.OrderedDict())
     run = AsyncMock(side_effect=[_proc(1, b"", b"Could not find tag for codec pcm_mulaw"), _proc(0, FMP4)])
     with patch.object(seg_mod.asyncio, "create_subprocess_exec", run):
         init, media = await seg_mod.fetch_segment(client, _seg(), "ffmpeg")
     assert media == _box("moof", b"m") + _box("mdat", b"d" * 4)
     first, second = (c.args for c in run.await_args_list)
     assert "0:a:0?" in first and "0:a:0?" not in second
+
+
+async def test_audio_refused_once_per_recording(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The recording's later segments go without audio straight away (one ffmpeg run, one consistent init)."""
+    monkeypatch.setattr(seg_mod, "_NO_AUDIO", seg_mod.OrderedDict())
+    client = MagicMock()
+    client.download = AsyncMock(return_value=b"raw-mp4")
+    run = AsyncMock(side_effect=[_proc(1, b"", b"Could not find tag for codec pcm_alaw"), _proc(0, FMP4), _proc(0, FMP4)])
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", run):
+        await seg_mod.fetch_segment(client, _seg(), "ffmpeg")
+        await seg_mod.fetch_segment(client, _seg(), "ffmpeg")
+    assert run.await_count == 3 and "0:a:0?" not in run.await_args.args
+
+
+async def test_other_ffmpeg_failure_is_not_retried_without_audio() -> None:
+    client = MagicMock()
+    client.download = AsyncMock(return_value=b"raw-mp4")
+    run = AsyncMock(return_value=_proc(1, b"", b"Invalid data found when processing input"))
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", run):
+        with pytest.raises(SSError, match="Invalid data"):
+            await seg_mod.fetch_segment(client, _seg(), "ffmpeg")
+    assert run.await_count == 1
 
 
 async def test_fetch_segment_timeout_is_not_retried() -> None:

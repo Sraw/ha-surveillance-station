@@ -372,6 +372,9 @@ class SurveillanceStationClient:
         apis = data.get("data") if data.get("success") else None
         if not isinstance(apis, dict):
             raise SSError("SYNO.API.Info", "query", _error_code(data), "unexpected reply")
+        if not any(api.startswith("SYNO.SurveillanceStation.") for api in apis):
+            # None at all: the package is stopped (or updating), not old.
+            raise SSConnectionError("SYNO.API.Info", "query", None, "Surveillance Station isn't running")
         missing = []
         for api, version in REQUIRED_APIS.items():
             try:

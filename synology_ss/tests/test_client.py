@@ -501,6 +501,10 @@ async def test_missing_apis() -> None:
     client, _ = _client([_resp(body=_json({"success": False, "error": {"code": 102}}))])
     with pytest.raises(SSError):
         await client.missing_apis()
+    # The SS package stopped (or updating): none of its APIs there. Not "old".
+    client, _ = _client([_resp(body=_json({"success": True, "data": {"SYNO.API.Auth": {"minVersion": 1, "maxVersion": 7}}}))])
+    with pytest.raises(SSConnectionError, match="isn't running"):
+        await client.missing_apis()
 
 
 def test_ipv6_host() -> None:

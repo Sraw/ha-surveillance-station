@@ -415,11 +415,31 @@ async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integ
 async def test_thumbnail_when_not_recording(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client, recordings
 ) -> None:
-    """SS isn't recording the camera then: nothing to wait for (a notification isn't held for it)."""
+    """SS isn't recording the camera then: given up after a few seconds (a motion recording may start a
+    moment late), not after the whole wait (a notification isn't held for it)."""
     mock_client.recordings = AsyncMock(return_value=recordings)
-    with patch.object(views, "THUMBNAIL_POLL_SECONDS", 0):
+    clock = iter(range(0, 1000, 2))
+    with patch.object(views, "THUMBNAIL_POLL_SECONDS", 0), patch.object(views, "_monotonic", lambda: next(clock)):
         assert await hass.data[DATA_MANAGER].thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
-    assert mock_client.recordings.await_count == 1
+    assert 3 <= mock_client.recordings.await_count <= 5  # 8 s of 2 s polls, not 20
+
+
+async def test_recent_miss_is_asked_again_soon(hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client) -> None:
+    """No frame for a moment just past (a notification fetched before SS listed it): asked again in seconds."""
+    manager = hass.data[DATA_MANAGER]
+    snap = AsyncMock(side_effect=[None, b"jpg", None, b"jpg"])
+    now = [100.0]
+    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic", lambda: now[0]), patch.object(
+        views.time, "time", return_value=T0 + 10
+    ):
+        assert await manager.thumbnail(setup_integration.entry_id, 6, T0) is None
+        now[0] += 6
+        assert await manager.thumbnail(setup_integration.entry_id, 6, T0) == b"jpg"
+    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic", lambda: now[0]):
+        assert await manager.thumbnail(setup_integration.entry_id, 6, T0 - 3600) is None  # long past
+        now[0] += 6
+        assert await manager.thumbnail(setup_integration.entry_id, 6, T0 - 3600) is None  # still the miss
+    assert snap.await_count == 3
 
 
 async def test_large_image(

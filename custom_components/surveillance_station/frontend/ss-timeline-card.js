@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.12.1";
+const CARD_VERSION = "0.12.2";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -153,8 +153,12 @@ const prefs = {
 // 12 or 24 h, as the user's HA profile says (hass.locale.time_format:
 // "12", "24", "language" or "system").
 let hour12 = false;
+let hour12Key;
 function setTimeFormat(locale) {
   const f = locale?.time_format;
+  const key = `${f}|${locale?.language}`;
+  if (key === hour12Key) return; // hass is set on every state change
+  hour12Key = key;
   if (f === "12" || f === "24") hour12 = f === "12";
   else {
     const lang = f === "system" ? undefined : locale?.language;
@@ -677,7 +681,9 @@ function audioCodecOf(moov) {
   const oti = moov[k];
   if (oti !== 0x40) return `mp4a.${oti.toString(16).padStart(2, "0")}`;
   k += 13; // object type, stream type, buffer size, bitrates
-  const aot = descriptor(0x05) ? moov[k] >> 3 : 2;
+  if (!descriptor(0x05)) return "mp4a.40.2";
+  let aot = moov[k] >> 3;
+  if (aot === 31) aot = 32 + (((moov[k] & 7) << 3) | (moov[k + 1] >> 5)); // the escape: 6 more bits
   return `mp4a.40.${aot || 2}`;
 }
 
@@ -926,7 +932,10 @@ class Track {
 class StreamFeed {
   constructor(player, url, { at = null, speed = 1, onStart, onLanded, onEnd }) {
     this.player = player;
-    player.audioUnplayable = null; // until this stream's audio says otherwise
+    if (player.audioUnplayable) {
+      player.audioUnplayable = null; // until this stream's audio says otherwise
+      player.card?._syncMuteIcon();
+    }
     this.video = player.video;
     this.live = at == null;
     this.speed = this.live ? 1 : speed;
@@ -1227,8 +1236,24 @@ class StreamFeed {
     this.audioInit = [this.aFtyp, moov];
     const a = this.audio;
     if (!a) return;
-    if (!a.inited) this.initAudio();
-    else if (reinit) for (const part of this.audioInit) a.track.sink.push(part, null);
+    if (!a.inited) return this.initAudio();
+    if (!reinit) return;
+    // The next recording file. Its audio may be another codec (the camera's
+    // setting changed): the SourceBuffer is told first, if the browser takes it.
+    const codec = audioCodecOf(moov);
+    if (codec !== a.codec) {
+      const mime = `audio/mp4; codecs="${codec}"`;
+      if (!MSE.isTypeSupported(mime) || !a.track.sink.sb?.changeType) return this.audioUnplayableNow(codec);
+      a.codec = codec;
+      a.track.sink.push((sb) => sb.changeType(mime), null);
+    }
+    for (const part of this.audioInit) a.track.sink.push(part, null);
+  }
+
+  audioUnplayableNow(codec) {
+    this.player.audioUnplayable = codec;
+    this.player.card._syncMuteIcon();
+    this.stopAudio();
   }
 
   async initAudio() {
@@ -1236,16 +1261,12 @@ class StreamFeed {
     if (!a || a.inited) return;
     a.inited = true;
     // Whatever the camera sends: the browser says whether it can play it.
-    const codec = audioCodecOf(this.audioInit[1]);
+    const codec = (a.codec = audioCodecOf(this.audioInit[1]));
     const mime = `audio/mp4; codecs="${codec}"`;
-    if (!MSE.isTypeSupported(mime)) {
-      this.player.audioUnplayable = codec;
-      this.player.card._syncMuteIcon();
-      if (this.audio === a) this.stopAudio();
-      return;
-    }
-    const ok = await a.track.sink.init(this.audioInit, mime);
-    if (!ok && this.audio === a) this.stopAudio();
+    // Said to be playable but refused all the same (addSourceBuffer threw, or
+    // the moov wasn't what it seemed): unplayable too.
+    const ok = MSE.isTypeSupported(mime) && (await a.track.sink.init(this.audioInit, mime));
+    if (!ok && this.audio === a) this.audioUnplayableNow(codec); // (not if sound was turned off meanwhile)
   }
 
   audioFragment(data, wall) {

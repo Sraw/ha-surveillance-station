@@ -10,10 +10,12 @@ lives only for the remux; a crash can leave one behind, which
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 import glob
 import logging
 import os
+import re
 import tempfile
 import time
 
@@ -57,17 +59,27 @@ async def fetch_segment(
     return init, media
 
 
+# Recordings whose audio MP4 can't carry (their later segments go without it
+# straight away, and consistently: one init for all of them).
+_NO_AUDIO: OrderedDict[int, None] = OrderedDict()
+_AUDIO_REFUSED = re.compile(r"codec|tag", re.IGNORECASE)
+
+
 async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float) -> bytes:
-    try:
-        return await _run_ffmpeg(
-            ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
-        )
-    except SSError as err:
-        if err.method != "run" or err.code is None:
-            raise
-    # ffmpeg refused: most likely an audio codec MP4 can't carry (G.711,
-    # G.726: many cameras' default). The video without it rather than nothing.
-    _LOGGER.debug("Remux of segment %s failed; again without audio", seg.index)
+    if seg.recording_id not in _NO_AUDIO:
+        try:
+            return await _run_ffmpeg(
+                ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
+            )
+        except SSError as err:
+            # An audio codec MP4 can't carry (G.711, G.726: many cameras'
+            # default): the video without it rather than nothing.
+            if err.method != "run" or err.code is None or not _AUDIO_REFUSED.search(str(err)):
+                raise
+        _LOGGER.debug("Recording %s: audio MP4 can't carry; its segments go without", seg.recording_id)
+        _NO_AUDIO[seg.recording_id] = None
+        while len(_NO_AUDIO) > 256:
+            _NO_AUDIO.popitem(last=False)
     return await _run_ffmpeg(
         ffmpeg, raw,
         lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc, audio=False),
