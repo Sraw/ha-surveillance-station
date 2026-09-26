@@ -179,6 +179,8 @@ Needs, on Frigate's side (verified on 0.18; the review topic is 0.14+):
 - Zones and `review.*.required_zones` decide what becomes a review; this
   integration takes every review with an object of interest.
 
+How it works:
+
 - Read from `<prefix>/reviews` on MQTT (HA's MQTT integration, connected to
   Frigate's broker). Frigate cameras are matched to SS cameras by name,
   ignoring case, spaces and punctuation (`drive_way` = "Drive Way"); where

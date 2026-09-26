@@ -288,7 +288,7 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
     assert result["errors"] == {"base": "duplicate_camera"}
     with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)) as start:
         result = await hass.config_entries.options.async_configure(
-            flow["flow_id"], {"Backyard": " back_yard , garden, Garden,", "Drive Way": " "}  # a name twice: once
+            flow["flow_id"], {"Backyard": " back_yard , garden, Back_Yard,", "Drive Way": " "}  # a name twice: once, in place
         )
         await hass.async_block_till_done()
     assert result["type"] == "create_entry"

@@ -237,8 +237,7 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
             mapping = {
                 name: ", ".join(names)
                 for name in self._cameras
-                # A name entered twice for the same camera: once.
-                if (names := list({camera_key(n): n for n in reversed(frigate_names(user_input.get(name, "")))}.values())[::-1])
+                if (names := _once(frigate_names(user_input.get(name, ""))))
             }
             listed = [camera_key(n) for names in mapping.values() for n in frigate_names(names)]
             if len(listed) != len(set(listed)):
@@ -253,3 +252,14 @@ class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
             ),
             errors=errors,
         )
+
+
+def _once(names: list[str]) -> list[str]:
+    """A name entered twice for the same camera: kept once, where it first came."""
+    seen: set[str] = set()
+    out = []
+    for name in names:
+        if (key := camera_key(name)) not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
