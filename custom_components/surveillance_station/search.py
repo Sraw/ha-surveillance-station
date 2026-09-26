@@ -3,8 +3,10 @@
 Frigate finds (it keeps a CLIP embedding of every tracked object's
 thumbnail); SS plays. Each result is placed by what the bookmarks are made
 by: the SS camera Frigate's camera maps to, and the object's time on SS's
-recording. A result on a Frigate bookmark's camera and time is that
-bookmark (its name and comment), listed once, by its best-matching object.
+recording. Only what is a Frigate bookmark (of its kind, on its camera
+then) is a result, listed once, by its best-matching object: what the event
+list and the timeline hold, not what Frigate saw and let go (outside the
+zones that count, a kind not bookmarked).
 "Similar to" a bookmark searches by the foremost object seen in it.
 
 By time, not by Frigate's review ids: Frigate deletes reviews with its
@@ -112,9 +114,9 @@ async def _search(
         label = obj.get("label") if isinstance(obj.get("label"), str) else ""
         kind = (kinds([label]) or [""])[0] if label else ""
         bm = _bookmark_of(obj, camera_id, kind, bookmarks)
-        if source is not None and bm is not None and bm.id == source.id:
-            continue  # the bookmark searched from
-        key = f"b{bm.id}" if bm else str(obj["id"])
+        if bm is None or (source is not None and bm.id == source.id):
+            continue  # not an event (no bookmark), or the bookmark searched from
+        key = f"b{bm.id}"
         if key in seen_keys:
             continue
         seen_keys.add(key)
@@ -127,9 +129,9 @@ async def _search(
                 "kind": kind,
                 "start": int(start),
                 "end": int(end) + 1 if end is not None else None,
-                "bookmark_id": bm.id if bm else None,
-                "name": bm.name if bm else kind or "Detection",
-                "comment": bm.comment if bm else "",
+                "bookmark_id": bm.id,
+                "name": bm.name,
+                "comment": bm.comment,
                 "thumbnail": manager.sign_path(f"{FRIGATE_IMAGE_URL}/{entry_id}/object/{obj['id']}.webp"),
             }
         )

@@ -35,6 +35,7 @@ async def bridge(
 ) -> FrigateBridge:
     mock_client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=7, name="Backyard", enabled=True)]
     mock_client.list_bookmarks.return_value = [
+        Bookmark(id=23, camera_id=7, name="Person", comment="Frigate alert [frigate r3]", start=T0 + 95, end=T0 + 120),
         Bookmark(id=22, camera_id=6, name="Person", comment="Frigate alert [frigate r2]", start=T0 + 900, end=T0 + 920),
         Bookmark(id=21, camera_id=6, name="Car", comment="Frigate alert in driveway [frigate r1]", start=T0 + 100, end=T0 + 111),
         Bookmark(id=20, camera_id=6, name="Mine", comment="by hand", start=T0 + 50, end=T0 + 120),
@@ -58,7 +59,8 @@ def query_of(aioclient_mock: AiohttpClientMocker, path: str) -> dict:
 
 
 async def test_words(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock: AiohttpClientMocker) -> None:
-    """Best first; a bookmark once, by its camera and time (not Frigate's review ids); the rest by themselves."""
+    """Best first; a bookmark once, by its camera and time (not Frigate's review ids); what isn't
+    a Frigate bookmark (a kind not bookmarked, a hand-made bookmark's time, unplaceable) isn't a result."""
     aioclient_mock.get(f"{F}/api/config", json=CONFIG)
     aioclient_mock.get(f"{F}/api/events/search", json=[
         obj("o1"), obj("o2", start=T0 + 105), obj("o3", camera="garage"), obj("o4", camera="backyard", label="person"),
@@ -68,16 +70,14 @@ async def test_words(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client,
     msg = await ask(hass, hass_ws_client, query=" white car ", camera_ids=[6])
     assert msg["success"], msg
     results = msg["result"]["results"]
-    assert [r["key"] for r in results] == ["b21", "o5", "o8"]
-    first, second, third = results
+    assert [r["key"] for r in results] == ["b21"]
+    first = results[0]
     assert first == {
         "key": "b21", "event_id": "o1", "camera_id": 6, "label": "car", "kind": "Car",
         "start": T0 + 98, "end": T0 + 111, "bookmark_id": 21, "name": "Car",
         "comment": "Frigate alert in driveway [frigate r1]", "thumbnail": first["thumbnail"],
     }  # not the hand-made bookmark over the same time
     assert first["thumbnail"].startswith(f"{FRIGATE_IMAGE_URL}/{bridge.entry_id}/object/o1.webp?exp=")
-    assert (second["kind"], second["name"], second["bookmark_id"], second["end"]) == ("Animal", "Animal", None, None)
-    assert (third["label"], third["name"]) == ("", "Detection")
     # Frigate asked for the cameras shown only (its names for them).
     assert query_of(aioclient_mock, "events/search") == {
         "query": "white car", "search_type": "thumbnail,description", "limit": "100", "cameras": "drive_way",
@@ -85,7 +85,7 @@ async def test_words(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client,
 
     # All cameras: the backyard's too; at most limit.
     msg = await ask(hass, hass_ws_client, query="white car")
-    assert [r["key"] for r in msg["result"]["results"]] == ["b21", "o4", "o5", "o8"]
+    assert [r["key"] for r in msg["result"]["results"]] == ["b21", "b23"]
     assert "cameras" not in query_of(aioclient_mock, "events/search")
     msg = await ask(hass, hass_ws_client, query="white car", limit=1)
     assert [r["key"] for r in msg["result"]["results"]] == ["b21"]
@@ -99,9 +99,9 @@ async def test_cameras_filter(hass: HomeAssistant, bridge: FrigateBridge, hass_w
     aioclient_mock.clear_requests()
     bridge._frigate_cameras_at = float("-inf")
     aioclient_mock.get(f"{F}/api/config", status=500)
-    aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o4", camera="backyard")])
+    aioclient_mock.get(f"{F}/api/events/search", json=[obj("o1"), obj("o4", camera="backyard", label="person")])
     msg = await ask(hass, hass_ws_client, query="car", camera_ids=[7])
-    assert [r["key"] for r in msg["result"]["results"]] == ["o4"]
+    assert [r["key"] for r in msg["result"]["results"]] == ["b23"]
     assert "cameras" not in query_of(aioclient_mock, "events/search")
 
 
@@ -137,7 +137,7 @@ async def test_similar_to_a_bookmark(hass: HomeAssistant, bridge: FrigateBridge,
 
 async def test_which_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
     """A car there all day is the car bookmark it overlaps (not the newest one of the day, a person's); one
-    still being tracked, begun before its bookmark, is that bookmark; an object of no bookmark's kind, none."""
+    still being tracked, begun before its bookmark, is that bookmark; an object of no bookmark's kind: no result."""
     aioclient_mock.get(f"{F}/api/events/search", json=[
         obj("o1", start=T0 + 50, end=T0 + 5000),
         obj("o2", label="person", start=T0 + 895, end=None),
@@ -145,7 +145,7 @@ async def test_which_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_w
     ])
     with patch.object(search_mod.time, "time", return_value=T0 + 950):
         msg = await ask(hass, hass_ws_client, query="car")
-    assert [(r["key"], r["name"]) for r in msg["result"]["results"]] == [("b21", "Car"), ("b22", "Person"), ("o3", "Animal")]
+    assert [(r["key"], r["name"]) for r in msg["result"]["results"]] == [("b21", "Car"), ("b22", "Person")]
 
 
 async def test_empty_answer_asked_again(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:

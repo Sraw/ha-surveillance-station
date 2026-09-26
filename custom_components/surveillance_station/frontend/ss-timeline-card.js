@@ -36,7 +36,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.14.3";
+const CARD_VERSION = "0.14.4";
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -3347,8 +3347,8 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _searchShown() {
-    // As the list does: a bookmark by its name ("Person, Car" found by its car is a Person too).
-    return (this._search?.items ?? []).filter((r) => this._kindOk(r.bookmark_id != null ? r.name : r.kind));
+    // As the list does, by the bookmark's name ("Person, Car" found by its car is a Person too).
+    return (this._search?.items ?? []).filter((r) => this._kindOk(r.name));
   }
 
   /** Ask Frigate (through the integration): {query} or {bookmark_id} (similar to it). */

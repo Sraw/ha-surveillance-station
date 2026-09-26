@@ -135,16 +135,16 @@ bookmarks are the event source.
   "person with a box"; English, Frigate's CLIP model), or "similar to" a
   bookmark (the button on a Frigate bookmark's row: by the foremost object
   seen in it, image to image). Frigate finds; SS plays: each result is
-  placed on the SS camera its Frigate camera maps to, at its start time. One
-  on a Frigate bookmark of its kind on that camera then (the one it began
-  in, else the one it overlaps most) is that bookmark, listed once. Matched
+  placed on the SS camera its Frigate camera maps to, at its start time, and
+  only one on a Frigate bookmark of its kind on that camera then (the one it
+  began in, else the one it overlaps most) is a result: that bookmark,
+  listed once. What Frigate saw and let go (outside the zones that count, a
+  kind not bookmarked) isn't an event, so it isn't found either. Matched
   by camera and time, not by Frigate's review ids: Frigate deletes reviews
   with its own recordings (days), but keeps tracked objects as long as their
   snapshots. Results come best first, each with Frigate's crop of the
   object, and the kind chips filter them too (a bookmarked one by its name).
-  Tapping one plays SS's recording from 3 s before it. Objects that never
-  became a review (outside `required_zones`) can be found too, without a
-  bookmark. Frigate ranks the best 100 of all cameras before filtering by
+  Tapping one plays SS's recording from 3 s before it. Frigate ranks the best 100 of all cameras before filtering by
   camera, so with a few cameras shown there may be fewer results.
   Needs `semantic_search.enabled` in Frigate; on a machine whose iGPU also
   decodes and detects, keep it on the CPU (`model_size: small`): with
