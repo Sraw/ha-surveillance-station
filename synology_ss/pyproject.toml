@@ -16,5 +16,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Sraw/ha-surveillance-station/tree/main/synology_ss"
+Issues = "https://github.com/Sraw/ha-surveillance-station/issues"
+
 [tool.setuptools.package-data]
 synology_ss_playback = ["py.typed"]

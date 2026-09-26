@@ -4,7 +4,9 @@
   "after_dependencies": [
     "mqtt"
   ],
-  "codeowners": [],
+  "codeowners": [
+    "@Sraw"
+  ],
   "config_flow": true,
   "dependencies": [
     "ffmpeg",
@@ -12,9 +14,10 @@
     "http",
     "lovelace"
   ],
-  "documentation": "https://github.com/",
+  "documentation": "https://github.com/Sraw/ha-surveillance-station",
   "integration_type": "hub",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Sraw/ha-surveillance-station/issues",
   "loggers": [
     "synology_ss_playback"
   ],

@@ -2,7 +2,7 @@
 // is served from the repo (mounted at /card), everything else is live HA.
 import { chromium } from "playwright";
 import fs from "fs";
-export const base = process.env.HA_URL ?? "http://172.26.0.4:8123";
+export const base = process.env.HA_URL; // run.sh requires it
 const token = fs.readFileSync("/token", "utf8").trim().split(/\s+/)[0];
 // path: a dashboard view holding the card (DASHBOARD, default /ss-playback/playback).
 export async function open({ w = 1400, h = 900, mobile = false, path = process.env.DASHBOARD ?? "/ss-playback/playback", prefs = null } = {}) {
