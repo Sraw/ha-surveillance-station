@@ -27,6 +27,12 @@ const HEVC_PROBE = 'video/mp4; codecs="hvc1.1.6.L93.B0"';
 // paints a big grey play button over a video with no frame yet.
 const TL_BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 const TL_LOADING_DELAY_MS = 400; // a quick load shows no veil at all
+// Timeline zoom: how much of the day the scrub bar shows (wall seconds).
+const TL_SPANS = [[86400, "24h"], [6 * 3600, "6h"], [3600, "1h"], [900, "15m"]];
+// Skip buttons, in seconds of the time-lapse itself (what is watched).
+const TL_SKIPS = [-30, -10, 10, 30];
+const TL_TICK_STEPS = [300, 900, 1800, 3600, 3 * 3600, 6 * 3600];
+const TL_FOLLOW_PAUSE_MS = 15_000; // after a manual pan, the view doesn't follow the playhead
 
 function tlPrefs(key, value) {
   try {
@@ -289,7 +295,7 @@ class SegmentFeed {
 
 const TL_STYLE = `
   :host { display: block; }
-  ha-card { overflow: hidden; }
+  ha-card { overflow: hidden; container-type: inline-size; }
   ha-icon { --mdc-icon-size: 20px; }
   .bar { display: flex; gap: 6px; padding: 8px 12px 0; align-items: center; }
   .scroll { overflow-x: auto; scrollbar-width: none; flex: 1; display: flex; gap: 6px; }
@@ -321,16 +327,31 @@ const TL_STYLE = `
   .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
   .vsub:empty { display: none; }
   .veil:not(.loading) .spin, .veil.loading ha-icon { display: none; }
-  .controls { display: flex; align-items: center; gap: 6px; padding: 6px 8px 10px; }
+  .controls { display: flex; align-items: center; gap: 2px; padding: 6px 8px 0; }
+  .spacer { flex: 1; }
+  .range { flex: 1; min-width: 0; font-size: 12px; color: var(--secondary-text-color); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; text-align: center; font-variant-numeric: tabular-nums; }
+  .spans { display: flex; border: 1px solid var(--divider-color); border-radius: 16px; overflow: hidden; flex: none; }
+  .spans button { border: none; border-radius: 0; padding: 4px 9px; font-size: 12px; color: var(--secondary-text-color); }
+  .spans button + button { border-left: 1px solid var(--divider-color); }
+  .spans button.on { color: var(--primary-text-color); font-weight: 600;
+    background: color-mix(in srgb, var(--primary-color) 22%, transparent); }
+  .tlrow { display: flex; align-items: flex-start; gap: 2px; padding: 4px 4px 10px; }
+  .tlrow button.icon { padding: 3px; margin-top: 2px; }
+  @container (max-width: 520px) {
+    .controls .wide, .range { display: none; }
+    .controls .spacer { display: block; }
+    .spans button { padding: 4px 7px; }
+  }
   .scrub { position: relative; flex: 1; height: 34px; cursor: pointer; touch-action: none; }
   .track { position: absolute; left: 0; right: 0; top: 6px; height: 10px; border-radius: 5px;
     background: color-mix(in srgb, var(--secondary-text-color) 18%, transparent); overflow: hidden; }
   .cov { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--primary-color) 45%, transparent); }
   .head { position: absolute; top: 2px; width: 2px; height: 18px; margin-left: -1px; background: var(--primary-color); }
   .ticks { position: absolute; left: 0; right: 0; top: 19px; height: 14px; font-size: 10px; color: var(--secondary-text-color); }
-  .ticks span { position: absolute; transform: translateX(-50%); }
-  .ticks span:first-child { transform: none; }
-  .ticks span:last-child { transform: translateX(-100%); }
+  .ticks span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+  .ticks span.l { transform: none; }
+  .ticks span.r { transform: translateX(-100%); }
 `;
 
 class SSTimelapseCard extends HTMLElement {
@@ -343,6 +364,10 @@ class SSTimelapseCard extends HTMLElement {
     this._session = null;
     this._feed = null;
     this._seq = 0;
+    const span = Number(tlPrefs("span"));
+    this._span = TL_SPANS.some(([v]) => v === span) ? span : TL_SPANS[0][0];
+    this._view = null; // {start, end}: the part of the day the scrub bar shows
+    this._followPausedUntil = 0;
     this._onResize = () => this._fit();
   }
 
@@ -432,11 +457,19 @@ class SSTimelapseCard extends HTMLElement {
         </div>
         <div class="controls">
           <button class="icon play" title="Play"><ha-icon icon="mdi:play"></ha-icon></button>
-          <div class="scrub"><div class="track"></div><div class="head"></div><div class="ticks"></div></div>
+          ${TL_SKIPS.map((d) => `<button class="icon skip${Math.abs(d) >= 30 ? " wide" : ""}" data-skip="${d}" title="${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s"><ha-icon icon="mdi:${d < 0 ? "rewind" : "fast-forward"}-${Math.abs(d)}"></ha-icon></button>`).join("")}
+          <span class="range"></span><span class="spacer" hidden></span>
+          <div class="spans">${TL_SPANS.map(([v, l]) => `<button data-span="${v}">${l}</button>`).join("")}</div>
           <button class="icon full" title="Full screen"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
+        </div>
+        <div class="tlrow">
+          <button class="icon pan" data-pan="-1" title="Earlier"><ha-icon icon="mdi:chevron-left"></ha-icon></button>
+          <div class="scrub"><div class="track"></div><div class="head"></div><div class="ticks"></div></div>
+          <button class="icon pan" data-pan="1" title="Later"><ha-icon icon="mdi:chevron-right"></ha-icon></button>
         </div>
       </ha-card>`;
     const $ = (s) => this.shadowRoot.querySelector(s);
+    this._dragging = false;
     this._video = $("video");
     this._video.muted = true;
     this._clock = $(".clock");
@@ -454,6 +487,10 @@ class SSTimelapseCard extends HTMLElement {
       } else if (this._video.paused) this._play();
       else this._video.pause();
     });
+    for (const b of this.shadowRoot.querySelectorAll("[data-skip]")) b.addEventListener("click", () => this._skip(Number(b.dataset.skip)));
+    for (const b of this.shadowRoot.querySelectorAll("[data-span]")) b.addEventListener("click", () => this._zoom(Number(b.dataset.span)));
+    for (const b of this.shadowRoot.querySelectorAll("[data-pan]")) b.addEventListener("click", () => this._pan(Number(b.dataset.pan)));
+    this._markSpan();
     $(".full").addEventListener("click", () => {
       const stage = $(".stage");
       if (document.fullscreenElement) document.exitFullscreen();
@@ -472,12 +509,17 @@ class SSTimelapseCard extends HTMLElement {
     const ready = () => v.paused && this._want?.kind === "loading" && this._message(null);
     v.addEventListener("canplay", ready);
     v.addEventListener("seeked", ready);
+    v.addEventListener("seeked", () => {
+      if (this._seekTarget != null && this._seekDeadline === Infinity) this._seekDeadline = Date.now() + 3000;
+      this._paint();
+    });
     v.addEventListener("ended", () => this._syncPlay());
     v.addEventListener("error", () => this._feedFailed(v.error));
     this._scrub.addEventListener("pointerdown", (e) => this._scrubStart(e));
     this._stage = $(".stage");
     this._card = $("ha-card");
-    this._resizeObs = new ResizeObserver(() => requestAnimationFrame(() => this._fit()));
+    // Ticks are as dense as the bar's width allows.
+    this._resizeObs = new ResizeObserver(() => requestAnimationFrame(() => (this._fit(), this._drawCoverage())));
     this._resizeObs.observe(this);
     requestAnimationFrame(() => this._fit());
   }
@@ -583,6 +625,7 @@ class SSTimelapseCard extends HTMLElement {
     }
     this._feed = null;
     this._session = null;
+    this._seekTarget = null;
     this._paint();
   }
 
@@ -601,8 +644,10 @@ class SSTimelapseCard extends HTMLElement {
       if (on) b.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     this._day = days[i];
-    this._drawCoverage();
     this._closeFeed();
+    this._followPausedUntil = 0;
+    this._setView(at ?? this._day?.start);
+    if (at !== null) this._paint(at); // there already, while the day opens
     this._message("Loading", "loading", this._day ? this._fmt((this._day.start + this._day.end) / 2, { weekday: "short", month: "short", day: "numeric" }) : "");
     const seq = ++this._seq;
     codec ??= TL_MSE?.isTypeSupported(HEVC_PROBE) || (!TL_MSE && this._video.canPlayType(HEVC_PROBE)) ? "hevc" : "h264";
@@ -624,6 +669,7 @@ class SSTimelapseCard extends HTMLElement {
       return;
     }
     this._session = session;
+    this._titleSkips();
     const v = this._video;
     if (TL_MSE) {
       this._feed = new SegmentFeed(v, session, {
@@ -634,8 +680,8 @@ class SSTimelapseCard extends HTMLElement {
       v.src = session.url;
     }
     const start = at === null ? 0 : this._mediaAt(at);
-    if (start > 0) v.currentTime = start;
-    this._paint();
+    if (start > 0) this._seek(start);
+    else this._paint();
     if (playing) this._play();
     else this._message(null);
   }
@@ -644,7 +690,7 @@ class SSTimelapseCard extends HTMLElement {
     if (!this._session) return;
     // One time-lapse plays at a time: a newer one (another card, device or
     // viewer) ended this. Play opens the day again, where it was.
-    const wall = this._wallAt(this._video.currentTime);
+    const wall = this._wallAt(this._seekTarget ?? this._video.currentTime);
     if (e?.status === 410) {
       this._resume = { at: wall };
       this._closeFeed();
@@ -701,62 +747,186 @@ class SSTimelapseCard extends HTMLElement {
     return last ? last.media_start + last.duration - 0.1 : 0;
   }
 
+  /** Where wall time w is on the scrub bar (0..1 of the view; outside it, beyond). */
   _frac(w) {
+    const v = this._view;
+    return v ? (w - v.start) / (v.end - v.start) : 0;
+  }
+
+  /** Show span seconds of the day around wall time `center` (whole day at most, never past its ends). */
+  _setView(center, paint = true) {
     const d = this._day;
-    return d ? Math.min(1, Math.max(0, (w - d.start) / (d.end - d.start))) : 0;
+    if (!d) {
+      this._view = null;
+    } else {
+      // The widest level is the whole day, a 23 or 25 h one too.
+      const span = this._span >= TL_SPANS[0][0] ? d.end - d.start : Math.min(this._span, d.end - d.start);
+      const start = Math.max(d.start, Math.min(center - span / 2, d.end - span));
+      this._view = { start, end: start + span };
+    }
+    this._drawCoverage();
+    if (paint) this._paint();
+  }
+
+  _zoom(span) {
+    this._span = span;
+    tlPrefs("span", span);
+    this._markSpan();
+    this._followPausedUntil = 0;
+    const w = this._session ? this._wallAt(this._seekTarget ?? this._video.currentTime) : null;
+    this._setView(w ?? (this._view ? (this._view.start + this._view.end) / 2 : this._day?.start));
+  }
+
+  _pan(dir) {
+    if (!this._view) return;
+    const span = this._view.end - this._view.start;
+    this._followPausedUntil = Date.now() + TL_FOLLOW_PAUSE_MS;
+    this._setView(this._view.start + span / 2 + (dir * span) / 2);
+  }
+
+  _markSpan() {
+    for (const b of this.shadowRoot.querySelectorAll("[data-span]")) {
+      const on = Number(b.dataset.span) === this._span;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
+  }
+
+  /** Seek to media time t; the playhead is there at once, however long the load takes. */
+  _seek(t) {
+    this._seekFrom = this._seekTarget == null ? this._video.currentTime : this._seekFrom;
+    this._seekTarget = t;
+    this._seekDeadline = Infinity;
+    this._video.currentTime = t;
+    this._paint();
+  }
+
+  /** Skip d seconds of the time-lapse (d times its rate of real time). */
+  _skip(d) {
+    const v = this._video;
+    if (!this._session) return;
+    const end = this._session.duration ?? v.duration;
+    // From where the last skip went, if it hasn't landed yet: skips add up.
+    const t = Math.min(Math.max(0, (this._seekTarget ?? v.currentTime) + d), Number.isFinite(end) ? end - 0.1 : Infinity);
+    this._followPausedUntil = 0;
+    this._seek(t);
+  }
+
+  /** Skip buttons say how much real time they skip (at the day's first rate). */
+  _titleSkips() {
+    const rate = this._session?.runs?.[0]?.rate ?? 0;
+    for (const b of this.shadowRoot.querySelectorAll("[data-skip]")) {
+      const d = Number(b.dataset.skip);
+      const real = Math.abs(d) * rate;
+      const approx = real >= 3600 ? `${+(real / 3600).toFixed(1)} h` : `${Math.round(real / 60)} min`;
+      b.title = `${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s${rate ? ` (≈${approx} of real time)` : ""}`;
+    }
   }
 
   _drawCoverage() {
     const track = this.shadowRoot.querySelector(".track");
     const ticks = this.shadowRoot.querySelector(".ticks");
+    const range = this.shadowRoot.querySelector(".range");
     track.innerHTML = "";
     ticks.innerHTML = "";
     const d = this._day;
-    if (!d) return;
+    const view = this._view;
+    for (const b of this.shadowRoot.querySelectorAll("[data-pan]")) {
+      b.disabled = !view || (Number(b.dataset.pan) < 0 ? view.start <= d.start : view.end >= d.end);
+    }
+    if (range) range.textContent = "";
+    if (!d || !view) return;
+    const hm = (t) => (t >= d.end ? "24:00" : this._fmt(t, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }));
+    const whole = view.end - view.start >= d.end - d.start;
+    if (range && !whole) range.textContent = `${hm(view.start)} – ${hm(view.end)}`;
     for (const [a, b] of d.covered) {
+      if (b <= view.start || a >= view.end) continue;
       const el = document.createElement("div");
       el.className = "cov";
-      el.style.left = `${this._frac(a) * 100}%`;
-      el.style.width = `${(this._frac(b) - this._frac(a)) * 100}%`;
+      const l = Math.max(this._frac(a), 0);
+      el.style.left = `${l * 100}%`;
+      el.style.width = `${(Math.min(this._frac(b), 1) - l) * 100}%`;
       track.append(el);
     }
-    // At the day's real 06:00/12:00/18:00 (a DST day is 23 or 25 h long).
-    const at = [[0, d.start], ...[6, 12, 18].map((h) => [h, d.hours?.[h] ?? d.start + h * 3600]), [24, d.end]];
-    for (const [h, ts] of at) {
+    // Ticks as dense as their labels allow (~64 px each), on the NAS clock's
+    // round times: hours are counted from midnight on its clock, so a DST
+    // day (23 or 25 h) still has them at 06:00, 12:00...
+    const span = view.end - view.start;
+    const px = Math.max(this._scrub?.clientWidth ?? 0, 1);
+    const step = TL_TICK_STEPS.find((v) => (v * px) / span >= 64) ?? TL_TICK_STEPS.at(-1);
+    const at = [];
+    if (step < 3600) {
+      for (let t = d.start + Math.ceil((view.start - d.start) / step) * step; t <= view.end + 1; t += step) at.push(t);
+    } else {
+      const hours = step / 3600;
+      for (let t = d.start; t <= Math.min(view.end, d.end) + 1; t += 3600) {
+        const h = Number(this._fmt(t, { hour: "numeric", hourCycle: "h23" }));
+        if (t >= view.start - 1 && (h % hours === 0 || t >= d.end)) at.push(t);
+      }
+    }
+    for (const t of at) {
+      const f = this._frac(Math.min(t, d.end));
       const s = document.createElement("span");
-      s.style.left = `${this._frac(ts) * 100}%`;
-      s.textContent = String(h).padStart(2, "0");
+      s.style.left = `${f * 100}%`;
+      if (f < 0.04) s.className = "l";
+      else if (f > 0.96) s.className = "r";
+      s.textContent = hm(Math.min(t, d.end));
       ticks.append(s);
     }
   }
 
   _paint(wall = null) {
     if (!this._headEl) return;
-    const w = wall ?? (this._session ? this._wallAt(this._video.currentTime) : null);
+    // While the head is being dragged, it is where the finger is.
+    if (wall === null && this._dragging) return;
+    // A seek under way shows where it goes until the video says it is there
+    // (some browsers report the old time until the segment there has loaded,
+    // even past "seeked"); the feed may move it on by a hair over a hole.
+    const vid = this._video;
+    if (this._seekTarget != null && !vid.seeking) {
+      const ct = vid.currentTime;
+      // There (not still where it came from), or it settled elsewhere for good
+      // (a few seconds after landing: the end, a feed moving on).
+      const there = ct !== this._seekFrom && ct >= this._seekTarget - 0.25 && ct - this._seekTarget < 2;
+      if (there || Date.now() > this._seekDeadline) this._seekTarget = null;
+    }
+    const w = wall ?? (this._session ? this._wallAt(this._seekTarget ?? vid.currentTime) : null);
     this._headEl.style.display = w === null ? "none" : "";
     this._clock.style.display = w === null ? "none" : "";
     if (w === null) return;
-    this._headEl.style.left = `${this._frac(w) * 100}%`;
+    // Zoomed in, the view follows the playhead (not for a while after a pan).
+    const v = this._view;
+    const d = this._day;
+    if (v && d && !this._dragging && (w < v.start || w > v.end) && w >= d.start && w <= d.end && Date.now() >= this._followPausedUntil) {
+      this._setView(w + (v.end - v.start) * 0.3, false);
+    }
+    const f = this._frac(w);
+    this._headEl.style.display = f < 0 || f > 1 ? "none" : "";
+    this._headEl.style.left = `${f * 100}%`;
     this._clock.textContent = this._fmt(w, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
   }
 
   _scrubStart(e) {
-    if (!this._session || !this._day) return;
+    if (!this._session || !this._day || !this._view) return;
     const rect = this._scrub.getBoundingClientRect();
-    const wallAt = (x) => this._day.start + Math.min(1, Math.max(0, (x - rect.left) / rect.width)) * (this._day.end - this._day.start);
+    const { start, end } = this._view;
+    const wallAt = (x) => start + Math.min(1, Math.max(0, (x - rect.left) / rect.width)) * (end - start);
     this._scrub.setPointerCapture(e.pointerId);
+    this._dragging = true;
     let w = wallAt(e.clientX);
     this._paint(w);
-    const move = (ev) => this._paint((w = wallAt(ev.clientX)));
-    const up = () => {
-      this._scrub.removeEventListener("pointermove", move);
-      this._scrub.removeEventListener("pointerup", up);
-      this._scrub.removeEventListener("pointercancel", up);
-      this._video.currentTime = this._mediaAt(w);
+    const scrub = this._scrub;
+    const move = (ev) => ev.pointerId === e.pointerId && this._paint((w = wallAt(ev.clientX)));
+    // Capture ends however the drag does (up, cancel, the bar re-rendered).
+    const up = (ev) => {
+      if (ev.pointerId !== e.pointerId) return;
+      scrub.removeEventListener("pointermove", move);
+      scrub.removeEventListener("lostpointercapture", up);
+      this._dragging = false;
+      if (scrub === this._scrub && this._session) this._seek(this._mediaAt(w));
     };
-    this._scrub.addEventListener("pointermove", move);
-    this._scrub.addEventListener("pointerup", up);
-    this._scrub.addEventListener("pointercancel", up);
+    scrub.addEventListener("pointermove", move);
+    scrub.addEventListener("lostpointercapture", up);
   }
 }
 
