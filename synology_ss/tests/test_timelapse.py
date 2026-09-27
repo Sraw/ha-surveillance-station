@@ -267,6 +267,29 @@ def test_plan_day_grid_is_the_files_not_the_days() -> None:
     assert [s.media_start for s in segs] == [0, 3, 7]
 
 
+def test_plan_day_never_starts_before_midnight_and_days_join() -> None:
+    # Midnight 100 s (0.42 video s) into a video second: the day starts at the
+    # next second, not 2 minutes before midnight, and the day before ends there.
+    midnight = 1000 + 43200 + 100
+    _, today = plan_day([_rec()], midnight, midnight + 86400)
+    _, before = plan_day([_rec()], midnight - 86400, midnight)
+    assert today[0].wall_start >= midnight
+    assert before[-1].wall_start + before[-1].duration * before[-1].rate == today[0].wall_start
+
+
+def test_plan_day_overlap_at_midnight_never_replays_the_day_before() -> None:
+    # a ends less than a video second past midnight; the day before played it
+    # to there, so b (overlapping a) starts there too, not at midnight.
+    a = _rec(id=1, start=0)
+    midnight = 86400 - 100
+    b = _rec(id=2, start=midnight - 190)  # its next whole second is between midnight and a's stop
+    _, before = plan_day([a, b], midnight - 86400, midnight)
+    _, today = plan_day([a, b], midnight, midnight + 86400)
+    stop = before[-1].wall_start + before[-1].duration * before[-1].rate
+    assert before[-1].recording_id == 1 and stop > midnight
+    assert today[0].recording_id == 2 and today[0].wall_start >= stop
+
+
 def test_plan_day_two_files_and_a_gap() -> None:
     a = _rec(id=1, start=0)
     b = _rec(id=2, start=86400 + 3600, span=3600, frames=450)  # an hour in 15 s

@@ -23,6 +23,10 @@ const AHEAD = 18; // seconds of video fetched ahead of the playhead
 const BEHIND = 30; // seconds of played video kept (a short step back is instant)
 const PARALLEL = 3; // segments fetched at once (the server transcodes as many)
 const HEVC_PROBE = 'video/mp4; codecs="hvc1.1.6.L93.B0"';
+// As the timeline card's: without a poster, Android WebView (the HA app)
+// paints a big grey play button over a video with no frame yet.
+const TL_BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+const TL_LOADING_DELAY_MS = 400; // a quick load shows no veil at all
 
 function tlPrefs(key, value) {
   try {
@@ -302,9 +306,21 @@ const TL_STYLE = `
   video { width: 100%; height: 100%; display: block; object-fit: contain; }
   .clock { position: absolute; left: 8px; top: 8px; color: #fff; background: rgba(0,0,0,.45);
     padding: 2px 8px; border-radius: 4px; font-size: 14px; font-variant-numeric: tabular-nums; pointer-events: none; }
-  .msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #fff;
-    text-align: center; padding: 16px; background: rgba(0,0,0,.35); font-size: 14px; }
-  .msg[hidden] { display: none; }
+  /* The veil, as the timeline card's: spinner (loading) or icon, a line, a sub-line. */
+  .veil { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 10px; padding: 16px; text-align: center; color: #fff;
+    background: rgba(0,0,0,.3); backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
+    opacity: 1; visibility: visible; transition: opacity .25s, visibility 0s; }
+  .veil.off { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s, visibility 0s .25s; }
+  .spin { width: 44px; height: 44px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25);
+    border-top-color: #fff; animation: tl-spin .9s linear infinite; }
+  @keyframes tl-spin { to { transform: rotate(360deg); } }
+  .veil ha-icon { --mdc-icon-size: 42px; opacity: .9; }
+  .veil.error ha-icon { color: #ff8a80; }
+  .vtext { font-size: 16px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,.6); max-width: 90%; }
+  .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
+  .vsub:empty { display: none; }
+  .veil:not(.loading) .spin, .veil.loading ha-icon { display: none; }
   .controls { display: flex; align-items: center; gap: 6px; padding: 6px 8px 10px; }
   .scrub { position: relative; flex: 1; height: 34px; cursor: pointer; touch-action: none; }
   .track { position: absolute; left: 0; right: 0; top: 6px; height: 10px; border-radius: 5px;
@@ -353,9 +369,7 @@ class SSTimelapseCard extends HTMLElement {
     // A hidden card holds no stream open, and a call still under way when it
     // went opens none: the next visit starts the day again.
     this._seq++;
-    this._feed?.close();
-    this._feed = null;
-    this._session = null;
+    this._closeFeed();
     this._inited = false;
     window.removeEventListener("resize", this._onResize);
     this._resizeObs?.disconnect();
@@ -379,20 +393,20 @@ class SSTimelapseCard extends HTMLElement {
   async _init() {
     this._inited = true;
     this._render();
-    this._message("Loading…");
+    this._message("Loading");
     const seq = ++this._seq;
     let index;
     try {
       index = await this._ws({ type: "surveillance_station/timelapse_days" });
     } catch (e) {
-      if (seq === this._seq) this._message(`Couldn't list the time-lapse: ${e.message || e.code || e}`);
+      if (seq === this._seq) this._message("Couldn't list the time-lapse", "error", e.message || e.code || String(e));
       return;
     }
     if (seq !== this._seq || !this.isConnected) return;
     this._index = index;
     const cams = this._index.cameras;
     if (!cams.length) {
-      this._message("No time-lapse tasks in Surveillance Station.");
+      this._message("No time-lapse tasks in Surveillance Station", "empty");
       return;
     }
     const want = this._config.camera ?? tlPrefs("camera");
@@ -412,9 +426,9 @@ class SSTimelapseCard extends HTMLElement {
           <button class="icon next" title="Next day"><ha-icon icon="mdi:chevron-right"></ha-icon></button>
         </div>
         <div class="stage">
-          <video muted playsinline disablepictureinpicture></video>
+          <video muted playsinline disablepictureinpicture poster="${TL_BLANK_POSTER}"></video>
           <div class="clock"></div>
-          <div class="msg" hidden></div>
+          <div class="veil off"><div class="spin"></div><ha-icon></ha-icon><div class="vtext"></div><div class="vsub"></div></div>
         </div>
         <div class="controls">
           <button class="icon play" title="Play"><ha-icon icon="mdi:play"></ha-icon></button>
@@ -426,16 +440,16 @@ class SSTimelapseCard extends HTMLElement {
     this._video = $("video");
     this._video.muted = true;
     this._clock = $(".clock");
-    this._msg = $(".msg");
+    this._veil = $(".veil");
     this._scrub = $(".scrub");
     this._headEl = $(".head");
     this._playBtn = $(".play");
     $(".prev").addEventListener("click", () => this._stepDay(1));
     $(".next").addEventListener("click", () => this._stepDay(-1));
     this._playBtn.addEventListener("click", () => {
-      if (this._superseded) {
-        const { at } = this._superseded;
-        this._superseded = null;
+      if (this._resume) {
+        const { at } = this._resume;
+        this._resume = null;
         this._selectDay(this._date, at, true);
       } else if (this._video.paused) this._play();
       else this._video.pause();
@@ -448,8 +462,16 @@ class SSTimelapseCard extends HTMLElement {
     const v = this._video;
     for (const ev of ["play", "pause"]) v.addEventListener(ev, () => this._syncPlay());
     v.addEventListener("timeupdate", () => this._paint());
-    v.addEventListener("playing", () => this._message(null));
-    v.addEventListener("waiting", () => this._message("Loading…"));
+    v.addEventListener("playing", () => {
+      this._played = true;
+      this._message(null);
+    });
+    // Until the first frame the veil says Loading (and which day); Buffering is for a stall after.
+    v.addEventListener("waiting", () => this._played && this._stall("Buffering"));
+    // Paused: a frame is on screen once it can play / the seek landed (also when autoplay was refused).
+    const ready = () => v.paused && this._want?.kind === "loading" && this._message(null);
+    v.addEventListener("canplay", ready);
+    v.addEventListener("seeked", ready);
     v.addEventListener("ended", () => this._syncPlay());
     v.addEventListener("error", () => this._feedFailed(v.error));
     this._scrub.addEventListener("pointerdown", (e) => this._scrubStart(e));
@@ -475,10 +497,31 @@ class SSTimelapseCard extends HTMLElement {
     if (st.style.width !== px) st.style.width = px;
   }
 
-  _message(text) {
-    if (!this._msg) return;
-    this._msg.hidden = !text;
-    this._msg.textContent = text ?? "";
+  /**
+   * The veil over the video: kind "loading" (a spinner; shown only if it
+   * lasts TL_LOADING_DELAY_MS), "empty" (nothing to show) or "error". No text: hidden.
+   */
+  _message(text, kind = "loading", sub = "") {
+    if (!this._veil) return;
+    clearTimeout(this._veilTimer);
+    this._want = text ? { kind } : null;
+    const show = () => {
+      const v = this._veil;
+      v.classList.toggle("off", !text);
+      if (!text) return;
+      v.classList.remove("loading", "empty", "error");
+      v.classList.add(kind);
+      v.querySelector("ha-icon").setAttribute("icon", kind === "error" ? "mdi:alert-circle-outline" : "mdi:video-off-outline");
+      v.querySelector(".vtext").textContent = kind === "loading" ? `${text}…` : text;
+      v.querySelector(".vsub").textContent = sub;
+    };
+    if (text && kind === "loading" && this._veil.classList.contains("off")) this._veilTimer = setTimeout(show, TL_LOADING_DELAY_MS);
+    else show();
+  }
+
+  /** A stall (seek, buffering): says so, unless the veil already says it or says more (an error). */
+  _stall(text) {
+    if (!this._want) this._message(text);
   }
 
   _camera() {
@@ -518,7 +561,7 @@ class SSTimelapseCard extends HTMLElement {
     if (days.length) this._selectDay((keep ?? days[0]).date);
     else {
       this._closeFeed();
-      this._message("No time-lapse for this camera yet.");
+      this._message("No time-lapse for this camera yet", "empty");
     }
   }
 
@@ -531,6 +574,13 @@ class SSTimelapseCard extends HTMLElement {
 
   _closeFeed() {
     this._feed?.close();
+    const v = this._video;
+    if (!this._feed && v?.getAttribute("src")) {
+      // Native HLS: stop the old day (and its transcodes); load() drops its queued events.
+      v.pause();
+      v.removeAttribute("src");
+      v.load();
+    }
     this._feed = null;
     this._session = null;
     this._paint();
@@ -539,7 +589,8 @@ class SSTimelapseCard extends HTMLElement {
   /** Open a day; at: the wall time to start from (default its start). */
   async _selectDay(date, at = null, playing = true, codec = null) {
     this._date = date;
-    this._superseded = null;
+    this._resume = null;
+    this._played = false;
     const days = this._camera()?.days ?? [];
     const i = days.findIndex((d) => d.date === date);
     this.shadowRoot.querySelector(".prev").disabled = i < 0 || i >= days.length - 1;
@@ -552,19 +603,24 @@ class SSTimelapseCard extends HTMLElement {
     this._day = days[i];
     this._drawCoverage();
     this._closeFeed();
-    this._message("Loading…");
+    this._message("Loading", "loading", this._day ? this._fmt((this._day.start + this._day.end) / 2, { weekday: "short", month: "short", day: "numeric" }) : "");
     const seq = ++this._seq;
     codec ??= TL_MSE?.isTypeSupported(HEVC_PROBE) || (!TL_MSE && this._video.canPlayType(HEVC_PROBE)) ? "hevc" : "h264";
     let session;
     try {
       session = await this._ws({ type: "surveillance_station/timelapse", camera_id: this._cameraId, date, codec });
     } catch (e) {
-      if (seq === this._seq) this._message(`Couldn't open the time-lapse: ${e.message || e.code || e}`);
+      if (seq === this._seq) {
+        // Play tries again from where it was asked to start.
+        this._resume = { at };
+        this._syncPlay();
+        this._message("Couldn't open the time-lapse", "error", e.message || e.code || String(e));
+      }
       return;
     }
     if (seq !== this._seq || !this.isConnected) return;
     if (!session.url) {
-      this._message("Nothing recorded on this day.");
+      this._message("Nothing recorded on this day", "empty");
       return;
     }
     this._session = session;
@@ -572,7 +628,7 @@ class SSTimelapseCard extends HTMLElement {
     if (TL_MSE) {
       this._feed = new SegmentFeed(v, session, {
         onError: (e) => this._feedFailed(e),
-        onWaiting: () => this._message("Loading…"),
+        onWaiting: () => this._stall("Loading"),
       });
     } else {
       v.src = session.url;
@@ -590,10 +646,10 @@ class SSTimelapseCard extends HTMLElement {
     // viewer) ended this. Play opens the day again, where it was.
     const wall = this._wallAt(this._video.currentTime);
     if (e?.status === 410) {
-      this._superseded = { at: wall };
+      this._resume = { at: wall };
       this._closeFeed();
       this._syncPlay();
-      this._message("Paused: a time-lapse is playing elsewhere (one at a time). Press play to take it back.");
+      this._message("Playing elsewhere", "empty", "One time-lapse plays at a time. Press play to take it back.");
       return;
     }
     // The session is gone (HA restarted, or it expired): open the day again, where it was.
@@ -608,7 +664,11 @@ class SSTimelapseCard extends HTMLElement {
       this._selectDay(this._date, wall, true, "h264");
       return;
     }
-    this._message(`Playback failed: ${e?.message || e?.code || e}`);
+    // Stop here (no refetching the failing segment on every timeupdate); play tries again from here.
+    this._resume = { at: wall };
+    this._closeFeed();
+    this._syncPlay();
+    this._message("Playback failed", "error", e?.message || e?.code || String(e));
   }
 
   _play() {

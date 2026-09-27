@@ -82,9 +82,12 @@ def plan_day(
     day_end: float,
     segment_seconds: int = TIMELAPSE_SEGMENT_SECONDS,
 ) -> tuple[list[Segment], list[TimelapseRun]]:
-    """Segments (and the media -> wall map) covering [day_start, day_end).
+    """Segments (and the media -> wall map) for the day [day_start, day_end).
 
-    Pass one camera's files. Segment boundaries are whole video seconds on a
+    Pass one camera's files. A file is played from its first whole video
+    second at or after day_start up to its first at or after day_end (a
+    second is minutes of wall time), so the next day picks up exactly where
+    this one stopped. Segment boundaries are whole video seconds on a
     grid from each file's start, so the same stretch is always the same cut.
     Where files overlap, the later one starts where the earlier one ended.
     The playlist has no discontinuities: gaps between files are skipped, and
@@ -102,13 +105,22 @@ def plan_day(
         usable = full - TIMELAPSE_LIVE_MARGIN_SECONDS if rec.live else full
         lo = max(day_start, rec.start)
         hi = min(day_end, rec.start + usable * rate)
-        v0 = max(0, round((lo - rec.start) / rate))
+        # Whole video seconds, rounded up at both ends: a day never starts
+        # before its midnight (a second is ~4 minutes of wall time), and one
+        # day ends on the very second the next one starts.
+        v0 = max(0, math.ceil((lo - rec.start) / rate - 1e-9))
         if prev_end is not None and prev_end > rec.start + v0 * rate:
             # Overlapping the last file: start at or after where it ended,
             # never a frame it already played.
-            v0 = max(v0, math.ceil((prev_end - rec.start) / rate - 1e-9))
-        v1 = min(math.floor(usable), round((hi - rec.start) / rate))
+            v0 = math.ceil((prev_end - rec.start) / rate - 1e-9)
+        v1 = min(math.floor(usable), math.ceil((hi - rec.start) / rate - 1e-9))
         if v1 - v0 < 1:
+            if lo <= hi and v0 <= math.floor(usable):
+                # The day before played this file up to here: a file
+                # overlapping it must not start any earlier. (Also within a
+                # day, where it can leave up to a video second of the next
+                # file unplayed: the price of both days' plans agreeing.)
+                prev_end = max(prev_end if prev_end is not None else -math.inf, rec.start + v0 * rate)
             continue
         runs.append(TimelapseRun(media, v1 - v0, rec.start + v0 * rate, rate, rec.id))
         v = v0

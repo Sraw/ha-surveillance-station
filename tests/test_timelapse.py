@@ -84,6 +84,16 @@ async def test_days_skip_a_sliver_and_use_the_list_cache(
     timelapse.assert_awaited_once()  # the GPU is checked once
 
 
+async def test_days_skip_a_day_with_less_than_a_video_second(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, timelapse,
+    hass_ws_client: WebSocketGenerator,
+) -> None:
+    # Ends 3 minutes (0.75 video s) past midnight: the day before plays it to its end.
+    mock_client.timelapse_recordings.return_value = [_file(start=MID + 180 - 86400)]
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
+    assert [d["date"] for d in msg["result"]["cameras"][0]["days"]] == ["2026-09-21"]
+
+
 async def test_days_surveillance_station_error(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, timelapse,
     hass_ws_client: WebSocketGenerator,

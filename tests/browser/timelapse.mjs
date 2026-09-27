@@ -11,7 +11,7 @@ const state = () => ev((c) => {
   const clock = c._session ? new Date(c._wallAt(v.currentTime) * 1000).toISOString().slice(5, 16) : "-";
   return `${c._camera()?.name} ${c._date} t=${v.currentTime.toFixed(1)} ${clock}Z ${v.paused ? "paused" : "playing"} ` +
     `${v.videoWidth}x${v.videoHeight} frames ${q?.totalVideoFrames}/${q?.droppedVideoFrames} dropped, ` +
-    `ahead ${f ? ((f.bufferedEnd(v.currentTime) ?? v.currentTime) - v.currentTime).toFixed(1) : "-"} msg="${c._msg.hidden ? "" : c._msg.textContent}"`;
+    `ahead ${f ? ((f.bufferedEnd(v.currentTime) ?? v.currentTime) - v.currentTime).toFixed(1) : "-"} veil="${c._veil.classList.contains("off") ? "" : c._veil.textContent.trim().replace(/\s+/g, " ")}"`;
 });
 const until = async (fn, ms = 20000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (await ev(fn)) return Date.now() - t0; await sleep(50); } return -1; };
 const playingAt = async (label) => {
@@ -22,6 +22,7 @@ const playingAt = async (label) => {
   return ms;
 };
 
+check(await ev((c) => c._video.poster.startsWith("data:image/gif")), "blank poster (no WebView play button)");
 const first = await until((c) => c._video.currentTime > 0.2);
 check(first > 0, `first frame after ${first} ms`);
 await ev((c) => { c._stalls = 0; c._video.addEventListener("waiting", () => c._stalls++); });
