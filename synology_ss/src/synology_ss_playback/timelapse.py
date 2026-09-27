@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import math
+import os
 
 from .client import TimelapseRecording
 from .vod import Segment
@@ -43,6 +44,11 @@ OUTPUT_WIDTH = 1280
 # QSV's ICQ quality (lower is better): ~1.7 Mbps H.265 / 2.2 Mbps H.264 at 1280.
 HW_QUALITY = 28
 SW_CRF = 26
+# A software transcode uses at most half the CPUs (decoding, scaling and
+# encoding each), leaving the rest to Home Assistant and whatever else runs.
+SW_THREADS = max(1, (getattr(os, "process_cpu_count", os.cpu_count)() or 2) // 2)
+# A GPU check that timed out is stopped with SIGTERM, then SIGKILL after this.
+CHECK_TERM_GRACE_SECONDS = 5
 CODECS = ("hevc", "h264")
 
 
@@ -320,10 +326,11 @@ def ffmpeg_transcode_args(
             "-c:v", encoder, "-preset", "veryfast", "-global_quality", str(HW_QUALITY),
         ]
     else:
-        head = ["-i", src]
+        threads = str(SW_THREADS)
+        head = ["-filter_threads", threads, "-threads", threads, "-i", src]
         video = [
             "-vf", f"scale={w}:{h}", "-pix_fmt", "yuv420p",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(SW_CRF),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", str(SW_CRF), "-threads", threads,
         ]
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error",
@@ -363,6 +370,13 @@ async def hardware_transcode_available(ffmpeg: str, timeout: float = 20) -> bool
         async with asyncio.timeout(timeout):
             return await proc.wait() == 0
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
+        # SIGTERM first: SIGKILLing QSV sessions mid-way hung an iGPU (see
+        # segment.fetch_timelapse_segment), and a check times out when it's busy.
+        proc.terminate()
+        try:
+            async with asyncio.timeout(CHECK_TERM_GRACE_SECONDS):
+                await proc.wait()
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
         return None

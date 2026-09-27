@@ -247,11 +247,11 @@ How it works:
   is logged once.
 - `new`: bookmark from the review's start, named after its objects
   ("Person, Car", "Animal"); its end is open (30 s, or up to now) until `end`
-  sets it. `update`: renamed as objects or zones are added; a review that
-  only now has an object of interest (a bicycle, then a person) is bookmarked
-  then. The comment ("Frigate alert in porch
-  [frigate <review id>]") names the review, so one that ends after a
-  restart still finds its bookmark.
+  sets it. `update`: renamed as objects are added; a review that only now
+  has an object of interest (a bicycle, then a person) is bookmarked then.
+  The comment ("Frigate alert [frigate <review id>]") names the review, so
+  one that ends after a restart still finds its bookmark. Zones are left
+  out of it (only some cameras have them; they are in the event).
 - Written with the documented `ThirdParty.Bookmark.Create` / `Edit` (epoch
   times). The DSM account needs no more than playback rights for it.
 - Each new bookmark fires **`surveillance_station_detection`** once, with
@@ -437,10 +437,24 @@ something not yet fetched plays in ~2 s: the segment there is fetched alone
 the previous session (its URLs answer 410, and its card offers to take it
 back rather than reopening by itself).
 
-Transcoding uses an **Intel GPU (QSV)** when the container has one (checked
-once, logged, and in diagnostics as `timelapse_hardware`); otherwise
-software H.264, which on a 12-thread i5-1235U takes all the CPU while playing (seeks ~9 s). A
-check that times out (the GPU busy) is repeated after 5 minutes. The
+What transcodes follows the option **Video transcoding** (it is for
+everything the integration transcodes; today that is the time-lapse -
+playback and live are only re-muxed, and a single frame for a thumbnail
+is always decoded on the CPU):
+
+- **Automatic** (default): an **Intel GPU (QSV)** when the container has
+  a usable one (checked once, logged, and in diagnostics as
+  `timelapse_hardware`), the CPU otherwise.
+- **GPU only**: never the CPU; without a GPU there is no time-lapse.
+- **CPU only**: never the GPU.
+
+A GPU check that times out (the GPU busy) is not taken for "no GPU": that
+time-lapse fails (`gpu_busy`) and the next one checks again, rather than
+loading the CPU. On the CPU it is H.264, on half the cores (decoding,
+scaling and encoding each), and every ffmpeg that fetches, re-muxes or
+transcodes video runs niced (10) below Home Assistant. On a 12-thread i5-1235U, 4 s of 4512x2512
+time-lapse takes 3.0 s on 6 threads (2.6 s on 12): it keeps up, with
+little to spare, and a seek takes several seconds. The
 official HA image ships ffmpeg with QSV but no GPU driver: this repo's owner
 runs it with `intel-media-driver` + `onevpl-intel-gpu` added and `/dev/dri`
 passed in. Transcodes run one at a time, and a hardware one is never

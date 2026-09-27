@@ -364,6 +364,18 @@ def test_transcode_args_hardware_h264_from_h264() -> None:
 def test_transcode_args_software_is_h264() -> None:
     line = " ".join(tl.ffmpeg_transcode_args("ffmpeg", "/src", 4, 0, TranscodeSpec("h264", False, True, 1280, 712)))
     assert "qsv" not in line and "-c:v libx264" in line and "scale=1280:712" in line
+    # Half the CPUs, for decoding, scaling and encoding.
+    n = tl.SW_THREADS
+    assert f"-filter_threads {n} -threads {n} -i /src" in line and f"-crf {tl.SW_CRF} -threads {n}" in line
+
+
+@pytest.mark.parametrize("nice", ["/usr/bin/nice", None])
+async def test_every_ffmpeg_runs_niced(nice: str | None) -> None:
+    with patch.object(seg_mod, "_NICE", nice), patch(
+        "asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(0, b"out"))
+    ) as run:
+        assert await seg_mod._exec_ffmpeg(["ffmpeg", "-x"], 5) == b"out"
+    assert list(run.await_args.args) == (["/usr/bin/nice", "-n", "10", "ffmpeg", "-x"] if nice else ["ffmpeg", "-x"])
 
 
 # ---- incomplete frames -----------------------------------------------------
@@ -545,8 +557,26 @@ async def test_hardware_transcode_available_times_out() -> None:
         return -9
 
     proc.wait = AsyncMock(side_effect=wait)
+    proc.terminate = MagicMock()
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
         assert await hardware_transcode_available("ffmpeg", timeout=0.01) is None  # undecided
+    proc.terminate.assert_called_once()  # never SIGKILLed while the GPU is busy
+    proc.kill.assert_not_called()
+
+
+async def test_hardware_check_ignoring_sigterm_is_killed() -> None:
+    proc = _proc()
+
+    async def wait():
+        if not proc.kill.called:
+            await asyncio.sleep(10)
+        return -9
+
+    proc.wait = AsyncMock(side_effect=wait)
+    proc.terminate = MagicMock()
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch.object(tl, "CHECK_TERM_GRACE_SECONDS", 0.01):
+        assert await hardware_transcode_available("ffmpeg", timeout=0.01) is None
+    proc.terminate.assert_called_once()
     proc.kill.assert_called_once()
 
 

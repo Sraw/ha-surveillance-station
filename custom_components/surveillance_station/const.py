@@ -24,10 +24,13 @@ MAX_PARALLEL_FETCHES = 4
 # from the NAS (the gigabit link is the limit) and holds the cut in memory;
 # their transcodes run one at a time (the GPU is Frigate's too).
 MAX_PARALLEL_TRANSCODES = 3
-# Intel QSV for time-lapse transcoding, where the container has a usable GPU.
-TIMELAPSE_HARDWARE = True
-# A GPU check that couldn't tell (timed out) is repeated after this long.
-HARDWARE_RECHECK_SECONDS = 300
+# How video is transcoded (today: time-lapse; playback and live are only
+# re-muxed, and a single frame is always decoded on the CPU): "auto" on an
+# Intel GPU (QSV) where there is a usable one, else on the CPU (H.264);
+# "gpu" never on the CPU (no time-lapse without a GPU); "cpu" never on the GPU.
+CONF_TRANSCODER = "transcoder"
+TRANSCODERS = ["auto", "gpu", "cpu"]
+DEFAULT_TRANSCODER = "auto"
 # The list of time-lapse files is fetched again after this long (a file
 # grows by a frame every 8 s; new files start once a day).
 TIMELAPSE_LIST_SECONDS = 60

@@ -30,6 +30,8 @@ from homeassistant.core import HomeAssistant, callback
 
 from .const import (
     BOOKMARK_PAGE_MAX,
+    CONF_TRANSCODER,
+    DEFAULT_TRANSCODER,
     FRIGATE_SEARCH_MAX,
     KIND_CHIPS_MAX,
     DOMAIN,
@@ -50,6 +52,7 @@ LIVE_THRESHOLD_SECONDS = 60
 
 ERR_SS = "surveillance_station_error"
 ERR_FRIGATE = "frigate_error"
+ERR_GPU_BUSY = "gpu_busy"
 
 
 @callback
@@ -75,6 +78,37 @@ def _client(hass: HomeAssistant, entry_id: str | None) -> tuple[str, Surveillanc
     if (client := _manager(hass).client(entry_id)) is None:
         raise KeyError(f"Surveillance Station entry {entry_id} is not loaded")
     return entry_id, client
+
+
+class TranscodeUnavailable(Exception):
+    """Nothing may transcode now, per the entry's transcoding option."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+async def _transcode_on_gpu(hass: HomeAssistant, entry_id: str, wait: bool = True) -> bool:
+    """Whether the entry's video is transcoded on the GPU (True) or the CPU (False).
+
+    Per its transcoding option: "cpu" never asks the GPU; "gpu" and "auto"
+    need a GPU check that answered - one that timed out (the GPU busy) is
+    no reason to load the CPU instead - and "gpu" a GPU. Without ``wait``,
+    a check still to come is started and counts as not answered.
+    """
+    entry = hass.config_entries.async_get_entry(entry_id)
+    mode = entry.options.get(CONF_TRANSCODER, DEFAULT_TRANSCODER) if entry else DEFAULT_TRANSCODER
+    if mode == "cpu":
+        return False
+    manager = _manager(hass)
+    found = await manager.hardware() if wait else manager.check_hardware()
+    if found is None:
+        raise TranscodeUnavailable(ERR_GPU_BUSY, "The Intel GPU didn't answer in time; try again")
+    if not found and mode == "gpu":
+        raise TranscodeUnavailable(
+            websocket_api.ERR_NOT_SUPPORTED, "Transcoding is set to the GPU only, and Home Assistant has no usable Intel GPU"
+        )
+    return found
 
 
 def _range(msg: dict[str, Any]) -> tuple[int, int]:
@@ -108,6 +142,9 @@ async def _run(
     except FrigateAPIError as err:
         # Ours too: a path, a status, Frigate's own message.
         connection.send_error(msg["id"], ERR_FRIGATE, str(err))
+        return
+    except TranscodeUnavailable as err:
+        connection.send_error(msg["id"], err.code, str(err))
         return
     if entry_id or (entry_id := _first_entry_id(hass)):
         manager.track(entry_id, None)
@@ -460,7 +497,12 @@ def _days(files: list[TimelapseRecording], tz: ZoneInfo) -> list[dict[str, Any]]
 async def ws_timelapse_days(
     hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
 ) -> None:
-    """The cameras with a time-lapse task, and the days (NAS-local) each can show."""
+    """The cameras with a time-lapse task, and the days (NAS-local) each can show.
+
+    ``hardware``: whether it would be transcoded on the GPU, or None if
+    that isn't known yet or it can't be now. Not waited for: the GPU check
+    is only started here, so that opening a day finds it done or under way.
+    """
 
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
@@ -469,10 +511,14 @@ async def ws_timelapse_days(
         tz = await client.timezone()
         names = {c.id: c.name for c in await client.cameras()}
         by_camera = {cid: _camera_files(files, cid) for cid in {f.camera_id for f in files}}
+        try:
+            hardware = await _transcode_on_gpu(hass, entry_id, wait=False)
+        except TranscodeUnavailable:
+            hardware = None
         return {
             "entry_id": entry_id,
             "timezone": str(tz),
-            "hardware": await manager.hardware(),
+            "hardware": hardware,
             "cameras": [
                 {"id": cid, "name": names.get(cid, str(cid)), "days": _days(by_camera[cid], tz)}
                 for cid in sorted(by_camera, key=lambda c: names.get(c, str(c)).lower())
@@ -512,13 +558,12 @@ async def ws_timelapse(hass: HomeAssistant, connection: websocket_api.ActiveConn
             raise ValueError("date out of range") from None
         files = _camera_files(await manager.timelapse_files(entry_id, client), msg["camera_id"])
         segments, runs = plan_day(files, start, end)
-        hardware = await manager.hardware()
-        codec = msg["codec"] if hardware else "h264"
-        result: dict[str, Any] = {
-            "date": day.isoformat(), "start": start, "end": end, "codec": codec, "hardware": hardware,
-        }
-        if not segments:
+        result: dict[str, Any] = {"date": day.isoformat(), "start": start, "end": end}
+        if not segments:  # nothing to transcode: whatever the GPU
             return {**result, "url": None, "duration": 0, "runs": []}
+        hardware = await _transcode_on_gpu(hass, entry_id)
+        codec = msg["codec"] if hardware else "h264"
+        result |= {"codec": codec, "hardware": hardware}
         by_id = {f.id: f for f in files}
         transcode = {}
         for rid in {seg.recording_id for seg in segments}:

@@ -43,6 +43,7 @@ from .const import (
     CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_FRIGATE_URL,
+    CONF_TRANSCODER,
     CONF_VERIFY_SSL,
     DEFAULT_FRIGATE_OBJECTS,
     DEFAULT_FRIGATE_QUIET_KINDS,
@@ -50,7 +51,9 @@ from .const import (
     FRIGATE_QUIET_KINDS,
     DEFAULT_FRIGATE_TOPIC,
     DEFAULT_PORT,
+    DEFAULT_TRANSCODER,
     DOMAIN,
+    TRANSCODERS,
 )
 from .frigate import camera_key, frigate_names
 
@@ -85,6 +88,9 @@ OPTIONS_SCHEMA = vol.Schema(
         ),
         vol.Optional(CONF_FRIGATE_QUIET_KINDS, default=DEFAULT_FRIGATE_QUIET_KINDS): SelectSelector(
             SelectSelectorConfig(options=FRIGATE_QUIET_KINDS, multiple=True)
+        ),
+        vol.Required(CONF_TRANSCODER, default=DEFAULT_TRANSCODER): SelectSelector(
+            SelectSelectorConfig(options=TRANSCODERS, translation_key=CONF_TRANSCODER)
         ),
     }
 )
@@ -189,7 +195,7 @@ class SurveillanceStationConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class SurveillanceStationOptionsFlow(OptionsFlowWithReload):
-    """Frigate detections as bookmarks (saving reloads the entry).
+    """Frigate detections as bookmarks, and how video is transcoded (saving reloads the entry).
 
     Then, if SS answers, which Frigate camera each SS camera is, where the
     names don't match."""

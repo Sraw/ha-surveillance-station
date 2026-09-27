@@ -135,9 +135,10 @@ def bookmark_name(objects: list[str]) -> str:
     return ", ".join(kinds(objects)) or "Detection"
 
 
-def bookmark_comment(review_id: str, severity: str, zones: list[str]) -> str:
-    where = f" in {', '.join(z.replace('_', ' ') for z in zones)}" if zones else ""
-    return f"Frigate {severity}{where} [frigate {review_id}]"
+def bookmark_comment(review_id: str, severity: str) -> str:
+    # No zones: only some cameras have them, and the camera already says where
+    # (they are in the event).
+    return f"Frigate {severity} [frigate {review_id}]"
 
 
 @dataclass
@@ -648,7 +649,7 @@ class FrigateBridge:
         camera_id, camera_name = camera
         zones = _strings(data.get("zones"))
         name = bookmark_name(objects)
-        comment = bookmark_comment(review_id, str(after.get("severity")), zones)
+        comment = bookmark_comment(review_id, str(after.get("severity")))
         try:
             ended = float(after["end_time"]) if after.get("end_time") else None
         except (TypeError, ValueError):

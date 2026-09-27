@@ -36,7 +36,7 @@ async def async_get_config_entry_diagnostics(
             surveillance_station = {"error": str(err)}
     return async_redact_data(
         {
-            "entry": {"unique_id": entry.unique_id, "data": dict(entry.data)},
+            "entry": {"unique_id": entry.unique_id, "data": dict(entry.data), "options": dict(entry.options)},
             "surveillance_station": surveillance_station,
             "playback": hass.data[DATA_MANAGER].stats(),
             "frigate": bridge.stats() if (bridge := hass.data.get(DATA_FRIGATE, {}).get(entry.entry_id)) else None,

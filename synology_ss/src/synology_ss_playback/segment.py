@@ -16,6 +16,7 @@ import glob
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 
@@ -29,6 +30,10 @@ TEMP_PREFIX = "ss_vod_"
 REMUX_TIMEOUT_SECONDS = 30
 # A process asked to stop with SIGTERM gets this long before SIGKILL.
 TERM_GRACE_SECONDS = 5
+# Every ffmpeg runs this much below Home Assistant's own priority (through
+# nice(1), so its threads have it from the start), where there is a nice.
+FFMPEG_NICE = 10
+_NICE = shutil.which("nice")
 SNAPSHOT_WIDTH = 320
 
 
@@ -120,6 +125,8 @@ async def _exec_ffmpeg(
     lets ffmpeg close its codecs, and SIGKILL only if it hasn't gone in
     TERM_GRACE_SECONDS (see fetch_timelapse_segment for why).
     """
+    if _NICE:
+        argv = [_NICE, "-n", str(FFMPEG_NICE), *argv]  # nice execs ffmpeg: same process
     proc = None
     try:
         try:

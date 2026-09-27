@@ -59,8 +59,8 @@
   "options": {
     "step": {
       "init": {
-        "title": "Frigate 检测",
-        "description": "把 Frigate 的 review 转成 Surveillance Station 书签（需要 MQTT 集成，并连接到 Frigate 使用的 broker）。Frigate 摄像头按名称与 Surveillance Station 摄像头匹配（忽略大小写、空格和标点）；名称不同的在下一步映射。每个新书签还会触发一个 surveillance_station_detection 事件，供自动化发送通知。",
+        "title": "Frigate 检测与视频",
+        "description": "把 Frigate 的 review 转成 Surveillance Station 书签（需要 MQTT 集成，并连接到 Frigate 使用的 broker）。Frigate 摄像头按名称与 Surveillance Station 摄像头匹配（忽略大小写、空格和标点）；名称不同的在下一步映射。每个新书签还会触发一个 surveillance_station_detection 事件，供自动化发送通知。最后是视频转码方式。",
         "data": {
           "frigate": "为 Frigate 检测创建书签",
           "frigate_topic": "Frigate MQTT 主题前缀",
@@ -68,7 +68,8 @@
           "frigate_link": "时间轴卡片所在的仪表盘路径",
           "frigate_url": "Frigate 地址（可选）",
           "frigate_quiet_minutes": "静默期（分钟）",
-          "frigate_quiet_kinds": "静默期适用于"
+          "frigate_quiet_kinds": "静默期适用于",
+          "transcoder": "视频转码"
         },
         "data_description": {
           "frigate_topic": "即 Frigate 的 mqtt.topic_prefix；review 从该前缀的 /reviews 主题读取。",
@@ -76,7 +77,8 @@
           "frigate_url": "Home Assistant 访问 Frigate API 的地址，例如 http://frigate:5000（内部端口，无需登录）。填了之后，通知图用 Frigate 对该物体的快照（画出检测框），推送也会早几秒；不填则用 Surveillance Station 在那一刻的画面。",
           "frigate_objects": "Frigate 标签。review 含其中任意一个就创建书签，alert 和 detection 都算。动物（dog、cat、bird……）统一命名为 Animal。",
           "frigate_quiet_minutes": "某摄像头的 review 如果只含下面所选的类别，且这些类别在该摄像头上这么多分钟内都出现过（走开又回来的狗），就不触发 surveillance_station_detection 事件；书签照常创建。0：每个 review 都触发。",
-          "frigate_quiet_kinds": "人永远不静默：又来了一个人，总是会通知。"
+          "frigate_quiet_kinds": "人永远不静默：又来了一个人，总是会通知。",
+          "transcoder": "由谁转码视频（目前是延时录像；回放和直播不转码）。自动：Home Assistant 有可用的 Intel GPU（QSV）就用 GPU，否则用 CPU；GPU 在但正忙时请稍后重试，不会改用 CPU。只用 GPU：从不用 CPU，没有 GPU 就没有延时录像。只用 CPU：从不用 GPU。用 CPU 时转成 H.264，低优先级、只用一半核心：4K 延时录像勉强跟得上，跳转更慢。"
         }
       },
       "cameras": {
@@ -104,6 +106,15 @@
     "frigate_offline": {
       "title": "Frigate 离线",
       "description": "Frigate 在 `{topic}/available` 上报告离线已超过 10 分钟，目前没有任何检测。请检查 Frigate 容器；Frigate 重新上线后此问题会自动消失。"
+    }
+  },
+  "selector": {
+    "transcoder": {
+      "options": {
+        "auto": "自动",
+        "gpu": "只用 GPU",
+        "cpu": "只用 CPU"
+      }
     }
   }
 }

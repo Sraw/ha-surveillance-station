@@ -28,6 +28,7 @@ from custom_components.surveillance_station.const import (
     CONF_FRIGATE_QUIET_KINDS,
     CONF_FRIGATE_TOPIC,
     CONF_FRIGATE_URL,
+    CONF_TRANSCODER,
     DETECTION_EVENT,
     DOMAIN,
 )
@@ -94,7 +95,7 @@ def test_names() -> None:
     assert bookmark_name(["car", "person", "car", "license_plate"]) == "Car, Person, License plate"
     assert bookmark_name(["dog", "person", "cat", "bird"]) == "Animal, Person"
     assert bookmark_name([]) == "Detection"
-    assert bookmark_comment("r1", "alert", ["front_yard", "porch"]) == "Frigate alert in front yard, porch [frigate r1]"
+    assert bookmark_comment("r1", "alert") == "Frigate alert [frigate r1]"
 
 
 async def test_alert_lifecycle(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
@@ -104,11 +105,13 @@ async def test_alert_lifecycle(hass: HomeAssistant, bridge: FrigateBridge, clien
     with clock as now:
         await bridge.handle(review("new"))
         client.create_bookmark.assert_awaited_once_with(6, "Person", T, T + 30, "Frigate alert [frigate 1790000000.1-abc]")
+        await bridge.handle(review("update", zones=("porch",)))  # only a zone: the bookmark says the same
+        client.edit_bookmark.assert_not_awaited()
         now.return_value = T + 40  # still going on: the bookmark reaches now
         await bridge.handle(review("update", objects=("person", "car"), zones=("porch",)))
         await bridge.handle(review("update", objects=("person", "car"), zones=("porch",)))  # nothing new
     assert client.edit_bookmark.await_count == 1
-    assert client.edit_bookmark.await_args.args == (100, 6, "Person, Car", T, T + 40, "Frigate alert in porch [frigate 1790000000.1-abc]")
+    assert client.edit_bookmark.await_args.args == (100, 6, "Person, Car", T, T + 40, "Frigate alert [frigate 1790000000.1-abc]")
     await bridge.handle(review("end", objects=("person", "car"), zones=("porch",), end=T + 17.5))
     assert client.edit_bookmark.await_args.args[3:5] == (T, T + 18)
     assert not bridge._tracked
@@ -310,6 +313,7 @@ async def test_options(hass: HomeAssistant, setup_integration: MockConfigEntry) 
         CONF_FRIGATE_QUIET: 5,
         CONF_FRIGATE_QUIET_KINDS: ["Animal"],
         CONF_FRIGATE_CAMERAS: {"Backyard": "back_yard, garden"},
+        CONF_TRANSCODER: "auto",  # the GPU where there is one
     }
     start.assert_awaited_once()  # reloaded with the bridge on
     assert hass.data[DATA_FRIGATE][setup_integration.entry_id].api.url == "http://frigate:5000"

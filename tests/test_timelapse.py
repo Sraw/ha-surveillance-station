@@ -12,6 +12,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
 from synology_ss_playback import SSConnectionError, SSError, TimelapseRecording, TranscodeSpec
 
+from custom_components.surveillance_station.const import CONF_TRANSCODER
 from custom_components.surveillance_station.views import DATA_MANAGER
 from homeassistant.core import HomeAssistant
 
@@ -60,7 +61,10 @@ async def test_days(
     msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
     assert msg["success"]
     res = msg["result"]
-    assert res["timezone"] == "US/Pacific" and res["hardware"] is True
+    # The GPU check is started, not waited for; the next listing has its answer.
+    assert res["timezone"] == "US/Pacific" and res["hardware"] is None
+    await hass.async_block_till_done()
+    assert (await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days"))["result"]["hardware"] is True
     assert [(c["id"], c["name"]) for c in res["cameras"]] == [(7, "Backyard"), (6, "Drive Way")]
     days = res["cameras"][1]["days"]
     assert [d["date"] for d in days] == ["2026-09-22", "2026-09-21"]
@@ -149,23 +153,49 @@ async def test_session_without_a_gpu_is_h264(
         msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=7, date="2026-09-22")
     assert msg["result"]["codec"] == "h264" and msg["result"]["hardware"] is False
     assert msg["result"]["maps"] == [{"index": 0, "size": "1280x720"}]
-    assert "software (H.264)" in caplog.text
+    assert "none usable" in caplog.text
 
 
-async def test_session_hardware_switched_off(
+def _transcoder(hass: HomeAssistant, entry: MockConfigEntry, mode: str) -> None:
+    hass.config_entries.async_update_entry(entry, options={**entry.options, CONF_TRANSCODER: mode})
+
+
+async def test_session_on_the_cpu_by_choice(
     hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
 ) -> None:
-    with patch("custom_components.surveillance_station.views.TIMELAPSE_HARDWARE", False):
-        msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
-    assert msg["result"]["codec"] == "h264"
-    timelapse.assert_not_awaited()
+    _transcoder(hass, setup_integration, "cpu")
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
+    assert msg["result"]["codec"] == "h264" and msg["result"]["hardware"] is False
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
+    assert msg["result"]["hardware"] is False
+    timelapse.assert_not_awaited()  # the GPU isn't even checked
+
+
+async def test_session_gpu_only(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
+) -> None:
+    _transcoder(hass, setup_integration, "gpu")
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
+    assert msg["result"]["codec"] == "hevc" and msg["result"]["hardware"] is True
+    hass.data[DATA_MANAGER]._hardware = None
+    timelapse.return_value = False  # no GPU: no time-lapse rather than the CPU
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
+    assert not msg["success"] and msg["error"]["code"] == "not_supported" and "GPU only" in msg["error"]["message"]
+    hass.data[DATA_MANAGER]._hardware = None
+    timelapse.return_value = None  # busy, not missing: try again
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
+    assert msg["error"]["code"] == "gpu_busy"
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
+    assert msg["success"] and msg["result"]["hardware"] is None
 
 
 async def test_session_nothing_that_day(
     hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
 ) -> None:
+    timelapse.return_value = None  # the GPU busy: no matter, there is nothing to transcode
     msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-08-01")
     assert msg["result"]["url"] is None and msg["result"]["runs"] == [] and msg["result"]["duration"] == 0
+    timelapse.assert_not_awaited()
 
 
 @pytest.mark.parametrize("date", ["2026-13-40", "yesterday", "2026-09-22T00"])
@@ -294,23 +324,20 @@ async def test_vod_runs_refuses_a_timelapse_token(
 
 async def test_gpu_check_undecided_is_retried(
     hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator,
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from custom_components.surveillance_station import views
-
-    now = [1000.0]
-    monkeypatch.setattr(views, "_monotonic", lambda: now[0])
-    timelapse.return_value = None  # timed out
-    manager = hass.data[DATA_MANAGER]
-    assert await manager.hardware() is False
+    timelapse.return_value = None  # timed out: the GPU busy, not missing
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
+    assert not msg["success"] and msg["error"]["code"] == "gpu_busy"  # not the CPU instead
     assert "timed out" in caplog.text
-    assert await manager.hardware() is False
-    assert timelapse.await_count == 1  # not again straight away
-    now[0] += 301
+    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
+    assert msg["success"] and msg["result"]["hardware"] is None
+    assert timelapse.await_count == 2  # asked again each time
     timelapse.return_value = True
+    manager = hass.data[DATA_MANAGER]
     assert await manager.hardware() is True
     assert await manager.hardware() is True
-    assert timelapse.await_count == 2
+    assert timelapse.await_count == 3  # then settled
 
 
 async def test_running_transcodes_are_drained_on_stop(

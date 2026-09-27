@@ -25,7 +25,6 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 import logging
-import math
 import re
 import secrets
 import time
@@ -83,8 +82,6 @@ from .const import (
     THUMBNAIL_URL,
     THUMBNAIL_URL_TTL_HOURS,
     THUMBNAIL_WIDTH,
-    HARDWARE_RECHECK_SECONDS,
-    TIMELAPSE_HARDWARE,
     TIMELAPSE_LIST_SECONDS,
     VOD_MAX_SESSIONS,
     VOD_SESSION_TTL_SECONDS,
@@ -153,7 +150,6 @@ class VodManager:
         # a player doesn't open its day again and end the newer one in turn).
         self.superseded: OrderedDict[str, None] = OrderedDict()
         self._hardware: bool | None = None
-        self._hardware_checked = -math.inf  # when an undecided check ended
         self._hardware_task: asyncio.Task | None = None
         # entry_id -> (fetched at, every time-lapse file).
         self._timelapse: dict[str, tuple[float, list[TimelapseRecording]]] = {}
@@ -281,25 +277,25 @@ class VodManager:
             "timelapse_transcode_failures": self.transcode_failures,
         }
 
-    async def hardware(self) -> bool:
-        """Whether time-lapse segments can be transcoded on an Intel GPU.
+    async def hardware(self) -> bool | None:
+        """Whether video can be transcoded on an Intel GPU (QSV) here.
 
-        Checked once; a check that couldn't tell (timed out) counts as no and
-        is repeated after HARDWARE_RECHECK_SECONDS. One check at a time,
-        shared by everyone asking, and not abandoned by a caller leaving.
+        Checked once. None: the check couldn't tell (timed out, the GPU busy)
+        - never taken for "no GPU"; the next caller checks again. One check
+        at a time, shared by everyone asking, and not abandoned by a caller
+        leaving.
         """
-        if self._hardware is not None:
+        if self.check_hardware() is not None:
             return self._hardware
-        if not TIMELAPSE_HARDWARE:
-            self._hardware = False
-            return False
-        if self._hardware_task is None and _monotonic() - self._hardware_checked >= HARDWARE_RECHECK_SECONDS:
+        return await asyncio.shield(self._hardware_task)
+
+    def check_hardware(self) -> bool | None:
+        """The GPU check's answer if there is one; otherwise None, the check started (not waited for)."""
+        if self._hardware is None and self._hardware_task is None:
             self._hardware_task = self.hass.async_create_background_task(
                 self._check_hardware(), "surveillance_station GPU check", eager_start=False
             )
-        if self._hardware_task is not None:
-            return bool(await asyncio.shield(self._hardware_task))
-        return False
+        return self._hardware
 
     async def _check_hardware(self) -> bool | None:
         try:
@@ -307,14 +303,10 @@ class VodManager:
         finally:
             self._hardware_task = None
         if found is None:
-            self._hardware_checked = _monotonic()
-            _LOGGER.warning("Time-lapse: the Intel GPU check timed out; software transcoding for now")
+            _LOGGER.warning("The Intel GPU check timed out (busy?); checked again on the next time-lapse")
         else:
             self._hardware = found
-            _LOGGER.info(
-                "Time-lapse transcoding: %s",
-                "Intel QSV (H.265 or H.264)" if found else "software (H.264): no usable Intel GPU",
-            )
+            _LOGGER.info("Intel GPU (QSV) for transcoding: %s", "yes" if found else "none usable")
         return found
 
     async def timelapse_files(self, entry_id: str, client: SurveillanceStationClient) -> list[TimelapseRecording]:

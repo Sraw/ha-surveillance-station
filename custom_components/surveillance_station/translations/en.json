@@ -59,8 +59,8 @@
   "options": {
     "step": {
       "init": {
-        "title": "Frigate detections",
-        "description": "Turn Frigate's review items into Surveillance Station bookmarks (needs the MQTT integration, connected to Frigate's broker). Frigate cameras are matched to Surveillance Station cameras by name (ignoring case, spaces and punctuation); the next step maps those whose names differ. Each new bookmark also fires a surveillance_station_detection event, for an automation to send a notification.",
+        "title": "Frigate detections and video",
+        "description": "Turn Frigate's review items into Surveillance Station bookmarks (needs the MQTT integration, connected to Frigate's broker). Frigate cameras are matched to Surveillance Station cameras by name (ignoring case, spaces and punctuation); the next step maps those whose names differ. Each new bookmark also fires a surveillance_station_detection event, for an automation to send a notification. Last, how video is transcoded.",
         "data": {
           "frigate": "Bookmark Frigate detections",
           "frigate_topic": "Frigate MQTT topic prefix",
@@ -68,7 +68,8 @@
           "frigate_link": "Dashboard path of the timeline card",
           "frigate_url": "Frigate URL (optional)",
           "frigate_quiet_minutes": "Quiet period (minutes)",
-          "frigate_quiet_kinds": "Quiet period applies to"
+          "frigate_quiet_kinds": "Quiet period applies to",
+          "transcoder": "Video transcoding"
         },
         "data_description": {
           "frigate_topic": "Frigate's mqtt.topic_prefix; reviews are read from this prefix's /reviews topic.",
@@ -76,7 +77,8 @@
           "frigate_url": "Frigate's API as Home Assistant reaches it, such as http://frigate:5000 (the internal port, no login). With it, a notification's image is Frigate's snapshot of the object, box drawn, and it is sent a few seconds sooner; without it, the Surveillance Station frame of that moment.",
           "frigate_objects": "Frigate labels. A review with any of them is bookmarked, alert or detection. Animals (dog, cat, bird, …) are all named Animal.",
           "frigate_quiet_minutes": "No surveillance_station_detection event for a camera's review when it has only kinds chosen below, all seen on that camera within this many minutes (the dog that wandered off and came back); it is still bookmarked. 0: every review.",
-          "frigate_quiet_kinds": "People are never quiet: a second person arriving is always announced."
+          "frigate_quiet_kinds": "People are never quiet: a second person arriving is always announced.",
+          "transcoder": "What transcodes video (today the time-lapse; playback and live are not transcoded). Automatic: an Intel GPU (QSV) where Home Assistant has a usable one, the CPU otherwise; a GPU that is there but busy means trying again, not the CPU. GPU only: never the CPU - no time-lapse without a GPU. CPU only: never the GPU. On the CPU it is H.264, at low priority and on half the cores: a 4K time-lapse keeps up with little to spare, and seeks are slower."
         }
       },
       "cameras": {
@@ -104,6 +106,15 @@
     "frigate_offline": {
       "title": "Frigate is offline",
       "description": "Frigate has reported itself offline on `{topic}/available` for over 10 minutes, so nothing is being detected. Check the Frigate container; this clears by itself once Frigate is back online."
+    }
+  },
+  "selector": {
+    "transcoder": {
+      "options": {
+        "auto": "Automatic",
+        "gpu": "GPU only",
+        "cpu": "CPU only"
+      }
     }
   }
 }
