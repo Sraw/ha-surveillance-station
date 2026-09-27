@@ -71,7 +71,6 @@ async def test_days(
     # The two files join up; the live one stops 2 video seconds (8 min) short of what SS has.
     assert days[0] == {
         "date": "2026-09-22", "start": MID, "end": MID + 86400, "covered": [[MID, MID + 85920]],
-        "hours": {"6": MID + 6 * 3600, "12": MID + 12 * 3600, "18": MID + 18 * 3600},
     }
     assert days[1]["covered"] == [[MID - 6 * 3600, MID]]
 
@@ -291,9 +290,6 @@ async def test_dst_days_are_23_and_25_hours(
     by = {d["date"]: d for d in days}
     assert by["2026-03-08"]["end"] - by["2026-03-08"]["start"] == 23 * 3600
     assert by["2026-11-01"]["end"] - by["2026-11-01"]["start"] == 25 * 3600
-    # 06:00 on the long day is 7 h after midnight.
-    assert by["2026-11-01"]["hours"]["6"] - by["2026-11-01"]["start"] == 7 * 3600
-    assert by["2026-11-01"]["hours"]["12"] - by["2026-11-01"]["start"] == 13 * 3600
 
 
 async def test_one_task_per_camera(

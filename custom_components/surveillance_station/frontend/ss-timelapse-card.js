@@ -406,10 +406,16 @@ class SSTimelapseCard extends HTMLElement {
   }
 
   _fmt(ts, opts) {
+    // One formatter per language, zone and options (the clock and the ticks
+    // format many times a second while zoomed in and playing).
+    const lang = this._hass?.locale?.language || undefined;
+    const tz = this._index?.timezone;
+    const key = `${lang}|${tz}|${JSON.stringify(opts)}`;
+    this._fmts ??= new Map();
     try {
-      return new Intl.DateTimeFormat(this._hass?.locale?.language || undefined, {
-        timeZone: this._index?.timezone, ...opts,
-      }).format(new Date(ts * 1000));
+      let f = this._fmts.get(key);
+      if (!f) this._fmts.set(key, (f = new Intl.DateTimeFormat(lang, { timeZone: tz, ...opts })));
+      return f.format(new Date(ts * 1000));
     } catch (e) {
       return new Date(ts * 1000).toLocaleString();
     }
@@ -794,6 +800,7 @@ class SSTimelapseCard extends HTMLElement {
 
   /** Seek to media time t; the playhead is there at once, however long the load takes. */
   _seek(t) {
+    this._followPausedUntil = 0; // a seek means "show me there", a pan or not
     this._seekFrom = this._seekTarget == null ? this._video.currentTime : this._seekFrom;
     this._seekTarget = t;
     this._seekDeadline = Infinity;
@@ -808,7 +815,6 @@ class SSTimelapseCard extends HTMLElement {
     const end = this._session.duration ?? v.duration;
     // From where the last skip went, if it hasn't landed yet: skips add up.
     const t = Math.min(Math.max(0, (this._seekTarget ?? v.currentTime) + d), Number.isFinite(end) ? end - 0.1 : Infinity);
-    this._followPausedUntil = 0;
     this._seek(t);
   }
 
@@ -827,10 +833,14 @@ class SSTimelapseCard extends HTMLElement {
     const track = this.shadowRoot.querySelector(".track");
     const ticks = this.shadowRoot.querySelector(".ticks");
     const range = this.shadowRoot.querySelector(".range");
-    track.innerHTML = "";
-    ticks.innerHTML = "";
     const d = this._day;
     const view = this._view;
+    // Nothing to redo for the same day, view and width (a resize, a follow that didn't move it).
+    const drawn = [d, view?.start, view?.end, this._scrub?.clientWidth, track];
+    if (this._drawn?.every((x, i) => x === drawn[i])) return;
+    this._drawn = drawn;
+    track.innerHTML = "";
+    ticks.innerHTML = "";
     for (const b of this.shadowRoot.querySelectorAll("[data-pan]")) {
       b.disabled = !view || (Number(b.dataset.pan) < 0 ? view.start <= d.start : view.end >= d.end);
     }

@@ -482,11 +482,7 @@ def _days(files: list[TimelapseRecording], tz: ZoneInfo) -> list[dict[str, Any]]
         start, end = _day_bounds(day, tz)
         if not plan_day(files, start, end)[1]:
             continue  # minutes past midnight only: less than the whole video second a day starts on
-        out.append({
-            "date": day.isoformat(), "start": start, "end": end, "covered": days[day],
-            # Where 06:00, 12:00 and 18:00 fall (not a quarter of the day apart across DST).
-            "hours": {h: _local(day, tz, h) for h in (6, 12, 18)},
-        })
+        out.append({"date": day.isoformat(), "start": start, "end": end, "covered": days[day]})
     return out
 
 

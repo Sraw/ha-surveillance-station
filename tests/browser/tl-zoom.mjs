@@ -90,6 +90,15 @@ check(Math.abs(v1.start - v0.start - 1800) < 1, `pan later moves half the view (
 await ev((c) => c._play());
 await sleep(1500);
 check(Math.abs((await head()).view.start - v1.start) < 1, "the view stays where it was panned");
+// A click on the bar after a pan: the view follows the playhead again at once.
+await ev((c) => c._video.pause());
+const pb = await ev((c) => { const r = c._scrub.getBoundingClientRect(); return [r.left, r.top, r.width]; });
+await page.mouse.click(pb[0] + pb[2] * 0.97, pb[1] + 10);
+await until((c) => c._seekTarget == null && !c._video.seeking, 30000);
+await ev((c) => c._play());
+await sleep(4000); // 1 s of video: 4 min, past the end of the 1h view from 97%
+h = await head();
+check(h.shown && h.wall >= h.view.start && h.wall <= h.view.end, `after a pan, a click on the bar: the view follows the playhead past its end (head at ${(h.f * 100).toFixed(0)}%)`);
 // Back to 24h.
 await btn('[data-span="86400"]');
 check(await ev((c) => c._view.end - c._view.start === c._day.end - c._day.start && [...c.shadowRoot.querySelectorAll("[data-pan]")].every((b) => b.disabled)), "24h again: whole day, no panning");
