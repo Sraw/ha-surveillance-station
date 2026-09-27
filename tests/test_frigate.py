@@ -631,7 +631,25 @@ async def test_state_survives_a_restart(hass: HomeAssistant, bridge: FrigateBrid
     await again.handle(review("new", objects=("cat",), rid="d2"))  # another animal, within the quiet period
     await hass.async_block_till_done()
     assert len(events) == 2
+    # What each was sent with is remembered too: a person joining the dog's is sent again.
+    client.list_bookmarks.return_value = [
+        Bookmark(id=101, camera_id=6, name="Animal", comment="Frigate alert [frigate d1]", start=T, end=T + 30)
+    ]
+    await again.handle(review("update", objects=("dog", "person"), rid="d1"))
+    await hass.async_block_till_done()
+    assert [(e.data["review_id"], e.data["objects"]) for e in events[2:]] == [("d1", ["Person", "Animal"])]
     again.stop()
+
+
+async def test_decided_before_0_18_is_not_sent_again(hass: HomeAssistant, bridge: FrigateBridge, hass_storage) -> None:
+    """Stored as bare ids (what they were sent with unknown): decided, and never sent again."""
+    hass_storage[f"{DOMAIN}.frigate.{bridge.entry_id}"] = {"version": 1, "key": "k", "data": {"decided": ["d1"]}}
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ):
+        await bridge.start()
+    assert bridge._decided == {"d1": None}
+    bridge.stop()
 
 
 async def test_announce_is_bounded(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
@@ -770,7 +788,7 @@ async def test_unload_writes_state_and_removal_deletes_it(
     bridge._save()  # delayed: not written yet
     key = f"{DOMAIN}.frigate.{entry.entry_id}"
     assert await hass.config_entries.async_unload(entry.entry_id)
-    assert hass_storage[key]["data"]["decided"] == ["r1"]  # written on unload, not 2 s later
+    assert hass_storage[key]["data"]["decided"] == [["r1", None]]  # written on unload, not 2 s later
     await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=10))
@@ -1147,6 +1165,130 @@ async def test_person_joining_a_quiet_review_is_announced(hass: HomeAssistant, b
     await hass.async_block_till_done()
     assert [(e.data["review_id"], e.data["objects"]) for e in events] == [("d1", ["Animal"]), ("d2", ["Person", "Animal"])]
     assert (bridge.stats()["held_quiet"], bridge.stats()["not_announced"]) == (1, 0)
+
+
+async def test_more_important_joining_is_sent_again(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A dog, then a person in the same review: sent again (the same review, so it replaces the
+    first notification); a car or another animal after that is not, nor a person twice."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("dog", "cat"), rid="d1"))  # another animal: no
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("dog", "person", "car"), rid="d1"))  # less than a person: no
+    await bridge.handle(review("end", objects=("dog", "person", "car"), rid="d1", end=T + 9))
+    await hass.async_block_till_done()
+    assert [(e.data["review_id"], e.data["objects"]) for e in events] == [("d1", ["Animal"]), ("d1", ["Person", "Animal"])]
+    assert bridge._decided["d1"] == "person"
+    stats = bridge.stats()
+    assert (stats["announced"], stats["announced_again"], stats["not_announced"]) == (1, 1, 0)
+
+
+async def test_less_important_joining_is_not_sent_again(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A person, then a car and a dog: the first notification says enough. A car, then a person: again."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("person",), rid="p1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("person", "car", "dog"), rid="p1"))
+    await bridge.handle(review("new", objects=("car",), rid="c1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("car", "person"), rid="c1"))
+    await hass.async_block_till_done()
+    assert [(e.data["review_id"], e.data["objects"]) for e in events] == [
+        ("p1", ["Person"]), ("c1", ["Car"]), ("c1", ["Person", "Car"])
+    ]
+
+
+async def test_joining_while_being_sent_is_in_the_one_notification(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A person seen while the dog's notification waits for its frame: in that one, not a second."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    release = asyncio.Event()
+
+    async def frame(*_args: Any) -> bytes:
+        await release.wait()
+        return b"jpg"
+
+    bridge.manager.thumbnail_when_recorded = AsyncMock(side_effect=frame)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await bridge.handle(review("update", objects=("dog", "person"), zones=("porch",), rid="d1"))
+    release.set()
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d1"))
+    await hass.async_block_till_done()
+    assert [(e.data["objects"], e.data["zones"]) for e in events] == [(["Person", "Animal"], ["porch"])]
+    assert bridge._decided["d1"] == "person" and not bridge._announcing_latest
+
+
+async def test_replayed_joining_is_not_sent_again(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A person in a message that waited out an SS outage: old news, not a late second notification."""
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await hass.async_block_till_done()
+    await bridge.handle({**review("update", objects=("dog", "person"), rid="d1"), "_received_at": T - 600})
+    await hass.async_block_till_done()
+    assert len(events) == 1
+
+
+async def test_quiet_kind_joining_is_not_sent_again(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    """A car is more than a dog, but with cars quiet it is no second alert, however often it is seen;
+    a bicycle behind that quiet car still is."""
+    bridge.quiet_kinds = {"Animal", "Car"}
+    bridge.objects = bridge.objects | {"bicycle"}
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("update", objects=("dog", "car"), rid="d1"))
+    await bridge.handle(review("update", objects=("dog", "car"), rid="d1"))
+    await hass.async_block_till_done()
+    assert len(events) == 1
+    await bridge.handle(review("update", objects=("dog", "car", "bicycle"), rid="d1"))
+    await hass.async_block_till_done()
+    await bridge.handle(review("end", objects=("dog", "car", "bicycle"), rid="d1", end=T + 9))
+    await hass.async_block_till_done()
+    assert [e.data["objects"] for e in events] == [["Animal"], ["Car", "Bicycle", "Animal"]]
+
+
+async def test_second_notification_cut_short_is_sent_by_the_next_message(
+    hass: HomeAssistant, bridge: FrigateBridge
+) -> None:
+    events = async_capture_events(hass, DETECTION_EVENT)
+    await bridge.handle(review("new", objects=("dog",), rid="d1"))
+    await hass.async_block_till_done()
+    never = asyncio.Event()
+
+    async def hang(*_args: Any) -> bytes:
+        await never.wait()
+        return b""
+
+    bridge.manager.thumbnail_when_recorded = AsyncMock(side_effect=hang)
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d1"))
+    await asyncio.sleep(0)
+    for task in list(bridge._announcing):
+        task.cancel()
+    await hass.async_block_till_done()
+    assert len(events) == 1 and "d1" not in bridge._not_yet and not bridge._announcing_latest
+    bridge.manager.thumbnail_when_recorded = AsyncMock(return_value=b"jpg")
+    await bridge.handle(review("update", objects=("dog", "person"), rid="d1"))
+    await hass.async_block_till_done()
+    assert [e.data["objects"] for e in events] == [["Animal"], ["Person", "Animal"]]
+
+
+async def test_unreadable_decided_items_are_skipped(hass: HomeAssistant, bridge: FrigateBridge, hass_storage) -> None:
+    """One odd item costs only itself, not the rest of the state."""
+    hass_storage[f"{DOMAIN}.frigate.{bridge.entry_id}"] = {"version": 1, "key": "k", "data": {
+        "decided": [5, None, ["x"], {"a": 1}, ["d1", "dog"], ["d2", 7]],
+        "not_yet": [["n1", ["Animal"]]],
+    }}
+    with patch.object(mqtt_mod, "async_wait_for_mqtt_client", AsyncMock(return_value=True)), patch.object(
+        mqtt_mod, "async_subscribe", AsyncMock(return_value=MagicMock())
+    ):
+        await bridge.start()
+    try:
+        assert bridge._decided == {"5": None, "d1": "dog", "d2": None}
+        assert bridge._not_yet == {"n1": frozenset({"Animal"})}
+    finally:
+        bridge.stop()
 
 
 async def test_quiet_review_ending_quiet_is_decided(hass: HomeAssistant, bridge: FrigateBridge) -> None:

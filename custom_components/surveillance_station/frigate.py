@@ -13,7 +13,10 @@ punctuation (``drive_way`` is "Drive Way"), or as the options map them.
 A review is announced as a ``surveillance_station_detection`` event once it
 has its bookmark (once per review, remembered across restarts; and not when the review has only kinds that may be quiet,
 animals by default, never people, all seen on that camera within the quiet
-period) for automations to notify with, carrying a signed image and, if
+period), and again if something more important joins it later (person >
+car > anything else > animals; never a kind that may be quiet: a person
+after a dog, not a dog after a person, nor a quiet car after a dog),
+for automations to notify with, carrying a signed image and, if
 configured, a link to the card at the review's start. With Frigate's API
 configured, the image is Frigate's snapshot of the review's foremost object
 (box drawn) as it is when fetched: the object is in it whatever the delay
@@ -185,10 +188,11 @@ class FrigateBridge:
         # (SS camera id, kind) -> when that kind was last active on that
         # camera, and in which review (a review never silences itself).
         self._last_seen: dict[tuple[int, str], tuple[float, str]] = {}
-        # Reviews whose notification was decided (sent, or not: quiet, old
-        # news). Kept across restarts with _last_seen, so a review that goes
-        # on over a restart is neither announced twice nor never.
-        self._decided: OrderedDict[str, None] = OrderedDict()
+        # Reviews whose notification was decided: sent (the foremost object
+        # it was sent with: something more important later is sent again),
+        # or not (None: old news). Kept across restarts with _last_seen, so a
+        # review that goes on over a restart is neither announced twice nor never.
+        self._decided: OrderedDict[str, str | None] = OrderedDict()
         # Reviews seen live but not announceable yet (none of the chosen
         # objects yet, or only quiet kinds): a later message that makes them
         # news is announced then, however long ago they began. With the
@@ -225,6 +229,8 @@ class FrigateBridge:
         self._subscribed = False
         self._announcing: set[asyncio.Task] = set()
         self._announcing_ids: set[str] = set()
+        # A message of a review being announced: the event says what it does.
+        self._announcing_latest: dict[str, tuple[dict[str, Any], list[str], list[str], int]] = {}
         self._probe: asyncio.Task | None = None
         self._stop_health: Callable[[], None] | None = None
         self._stop_listener: Callable[[], None] | None = None
@@ -241,10 +247,11 @@ class FrigateBridge:
         # (+ those pushed out of a full queue to wait with the deferred);
         # handled ends as ignored (by reason), failed (after retries), or went
         # through (bookmarked counts new bookmarks; each review is then
-        # announced or not_announced).
+        # announced or not_announced; announced_again counts its further
+        # notifications, outside that sum).
         self._counts = {
             "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
-            "announced": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
+            "announced": 0, "announced_again": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
             "images_frigate": 0, "images_ss": 0, "images_no_snapshot": 0, "images_failed": 0,
         }
         # Frigate's images: not asked again until then after a failure; its
@@ -312,8 +319,14 @@ class FrigateBridge:
         try:
             stored = await self._store.async_load() or {}
             now = time.time()
-            for review_id in stored.get("decided") or []:
-                self._decide(str(review_id))
+            for item in stored.get("decided") or []:
+                # [id, foremost object sent or None]; before 0.18 just the id (not sent again).
+                if isinstance(item, list) and len(item) == 2:
+                    review_id, told = item
+                else:
+                    review_id, told = item, None
+                if isinstance(review_id, (str, int, float)):
+                    self._decide(str(review_id), told if isinstance(told, str) else None)
             for review_id, quiet in stored.get("not_yet") or []:
                 self._note_not_yet(str(review_id), [str(k) for k in quiet])
             for camera_id, kind, t, *rid in stored.get("last_seen") or []:
@@ -691,7 +704,24 @@ class FrigateBridge:
             self._ok()
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self._bookmarks_changed()
-        if review_id not in self._decided and review_id not in self._announcing_ids:
+        if review_id in self._announcing_ids:
+            # Sent in a moment: with this message's objects (a person that
+            # joined meanwhile is in it, rather than one more notification).
+            if objects:
+                self._announcing_latest[review_id] = (after, objects, zones, frame or start)
+        elif review_id in self._decided:
+            # Sent already: again if something more important has joined (a
+            # person after a dog), of a kind that is never quiet (a quiet car
+            # joining a dog's review is not worth a second alert).
+            told = self._decided[review_id]
+            if told is not None and self._live(review) and any(
+                _rank(o)[0] < _rank(told)[0] and kinds([o])[0] not in self.quiet_kinds for o in objects
+            ):
+                self._announce(
+                    review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start,
+                    again=True,
+                )
+        else:
             # Once per review, as soon as it has its bookmark: normally at its
             # first message; later if that one failed (even at its end). Long
             # after it began (HA was down, SS unreachable) it is old news.
@@ -757,14 +787,15 @@ class FrigateBridge:
         while len(self._not_yet) > FRIGATE_TRACKED_MAX:
             self._not_yet.popitem(last=False)
 
-    def _decide(self, review_id: str) -> None:
-        self._decided[review_id] = None
+    def _decide(self, review_id: str, told: str | None = None) -> None:
+        self._decided[review_id] = told
+        self._decided.move_to_end(review_id)
         while len(self._decided) > FRIGATE_DECIDED_MAX:
             self._decided.popitem(last=False)
 
     def _data(self) -> dict[str, Any]:
         return {
-            "decided": list(self._decided),
+            "decided": [[rid, told] for rid, told in self._decided.items()],
             "last_seen": [[c, k, t, rid] for (c, k), (t, rid) in self._last_seen.items()],
             "not_yet": [[rid, sorted(quiet)] for rid, quiet in self._not_yet.items()],
             "deferred": [[key, review] for key, review in self._waiting().items()],
@@ -827,23 +858,25 @@ class FrigateBridge:
         zones: list[str],
         start: int,
         frame: int,
+        again: bool = False,
     ) -> None:
-        payload = {
-            "entry_id": self.entry_id,
-            "review_id": review_id,
-            "bookmark_id": bookmark_id,
-            "camera_id": camera_id,
-            "camera": camera_name,
-            "frigate_camera": after.get("camera"),
-            "severity": after.get("severity"),
-            "objects": kinds(objects),
-            "labels": list(dict.fromkeys(objects)),
-            "zones": zones,
-            "start": start,
-            "image": self._image_url(review_id, camera_id, frame),
-            "thumbnail": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
-            "url": self._url(camera_id, start),
-        }
+        def payload(after: dict[str, Any], objects: list[str], zones: list[str], frame: int) -> dict[str, Any]:
+            return {
+                "entry_id": self.entry_id,
+                "review_id": review_id,
+                "bookmark_id": bookmark_id,
+                "camera_id": camera_id,
+                "camera": camera_name,
+                "frigate_camera": after.get("camera"),
+                "severity": after.get("severity"),
+                "objects": kinds(objects),
+                "labels": list(dict.fromkeys(objects)),
+                "zones": zones,
+                "start": start,
+                "image": self._image_url(review_id, camera_id, frame),
+                "thumbnail": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
+                "url": self._url(camera_id, start),
+            }
 
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
@@ -854,10 +887,12 @@ class FrigateBridge:
                     await wait_for_frame()
             finally:
                 self._announcing_ids.discard(review_id)
-            self.hass.bus.async_fire(DETECTION_EVENT, payload)
-            self._counts["announced"] += 1
+                latest = self._announcing_latest.pop(review_id, (after, objects, zones, frame))
+            self.hass.bus.async_fire(DETECTION_EVENT, payload(*latest))
+            # A review counts as announced (or not) once; again: its later notifications.
+            self._counts["announced_again" if again else "announced"] += 1
             self._not_yet.pop(review_id, None)
-            self._decide(review_id)
+            self._decide(review_id, latest[1][0])
             self._save()
 
         async def wait_for_frame() -> None:
@@ -876,7 +911,8 @@ class FrigateBridge:
         # Not yet news told until it has fired: cut short (unloaded while
         # waiting for the frame), it is news for the review's next message
         # after the reload, however long the review has gone on by then.
-        self._note_not_yet(review_id)
+        if not again:  # a second one cut short: its told is unchanged, so it is tried again anyway
+            self._note_not_yet(review_id)
         self._announcing_ids.add(review_id)
         task = self.hass.async_create_background_task(announce(), f"surveillance_station detection {review_id}")
         self._announcing.add(task)

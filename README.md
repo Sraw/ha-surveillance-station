@@ -295,15 +295,24 @@ How it works:
   since a longer one folds a second person arriving within it into the
   first's review, and so into its one notification.
 - One event per review, as soon as it has its bookmark, with the objects
-  seen by then: a car that a person later gets out of was announced as
-  "Car". Normally that is its first message; if that one failed, a later
-  one (even its `end`). Which reviews were announced is kept across
-  restarts (with the quiet period), so a review going on over a restart is
-  announced neither twice nor never. One first heard of more than 2
-  minutes after it began (HA was down), or whose message waited more than 2
-  minutes for SS, gets its bookmark but no event: the notification would be
-  old news. A review seen going on without being news (only bicycles, or a
-  quiet dog) is announced when it becomes news, however long it has lasted.
+  seen by then. Normally that is its first message; if that one failed, a
+  later one (even its `end`). **Again if something more important joins
+  the review later** (person > car > anything else > animals): a person
+  after a dog, or getting out of a car, is a second event for the same
+  review — the blueprint's notification uses the review id as its `tag`,
+  so it replaces the first one ("Animal" becomes "Person, Animal", with
+  the person's snapshot) and the phone alerts again. A dog after a person,
+  or a second animal, is not; nor a kind that may be quiet (a car, if cars
+  are made quiet, joining a dog's review). An object seen while the first
+  event waits for its frame is simply in that event. Which reviews were
+  announced is kept across restarts (with the quiet period), so a review
+  going on over a restart is announced neither twice nor never
+  (downgrading below 0.18 forgets it: the stored format changed). One
+  first heard of more than 2 minutes after it began (HA was down), or
+  whose message waited more than 2 minutes for SS, gets its bookmark but
+  no event: the notification would be old news. A review seen going on
+  without being news (only bicycles, or a quiet dog) is announced when it
+  becomes news, however long it has lasted.
 - Anyone who can publish to Frigate's topic on the broker can make
   bookmarks (and pick the moment whose frame is signed into the event); the
   broker is expected to require a login, as Frigate's does.
@@ -360,7 +369,8 @@ broker down, NAS unreachable at runtime and during HA's start):
   reads it.
 - Diagnostics show the bridge: subscribed, Frigate online, and every review
   message's fate (ignored and why, coalesced, dropped, retried, failed,
-  bookmarked, announced or not), plus the last error; with a Frigate URL,
+  bookmarked, announced or not; `announced_again`: the further
+  notifications of reviews something more important joined), plus the last error; with a Frigate URL,
   how the notification images went: `images_frigate` (Frigate's snapshot),
   `images_ss` (SS's frame instead), `images_failed` (neither: the phone got
   no image), `images_no_snapshot` (Frigate had none for that review),
@@ -379,7 +389,7 @@ blueprint for the companion app,
 (import it in **Settings → Automations & scenes → Blueprints → Import
 blueprint** with that file's URL): a phone, which cameras, objects and
 severities, and it sends the title, time, frame and link, one notification
-per review. Or by hand, e.g.:
+per review (updated in place when something more important joins it). Or by hand, e.g.:
 
 ```yaml
 triggers:
