@@ -20,7 +20,7 @@ import tempfile
 import time
 
 from .client import RecordingInfo, SSError, SurveillanceStationClient
-from .timelapse import TranscodeSpec, ffmpeg_transcode_args
+from .timelapse import TranscodeSpec, broken_frames, ffmpeg_transcode_args, slice_types
 from .vod import Recording, Segment, ffmpeg_remux_args, split_fmp4
 
 _LOGGER = logging.getLogger(__name__)
@@ -192,6 +192,9 @@ async def fetch_timelapse_segment(
     cancellable: a cut nobody wants any more never reaches the GPU. On
     shutdown, drain_transcodes() lets the running one finish; the timeout
     stops one with SIGTERM before SIGKILL.
+
+    An H.265 cut goes to the GPU without its broken frames (see
+    timelapse.broken_frames): one of those hangs it.
     """
     if gpu is None and spec.hardware:
         gpu = _DEFAULT_GPU
@@ -206,17 +209,28 @@ async def fetch_timelapse_segment(
             fd, seg.recording_id, seg.mount_id, seg.offset_ms, int(seg.duration * 1000), timelapse=True
         )
         fetched = time.monotonic()
+        if spec.hardware and spec.source_hevc:
+            await _drop_broken_frames(ffmpeg, cut, seg, timeout)
         if gpu is not None:
             await gpu.acquire()
             cut.lock = gpu
     except BaseException:
         cut.close()
         raise
-    argv = ffmpeg_transcode_args(ffmpeg, f"/proc/self/fd/{fd}", seg.duration, seg.media_start, spec)
+    argv = ffmpeg_transcode_args(ffmpeg, f"/proc/self/fd/{cut.fd}", seg.duration, seg.media_start, spec)
     job = asyncio.ensure_future(_transcode(argv, cut, timeout, spec.hardware))
     # Whatever happens to the job - even cancelled before it ran (loop
-    # teardown) - the file is closed and the lock freed, exactly once.
-    job.add_done_callback(lambda t: (cut.close(), t.cancelled() or t.exception()))
+    # teardown) - the file is closed and the lock freed, exactly once. A
+    # failure is logged with its cut: the caller may be gone (shielded).
+    def done(t: asyncio.Future) -> None:
+        cut.close()
+        if not t.cancelled() and (err := t.exception()) is not None:
+            _LOGGER.warning(
+                "time-lapse transcode rec=%s off=%sms dur=%.0fs failed: %s",
+                seg.recording_id, seg.offset_ms, seg.duration, str(err)[-300:],
+            )
+
+    job.add_done_callback(done)
     if spec.hardware:
         _JOBS.add(job)
         job.add_done_callback(_JOBS.discard)
@@ -248,6 +262,49 @@ class _Cut:
         if self.lock is not None:
             self.lock.release()
             self.lock = None
+
+
+async def _drop_broken_frames(ffmpeg: str, cut: _Cut, seg: Segment, timeout: float) -> None:
+    """Re-mux the cut without its broken frames (timelapse.broken_frames), if any.
+
+    The frame before stays on screen for a dropped one (a 30th of a second of
+    video) and the rest keep their timestamps; a dropped first or last frame
+    leaves the segment that much short. The re-muxed cut must hold exactly
+    the frames that were kept - otherwise it doesn't go to the GPU. Holds the
+    cut twice in memory meanwhile.
+    """
+    def reader(fd: int) -> Callable[[int, int], bytes]:
+        return lambda offset, n: os.pread(fd, n, offset)
+
+    frames = slice_types(reader(cut.fd), os.fstat(cut.fd).st_size)
+    drop = broken_frames(frames or [])
+    if not drop:
+        return
+    _LOGGER.info(
+        "time-lapse rec=%s off=%sms: dropping %d broken frame(s) (%s) before the GPU decodes it",
+        seg.recording_id, seg.offset_ms, len(drop), ", ".join(map(str, drop)),
+    )
+    try:
+        out = os.memfd_create("ss_timelapse", os.MFD_CLOEXEC)
+    except OSError as err:
+        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
+    expr = "+".join(f"eq(n\\,{i})" for i in drop)
+    argv = [
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-i", f"/proc/self/fd/{cut.fd}",
+        "-map", "0:v:0", "-c", "copy", "-bsf:v", f"noise=drop={expr}",
+        "-f", "mp4", "-y", f"/proc/self/fd/{out}",
+    ]
+    try:
+        await _exec_ffmpeg(argv, timeout, pass_fds=(cut.fd, out))
+    except BaseException:
+        os.close(out)
+        raise
+    old, cut.fd = cut.fd, out
+    os.close(old)
+    dropped = set(drop)
+    kept = [f for i, f in enumerate(frames) if i not in dropped]
+    if slice_types(reader(out), os.fstat(out).st_size) != kept:
+        raise SSError("ffmpeg", "drop frames", None, f"the re-muxed cut isn't the {len(kept)} frames kept")
 
 
 async def _transcode(argv: list[str], cut: _Cut, timeout: float, hardware: bool) -> bytes:

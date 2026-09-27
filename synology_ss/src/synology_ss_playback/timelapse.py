@@ -19,11 +19,16 @@ boundaries are whole video seconds (4 minutes of wall time at 240x) anyway.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
+import logging
 import math
 
 from .client import TimelapseRecording
 from .vod import Segment
+
+_LOGGER = logging.getLogger(__name__)
 
 # SS writes time-lapse video at this rate (every task on SS 9.x).
 TIMELAPSE_FPS = 30
@@ -144,6 +149,144 @@ def plan_day(
         media += v1 - v0
         prev_end = rec.start + v1 * rate
     return segments, runs
+
+
+# IRAP pictures: BLA, IDR, CRA (all-intra streams are made of these).
+_IRAP = range(16, 22)
+
+
+def slice_types(read: Callable[[int, int], bytes], size: int) -> list[tuple[int, ...]] | None:
+    """The NAL unit types of the slices of each sample of an MP4's H.265 track.
+
+    ``read(offset, n)`` reads the file (``size`` bytes); only the NAL unit
+    headers are read. None if it has no H.265 video track or can't be parsed.
+    """
+    try:
+        return _slice_types(read, size)
+    except Exception as err:  # noqa: BLE001 - a file it can't read isn't checked
+        _LOGGER.debug("can't read the slices of an MP4: %s: %s", type(err).__name__, err)
+        return None
+
+
+def broken_frames(frames: list[tuple[int, ...]]) -> list[int]:
+    """Indices of the frames (from ``slice_types``) that aren't whole pictures.
+
+    A Reolink E1 Outdoor Pro (firmware v3.1.0.5714, on Wi-Fi) now and then
+    leaves a time-lapse frame with one of its two slices - one per tile
+    column - missing, or with the second one taken from another picture (a
+    P slice in an all-intra stream). The CPU decoder conceals both; an Iris
+    Xe decodes such 4K frames with both VDBoxes, one tile column each, and
+    hangs on the first kind (reproduced: every such cut, in any driver and
+    ffmpeg version; none once the frame was dropped) and crashes ffmpeg on
+    the second.
+
+    Broken: fewer slices than most of the frames have, or - in a stream of
+    mostly all-intra frames - a slice that isn't intra, or slices of
+    different types. They are simply dropped: a 30th of a second of video.
+    """
+    if not frames:
+        return []
+    usual = Counter(len(f) for f in frames).most_common(1)[0][0]
+    intra = sum(1 for f in frames if f and all(t in _IRAP for t in f)) * 2 > len(frames)
+    return [
+        i for i, f in enumerate(frames)
+        if len(f) < usual or (intra and (not f or len(set(f)) > 1 or f[0] not in _IRAP))
+    ]
+
+
+def _boxes(read: Callable[[int, int], bytes], start: int, end: int):
+    """(type, payload start, payload end) of the boxes in [start, end)."""
+    pos = start
+    while pos + 8 <= end:
+        head = read(pos, 16)
+        size, kind = int.from_bytes(head[:4], "big"), head[4:8].decode("latin-1")
+        hdr = 8
+        if size == 1:
+            size, hdr = int.from_bytes(head[8:16], "big"), 16
+        elif size == 0:
+            size = end - pos
+        if size < hdr or pos + size > end:
+            raise ValueError("bad box")
+        yield kind, pos + hdr, pos + size
+        pos += size
+
+
+def _child(read, box: tuple[int, int], path: str) -> tuple[int, int]:
+    for name in path.split("/"):
+        box = next(((a, b) for kind, a, b in _boxes(read, *box) if kind == name), None)
+        if box is None:
+            raise ValueError(f"no {name}")
+    return box
+
+
+def _table(read, box: tuple[int, int], head: int, count: int, width: int) -> list[int]:
+    """``count`` big-endian integers of ``width`` bytes, ``head`` bytes into a box."""
+    if head + count * width > box[1] - box[0]:
+        raise ValueError("table past its box")
+    raw = read(box[0] + head, count * width)
+    return [int.from_bytes(raw[i : i + width], "big") for i in range(0, count * width, width)]
+
+
+def _slice_types(read: Callable[[int, int], bytes], size: int) -> list[tuple[int, ...]] | None:
+    moov = _child(read, (0, size), "moov")
+    for kind, a, b in _boxes(read, *moov):
+        if kind != "trak":
+            continue
+        hdlr = _child(read, (a, b), "mdia/hdlr")
+        if read(hdlr[0] + 8, 4) == b"vide":
+            stbl = _child(read, (a, b), "mdia/minf/stbl")
+            break
+    else:
+        return None
+    # The sample entry (hvc1/hev1): 78 bytes of VisualSampleEntry, then hvcC.
+    stsd = _child(read, stbl, "stsd")
+    kind, ea, eb = next(_boxes(read, stsd[0] + 8, stsd[1]), ("", 0, 0))
+    if kind not in ("hvc1", "hev1"):
+        return None
+    hvcc = _child(read, (ea + 78, eb), "hvcC")
+    length = (read(hvcc[0] + 21, 1)[0] & 3) + 1
+    stsz = _child(read, stbl, "stsz")
+    fixed, count = int.from_bytes(read(stsz[0] + 4, 4), "big"), int.from_bytes(read(stsz[0] + 8, 4), "big")
+    if fixed:
+        if fixed * count > size:
+            raise ValueError("samples past the file")
+        sizes = [fixed] * count
+    else:
+        sizes = _table(read, stsz, 12, count, 4)
+    stsc = _child(read, stbl, "stsc")
+    table = _table(read, stsc, 8, int.from_bytes(read(stsc[0] + 4, 4), "big") * 3, 4)
+    runs = list(zip(table[0::3], table[1::3]))  # (first chunk, samples per chunk)
+    try:
+        co, width = _child(read, stbl, "stco"), 4
+    except ValueError:
+        co, width = _child(read, stbl, "co64"), 8
+    offsets = _table(read, co, 8, int.from_bytes(read(co[0] + 4, 4), "big"), width)
+    slices = []
+    sample = 0
+    for c, chunk_offset in enumerate(offsets, start=1):
+        per_chunk = next((spc for first, spc in reversed(runs) if first <= c), None)
+        if per_chunk is None:
+            raise ValueError("chunk before the first run")
+        pos = chunk_offset
+        for _ in range(per_chunk):
+            if sample >= count:
+                break
+            end, types = pos + sizes[sample], []
+            if end > size:
+                raise ValueError("sample past the file")
+            while pos + length < end:
+                head = read(pos, length + 1)
+                nal = int.from_bytes(head[:length], "big")
+                if (kind := (head[length] >> 1) & 0x3F) < 32:  # VCL: a slice segment
+                    types.append(kind)
+                pos += length + nal
+            if pos != end:  # its NAL units don't add up to it: a broken frame
+                types, pos = [], end
+            slices.append(tuple(types))
+            sample += 1
+    if sample != count:
+        raise ValueError("samples without a chunk")
+    return slices
 
 
 def output_size(width: int, height: int, target: int = OUTPUT_WIDTH) -> tuple[int, int]:

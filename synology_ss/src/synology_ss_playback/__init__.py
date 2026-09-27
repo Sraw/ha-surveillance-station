@@ -24,10 +24,12 @@ from .timelapse import (
     CODECS,
     TimelapseRun,
     TranscodeSpec,
+    broken_frames,
     covered,
     hardware_transcode_available,
     output_size,
     plan_day,
+    slice_types,
 )
 from .vod import (
     Recording,
@@ -56,6 +58,7 @@ __all__ = [
     "TimelapseRecording",
     "TimelapseRun",
     "TranscodeSpec",
+    "broken_frames",
     "covered",
     "drain_transcodes",
     "fetch_segment",
@@ -70,4 +73,5 @@ __all__ = [
     "remove_stale_temp_files",
     "render_playlist",
     "runs_from_segments",
+    "slice_types",
 ]

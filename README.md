@@ -609,6 +609,21 @@ entities; there is no per-user camera permission.
   time; a hardware one, once running, finishes whoever leaves (only waiting
   for its turn is cancelled), HA's shutdown waits for it, and a 30 s timeout
   stops it with SIGTERM before SIGKILL.
+- **Broken time-lapse frames hang the GPU**: a Reolink E1 Outdoor Pro on
+  firmware v3.1.0.5714 (Wi-Fi) now and then leaves a frame in its 4K
+  time-lapse with one of its two slices (one per tile column) missing, or
+  with the second one from another picture (a P slice in an all-intra
+  stream). Software decoders conceal it. The Iris Xe decodes these frames
+  with both VDBoxes, one tile column each, and hangs on the first kind;
+  ffmpeg crashes on the second. This happened on every such cut, with
+  Intel's media driver 25.2.6 (Frigate's) and 26.2.1, and with ffmpeg 7.0
+  and 8.1. The same camera model on older firmware never did. So before a
+  GPU transcode of an H.265 cut, the integration reads the NAL unit headers
+  of each frame (under a millisecond). If any frame isn't whole, it
+  re-muxes the cut without that frame (`noise=drop`), and the frame before
+  stays on screen for a 30th of a second. The re-muxed cut must hold
+  exactly the frames that were kept, or it doesn't reach the GPU. After
+  this change, 166 consecutive segments of that camera ran without a hang.
 - Time-lapse throughput is bounded by the NAS: a second of daytime 4K
   time-lapse is ~30 MB, the gigabit link carries ~110 MB/s from a finished
   file, and SS reads the file it is still writing at only ~50 MB/s. Today's

@@ -366,6 +366,150 @@ def test_transcode_args_software_is_h264() -> None:
     assert "qsv" not in line and "-c:v libx264" in line and "scale=1280:712" in line
 
 
+# ---- incomplete frames -----------------------------------------------------
+
+
+def _nal(kind: int, body: bytes = b"xy") -> bytes:
+    unit = bytes([kind << 1, 1]) + body
+    return len(unit).to_bytes(4, "big") + unit
+
+
+def _full(payload: bytes) -> bytes:
+    return b"\0\0\0\0" + payload
+
+
+def _mp4(
+    samples: list[list[int]], *, entry: str = "hvc1", co64: bool = False, audio_first: bool = False, fixed: bool = False
+) -> bytes:
+    """ftyp, mdat (two samples a chunk), moov; each sample a list of NAL unit types."""
+    data = [b"".join(_nal(k) for k in s) for s in samples]
+    ftyp = _box("ftyp", b"isom")
+    first = len(ftyp) + 8
+    offsets, pos = [], first
+    for i in range(0, len(data), 2):
+        offsets.append(pos)
+        pos += sum(len(d) for d in data[i : i + 2])
+    mdat = _box("mdat", b"".join(data))
+    hvcc = _box("hvcC", bytes(21) + b"\xff" + bytes(2))
+    stsd = _box("stsd", _full((1).to_bytes(4, "big") + (_box(entry, bytes(78) + hvcc) if entry else b"")))
+    if fixed:  # every sample the same size: no table
+        stsz = _box("stsz", _full(len(data[0]).to_bytes(4, "big") + len(data).to_bytes(4, "big")))
+    else:
+        stsz = _box("stsz", _full(bytes(4) + len(data).to_bytes(4, "big") + b"".join(len(d).to_bytes(4, "big") for d in data)))
+    stsc = _box("stsc", _full((1).to_bytes(4, "big") + (1).to_bytes(4, "big") + (2).to_bytes(4, "big") + (1).to_bytes(4, "big")))
+    width = 8 if co64 else 4
+    co = _box("co64" if co64 else "stco", _full(len(offsets).to_bytes(4, "big") + b"".join(o.to_bytes(width, "big") for o in offsets)))
+    stbl = _box("stbl", stsd + stsz + stsc + co)
+
+    def trak(handler: bytes, stbl: bytes) -> bytes:
+        hdlr = _box("hdlr", _full(bytes(4) + handler + bytes(12)))
+        return _box("trak", _box("mdia", hdlr + _box("minf", stbl)))
+
+    traks = trak(b"vide", stbl)
+    if audio_first:
+        traks = trak(b"soun", _box("stbl", b"")) + traks
+    return ftyp + mdat + _box("moov", _box("mvhd", _full(bytes(96))) + traks)
+
+
+def _broken(data: bytes) -> list[int]:
+    return tl.broken_frames(tl.slice_types(lambda offset, n: data[offset : offset + n], len(data)) or [])
+
+
+def test_broken_frames_finds_a_frame_missing_a_slice() -> None:
+    frame = [32, 33, 34, 19, 19]  # VPS, SPS, PPS, two IDR slices
+    samples = [frame, [32, 33, 34, 19], frame, frame, [19], frame]
+    assert _broken(_mp4(samples)) == [1, 4]
+    assert _broken(_mp4(samples, co64=True, audio_first=True)) == [1, 4]
+
+
+def test_broken_frames_takes_a_slice_of_another_picture() -> None:
+    frame = [32, 33, 34, 19, 19]
+    assert _broken(_mp4([frame, [19, 1], frame, frame, [1, 19]])) == [1, 4]
+
+
+def test_broken_frames_leaves_a_stream_with_p_frames_alone() -> None:
+    # IDR then P frames (a GOP): only a missing slice counts.
+    assert _broken(_mp4([[19, 19], [1, 1], [1, 1], [1], [1, 1], [19, 19]])) == [3]
+
+
+def test_broken_frames_takes_the_usual_slice_count() -> None:
+    f = [32, 33, 34, 19, 19]
+    assert _broken(_mp4([f, f, f + [19], f, f, f])) == []  # one frame with a slice more: not the rest
+    assert _broken(_mp4([f, f, f + [1], f, [19], f])) == [2, 4]
+
+
+def test_broken_frames_takes_any_intra_type() -> None:
+    assert _broken(_mp4([[19, 19], [21, 21], [21, 21], [20, 20], [19, 21], [16, 16]])) == [4]
+
+
+def test_broken_frames_by_the_usual_frame() -> None:
+    assert _broken(_mp4([[19, 19], [19], [19], [19, 19], [19]])) == []
+    assert _broken(_mp4([[19, 19], [19, 19], [32], [19, 19]])) == [2]  # a frame without a slice
+
+
+def test_broken_frames_none() -> None:
+    assert _broken(_mp4([[32, 19, 19]] * 3)) == []
+    assert _broken(_mp4([[32, 19, 19], [19, 19, 32]], fixed=True)) == []
+    assert _broken(_mp4([[19, 19, 32], [19, 32, 32], [19, 19, 32]], fixed=True)) == [1]
+    assert _broken(_mp4([[32, 19], [19]])) == []  # one slice a frame: nothing to miss
+    assert _broken(_mp4([[19, 19], [19]], entry="avc1")) == []  # not H.265
+    assert _broken(_mp4([[19, 19], [19]], entry="")) == []  # no sample entry
+
+
+@pytest.mark.parametrize(
+    "mangle",
+    [
+        lambda d: d.replace(  # the first run starts at chunk 2
+            b"stsc" + bytes(4) + (1).to_bytes(4, "big") + (1).to_bytes(4, "big"),
+            b"stsc" + bytes(4) + (1).to_bytes(4, "big") + (2).to_bytes(4, "big"),
+        ),
+        lambda d: d.replace(b"stsz" + bytes(8), b"stsz" + bytes(4) + (10**9).to_bytes(4, "big")),  # a count past its box
+        lambda d: d.replace(b"stco" + bytes(4) + (1).to_bytes(4, "big"), b"stco" + bytes(4) + (10**9).to_bytes(4, "big")),
+        lambda d: d.replace(b"stsz" + bytes(8), b"stsz" + bytes(4) + (10**9).to_bytes(4, "big"), 1).replace(
+            b"stsz" + bytes(4) + (10**9).to_bytes(4, "big"), b"stsz" + (10**6).to_bytes(4, "big") + (10**6).to_bytes(4, "big")
+        ),  # fixed sizes past the file
+        lambda d: d.replace(  # one sample a chunk: the second sample in no chunk
+            b"stsc" + bytes(4) + (1).to_bytes(4, "big") * 2 + (2).to_bytes(4, "big"),
+            b"stsc" + bytes(4) + (1).to_bytes(4, "big") * 3,
+        ),
+    ],
+)
+def test_slice_types_of_a_malformed_file(mangle) -> None:
+    good = _mp4([[19, 19], [19]])
+    bad = mangle(good)
+    assert bad != good
+    assert tl.slice_types(lambda offset, n: bad[offset : offset + n], len(bad)) is None
+
+
+def test_slice_types_with_an_offset_past_the_file() -> None:
+    good = _mp4([[19, 19], [19]], co64=True)
+    at = good.index(b"co64") + 12
+    bad = good[:at] + (2**63).to_bytes(8, "big") + good[at + 8 :]
+
+    def read(offset: int, n: int) -> bytes:
+        if offset >= 2**62:
+            raise OverflowError("signed integer is greater than maximum")
+        return bad[offset : offset + n]
+
+    assert tl.slice_types(read, len(bad)) is None
+
+
+def test_broken_frames_of_something_else() -> None:
+    good = _mp4([[19, 19], [19]])
+    assert _broken(b"") == [] and _broken(b"not an mp4 at all") == []
+    assert _broken(good[: len(good) - 10]) == []  # truncated moov
+    no_video = _mp4([[19, 19]]).replace(b"vide", b"soun")
+    assert _broken(no_video) == []
+    bad_sample = bytearray(_mp4([[19, 19]] * 3))
+    first = bad_sample.index(b"mdat") + 4
+    bad_sample[first : first + 4] = (10_000).to_bytes(4, "big")  # a NAL running past its sample
+    assert _broken(bytes(bad_sample)) == [0]  # a broken frame, not a file it can't read
+    moov = good.index(b"moov") - 4
+    large = (1).to_bytes(4, "big") + b"free" + (16).to_bytes(8, "big")  # a 64-bit box size
+    assert _broken(good[:moov] + large + good[moov:]) == [1]
+    assert _broken(good[:moov] + bytes(4) + good[moov + 4 :]) == [1]  # size 0: to the end of the file
+
+
 # ---- hardware check --------------------------------------------------------
 
 
@@ -456,6 +600,101 @@ async def test_fetch_timelapse_segment(spec: TranscodeSpec) -> None:
     client.download_to.assert_awaited_once()
     args = client.download_to.await_args
     assert args.args[1:] == (seg.recording_id, 0, seg.offset_ms, 4000) and args.kwargs == {"timelapse": True}
+
+
+WHOLE, HALF = (19, 19), (19,)
+CUT_TYPES = [WHOLE, WHOLE, WHOLE, HALF, WHOLE, HALF]  # frames 3 and 5 miss a slice
+
+
+def _types_before_after(after: list | None):
+    """slice_types: the cut's frames first, then (the re-muxed cut) ``after``."""
+    return patch.object(seg_mod, "slice_types", side_effect=[CUT_TYPES, after])
+
+
+async def test_broken_frames_never_reach_the_gpu() -> None:
+    gpu = asyncio.Semaphore(1)
+    calls, closed = [], []
+    real_close = os.close
+
+    async def run(*argv, **kwargs):
+        fds = kwargs["pass_fds"]
+        os.lseek(fds[0], 0, os.SEEK_SET)
+        calls.append((argv, fds, os.read(fds[0], 100), gpu.locked()))
+        if len(fds) == 2:
+            assert argv[-1] == f"/proc/self/fd/{fds[1]}"
+            os.write(fds[1], b"whole")
+            return _proc(0)
+        return _proc(0, FMP4)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=run)), _types_before_after(
+        [WHOLE] * 4
+    ), patch.object(seg_mod.os, "close", side_effect=lambda fd: closed.append(fd) or real_close(fd)):
+        init, media = await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW, gpu=gpu)
+    assert init and media and not gpu.locked()
+    (remux, (cut_fd, new_fd), data1, locked1), (transcode, fds2, data2, locked2) = calls
+    assert "noise=drop=eq(n\\,3)+eq(n\\,5)" in remux and "copy" in remux
+    assert data1 == b"cut" and not locked1  # re-muxed before taking the GPU
+    assert fds2 == (new_fd,) and data2 == b"whole" and locked2 and "-hwaccel" in transcode
+    assert sorted(closed) == sorted([cut_fd, new_fd])  # each once
+
+
+@pytest.mark.parametrize("after", [None, [WHOLE] * 5, [WHOLE, WHOLE, WHOLE, HALF]])
+async def test_a_remux_that_kept_other_frames_never_reaches_the_gpu(after) -> None:
+    gpu = asyncio.Semaphore(1)
+    closed = []
+    real_close = os.close
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(0))) as run, _types_before_after(
+        after
+    ), patch.object(seg_mod.os, "close", side_effect=lambda fd: closed.append(fd) or real_close(fd)):
+        with pytest.raises(SSError, match="the 4 frames kept"):
+            await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW, gpu=gpu)
+    assert run.await_count == 1 and len(closed) == 2 and not gpu.locked()
+
+
+@pytest.mark.parametrize("spec", [SW, TranscodeSpec("hevc", True, False, 1280, 712)])
+async def test_only_a_gpu_decoding_h265_is_checked(spec: TranscodeSpec) -> None:
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(0, FMP4))) as run, patch.object(
+        seg_mod, "slice_types"
+    ) as check:
+        await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", spec)
+    check.assert_not_called()
+    assert run.await_count == 1
+
+
+@pytest.mark.parametrize("cut", [_mp4([[19, 19]] * 2), b"not an mp4"])
+async def test_whole_or_unreadable_cut_goes_to_the_gpu_as_it_is(cut: bytes) -> None:
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(0, FMP4))) as run:
+        await fetch_timelapse_segment(_dl_client(cut), _tseg(), "ffmpeg", HW)
+    assert run.await_count == 1
+
+
+async def test_dropping_frames_fails() -> None:
+    gpu = asyncio.Semaphore(1)
+    closed = []
+    real_close = os.close
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(1, b"", b"bad cut"))) as run, patch.object(
+        seg_mod, "slice_types", return_value=CUT_TYPES
+    ), patch.object(seg_mod.os, "close", side_effect=lambda fd: closed.append(fd) or real_close(fd)):
+        with pytest.raises(SSError, match="bad cut"):
+            await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW, gpu=gpu)
+    assert run.await_count == 1 and len(closed) == 2 and not gpu.locked()
+
+
+async def test_dropping_frames_without_memfd() -> None:
+    real = os.memfd_create
+    made = []
+
+    def once(*a):
+        if made:
+            raise OSError(24, "Too many open files")
+        made.append(1)
+        return real(*a)
+
+    with patch.object(seg_mod.os, "memfd_create", side_effect=once), patch.object(
+        seg_mod, "slice_types", return_value=CUT_TYPES
+    ):
+        with pytest.raises(SSError, match="OSError"):
+            await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW)
 
 
 async def test_fetch_timelapse_segment_empty_output() -> None:
@@ -586,7 +825,7 @@ async def test_hardware_without_a_lock_uses_the_module_one() -> None:
     assert seen == [True] and not seg_mod._DEFAULT_GPU.locked()
 
 
-async def test_hardware_timeout_stops_with_sigterm_first() -> None:
+async def test_hardware_timeout_stops_with_sigterm_first(caplog: pytest.LogCaptureFixture) -> None:
     proc = _proc(None)
 
     async def communicate():
@@ -604,6 +843,8 @@ async def test_hardware_timeout_stops_with_sigterm_first() -> None:
             await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW, timeout=0.01, gpu=asyncio.Semaphore(1))
     proc.terminate.assert_called_once()
     proc.kill.assert_not_called()
+    # Which cut failed is logged (its caller may be gone).
+    assert f"rec={_tseg().recording_id} off={_tseg().offset_ms}ms" in caplog.text and "timed out" in caplog.text
 
 
 async def test_sigterm_ignored_then_sigkill() -> None:
