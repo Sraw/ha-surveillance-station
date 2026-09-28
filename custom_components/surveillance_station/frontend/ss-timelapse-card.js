@@ -21,7 +21,7 @@ const TL_TAG = "ss-timelapse-card";
 // What this card shares with the timeline card, at the version this card was
 // loaded with (the timeline card's, see ss-common.js).
 const {
-  MSE: TL_MSE, BLANK_POSTER: TL_BLANK_POSTER, prefsFor, labelAttrs, setLabel, sliderKey, veilHtml, VEIL_CSS, setVeil, codecOf,
+  MSE: TL_MSE, BLANK_POSTER: TL_BLANK_POSTER, prefsFor, labelAttrs, setLabel, sliderKey, setSliderValue, veilHtml, VEIL_CSS, setVeil, codecOf,
 } = await import(new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href);
 const AHEAD = 18; // seconds of video fetched ahead of the playhead
 const BEHIND = 30; // seconds of played video kept (a short step back is instant)
@@ -740,6 +740,7 @@ class SSTimelapseCard extends HTMLElement {
   }
 
   _zoom(span) {
+    this._endScrubKeys();
     this._span = span;
     tlPrefs.set("span", span);
     this._markSpan();
@@ -750,6 +751,7 @@ class SSTimelapseCard extends HTMLElement {
 
   _pan(dir) {
     if (!this._view) return;
+    this._endScrubKeys();
     const span = this._view.end - this._view.start;
     this._followPausedUntil = Date.now() + TL_FOLLOW_PAUSE_MS;
     this._setView(this._view.start + span / 2 + (dir * span) / 2);
@@ -765,6 +767,7 @@ class SSTimelapseCard extends HTMLElement {
 
   /** Seek to media time t; the playhead is there at once, however long the load takes. */
   _seek(t) {
+    this._endScrubKeys();
     this._followPausedUntil = 0; // a seek means "show me there", a pan or not
     this._seekFrom = this._seekTarget == null ? this._video.currentTime : this._seekFrom;
     this._seekTarget = t;
@@ -882,10 +885,7 @@ class SSTimelapseCard extends HTMLElement {
     this._clock.textContent = text;
     // The scrub bar as a slider: its value within the view, and what the clock says.
     const view = this._view;
-    if (view && this._scrub.getAttribute("aria-valuetext") !== text) {
-      this._scrub.setAttribute("aria-valuenow", String(Math.round(Math.min(Math.max(w, view.start), view.end))));
-      this._scrub.setAttribute("aria-valuetext", text);
-    }
+    if (view) setSliderValue(this._scrub, w, text, view.start, view.end);
   }
 
   /**
@@ -912,7 +912,10 @@ class SSTimelapseCard extends HTMLElement {
     }, 400);
   }
 
-  /** Keys still waiting to seek don't, once a drag or another day takes over. */
+  /**
+   * Keys still waiting to seek don't, once a drag, another seek (a skip), a
+   * pan, a zoom or another day takes over: they would undo it.
+   */
   _endScrubKeys() {
     if (this._keyWall == null) return;
     clearTimeout(this._keyTimer);

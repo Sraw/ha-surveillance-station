@@ -41,8 +41,8 @@ const CARD_VERSION = "0.19.0";
 // What this card shares with the time-lapse card, loaded as that card is:
 // with this card's version, so a release never runs against a stale cached copy.
 const {
-  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, sliderKey, kindTest, veilHtml, VEIL_CSS, setVeil,
-  ticksOf, readStreamMsg, findBox, codecOf, audioCodecOf,
+  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, sliderKey, setSliderValue, kindTest, veilHtml, VEIL_CSS, setVeil,
+  ticksOf, liveViewEnd, readStreamMsg, findBox, codecOf, audioCodecOf,
 } = await import(new URL(`./ss-common.js?v=${CARD_VERSION}`, import.meta.url).href);
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
@@ -2074,7 +2074,7 @@ class SSTimelineCard extends HTMLElement {
     // The nearest of the spans offered.
     const span = Number(prefs.get("span", Number(this._config.span))) || 3600;
     this._span = SPANS.map(([v]) => v).reduce((a, b) => (Math.abs(b - span) < Math.abs(a - span) ? b : a));
-    const end = nowS() + this._span * 0.05;
+    const end = this._liveEnd();
     this._view = { start: end - this._span, end };
     // What's laid over the video; each can be hidden (see SHOWS).
     this._shows = Object.fromEntries(SHOWS.map(([k]) => [k, prefs.get(k, this._config[k] !== false)]));
@@ -2666,6 +2666,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _seekAll(t, autoplay) {
+    this._endTrackKeys();
     // Leader first: followers then correct to wherever it actually lands.
     this._leader?.seek(t, autoplay);
     for (const p of this._players.values()) if (p !== this._leader) p.seek(t, autoplay);
@@ -2918,6 +2919,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _setSpan(span) {
+    this._endTrackKeys();
     this._span = span;
     prefs.set("span", this._span);
     this._centerOn(this._leader.wall());
@@ -2979,8 +2981,9 @@ class SSTimelineCard extends HTMLElement {
 
   /** Move the view by `spans` of its width (not past now). */
   _pan(spans) {
+    this._endTrackKeys();
     const shift = spans * this._span;
-    const end = Math.min(this._view.end + shift, nowS() + this._span * 0.05);
+    const end = Math.min(this._view.end + shift, this._liveEnd());
     this._view = { start: end - this._span, end };
     this._followPausedUntil = Date.now() + FOLLOW_PAUSE_MS;
     this._loadTimeline();
@@ -2995,8 +2998,14 @@ class SSTimelineCard extends HTMLElement {
   // ---- timeline ---------------------------------------------------------
 
   _centerOn(t) {
-    const end = Math.min(t + this._span / 2, nowS() + this._span * 0.05);
+    const end = Math.min(t + this._span / 2, this._liveEnd());
     this._view = { start: end - this._span, end };
+  }
+
+  /** The end of a view showing now (see liveViewEnd). */
+  _liveEnd() {
+    // A track not laid out yet (or hidden) counts as 200 px wide, not 0.
+    return liveViewEnd(nowS(), this._span, Math.max(this._track?.clientWidth ?? 0, 200));
   }
 
   async _loadTimeline() {
@@ -3480,10 +3489,8 @@ class SSTimelineCard extends HTMLElement {
 
   /** The timeline slider's value (within the view) and what it says (the clock's text). */
   _sliderAt(t, text) {
-    if (this._bars.getAttribute("aria-valuetext") === text) return;
     const { start, end } = this._view;
-    this._bars.setAttribute("aria-valuenow", String(Math.round(clamp(t, start, end))));
-    this._bars.setAttribute("aria-valuetext", text);
+    setSliderValue(this._bars, t, text, start, end);
   }
 
   /**
@@ -3510,7 +3517,11 @@ class SSTimelineCard extends HTMLElement {
     }, 400);
   }
 
-  /** A pointer on the timeline, or the card leaving: keys still waiting to seek don't. */
+  /**
+   * A pointer on the timeline, another seek, a pan, a new span or the card
+   * leaving: keys still waiting to seek don't (they would undo it), and the
+   * playhead shows the cameras' time again.
+   */
   _endTrackKeys() {
     clearTimeout(this._keyTimer);
     this._keyAt = null;
@@ -3603,26 +3614,25 @@ class SSTimelineCard extends HTMLElement {
     m.target = t;
     const { start, end } = this._view;
     const following = !this._drag && Date.now() > this._followPausedUntil;
-    // Live: the timeline scrolls along with now, kept near the right edge
-    // (redrawn once it has moved about a pixel), rather than sitting still
-    // until now runs off it. Not under the pointer: the bars would be replaced
-    // under a tooltip and the hover time would go stale. A bigger move (back
-    // from a pan) is a new range to fetch, and so is what's recording, every
-    // few seconds (_liveRecsDue).
+    // Live: the timeline scrolls along with now, kept near the right edge on
+    // the pixel step (redrawn once now has moved a pixel, see liveViewEnd),
+    // rather than sitting still until now runs off it. Not under the pointer:
+    // the bars would be replaced under a tooltip and the hover time would go
+    // stale. A bigger move (back from a pan) is a new range to fetch, and so
+    // is what's recording, every few seconds (_liveRecsDue).
     if (following && !this._overTrack && this._isLive(t)) {
-      const e = nowS() + this._span * 0.05;
-      const shift = Math.abs(e - end);
+      const e = this._liveEnd();
       const due = this._liveRecsDue();
-      if (due || shift > this._span / Math.max(this._track.clientWidth, 200)) {
+      if (due || e !== end) {
         this._view = { start: e - this._span, end: e };
-        if (due || shift > this._span * 0.1) this._loadTimeline();
+        if (due || Math.abs(e - end) > this._span * 0.1) this._loadTimeline();
         else this._drawTimeline(); // paints t too
         return;
       }
     }
     if (following && (t < start || t > end)) {
       const s = t - this._span * 0.2;
-      const e = Math.min(s + this._span, nowS() + this._span * 0.05);
+      const e = Math.min(s + this._span, this._liveEnd());
       this._view = { start: e - this._span, end: e };
       this._loadTimeline();
       return;

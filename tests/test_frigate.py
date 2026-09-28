@@ -1162,8 +1162,8 @@ async def test_kept_again_keeps_its_first_failure(nvr: Nvr, client: MagicMock, c
 
 
 async def test_merged_message_keeps_when_the_news_came(hass: HomeAssistant, nvr: Nvr, client: MagicMock, clock, no_retry_wait) -> None:
-    """A person seen at +60 s waited for SS (down); an update at +1500 s joins it: still 24
-    minutes old news, and the bookmark open up to when it came."""
+    """A person seen at +60 s waited for SS (down); an update at +1500 s joins it once SS is back:
+    still 24 minutes old news, but the bookmark open up to the update, not the person's message."""
     events = async_capture_events(hass, DETECTION_EVENT)
     nvr.send(review("new", objects=("bicycle",), rid="b"))
     await nvr.until(lambda: nvr.stats()["ignored"].get("no_objects"))
@@ -1177,7 +1177,29 @@ async def test_merged_message_keeps_when_the_news_came(hass: HomeAssistant, nvr:
     await nvr.until(lambda: nvr.stats()["bookmarked"] == 1)
     await hass.async_block_till_done()
     assert not events
-    assert client.create_bookmark.await_args.args[2:4] == (T, T + 60)
+    assert client.create_bookmark.await_args.args[2:4] == (T, T + 1500)
+
+
+async def test_merged_messages_replayed_end_at_the_latest(
+    hass: HomeAssistant, nvr: Nvr, client: MagicMock, clock, no_retry_wait
+) -> None:
+    """A review's messages at +60 s and +1500 s both wait out an outage (merged into one), and are
+    replayed at +3600 s, their end never heard of: the bookmark reaches the later message (both
+    times are stored for a restart)."""
+    create = down(client)
+    clock.return_value = T + 60
+    nvr.send(review("update", rid="r"))
+    await nvr.until(lambda: nvr.stats()["deferred"] == 1)
+    clock.return_value = T + 1500
+    nvr.send(review("update", objects=("person", "car"), rid="r"))
+    await nvr.until(lambda: nvr.stats()["deferred"] == 1 and client.create_bookmark.await_count == 4)
+    kept = (await nvr.kept())["r"]
+    assert (kept["_received_at"], kept["_last_received_at"]) == (T + 60, T + 1500)
+    clock.return_value = T + 3600
+    client.create_bookmark.side_effect = create
+    await nvr.check()
+    await nvr.until(lambda: nvr.stats()["bookmarked"] == 1)
+    assert client.create_bookmark.await_args.args[1:4] == ("Person, Car", T, T + 1500)
 
 
 async def test_merged_message_without_news_is_fresh(hass: HomeAssistant, nvr: Nvr, client: MagicMock, clock) -> None:
@@ -1241,7 +1263,8 @@ async def test_replayed_joining_is_not_sent_again(hass: HomeAssistant, nvr: Nvr,
     client.list_bookmarks.side_effect = None
     client.list_bookmarks.return_value = [Bookmark(100, 6, "Animal", "Frigate alert [frigate d1]", T, T + 30)]
     await nvr.check()
-    await nvr.until(lambda: nvr.stats()["deferred"] == 0 and client.edit_bookmark.await_count == 2)
+    # Three tries of the same id while SS was down, then the replay.
+    await nvr.until(lambda: nvr.stats()["deferred"] == 0 and client.edit_bookmark.await_count == 4)
     await hass.async_block_till_done()
     assert len(events) == 1
 
@@ -1377,6 +1400,37 @@ async def test_bookmark_deleted_in_ss_is_made_again(nvr: Nvr, client: MagicMock,
     await nvr.until(lambda: nvr.stats()["bookmarked"] == 2)
     assert client.edit_bookmark.await_count == 1
     assert client.create_bookmark.await_args.args[1] == "Person, Car, Animal"
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        SSConnectionError("x", "Edit", None),
+        SSAuthError("SYNO.API.Auth", "login", 400),
+        SSError("SYNO.SurveillanceStation.ThirdParty.Bookmark", "Edit", 102),  # the SS package stopped
+    ],
+    ids=["unreachable", "credentials", "not_now"],
+)
+async def test_bookmark_edit_not_reaching_ss_keeps_its_id(nvr: Nvr, client: MagicMock, no_retry_wait, err: SSError) -> None:
+    """SS unreachable, credentials refused or "not now" while editing a bookmark: the retry edits
+    the same id, rather than fetch the bookmark list again to look for it (and make a second)."""
+    nvr.send(review("new"))
+    await nvr.until(lambda: nvr.stats()["bookmarked"] == 1)
+    edit = client.edit_bookmark.side_effect
+    failed = []
+
+    async def once(*args):
+        if not failed:
+            failed.append(args)
+            raise err
+        return await edit(*args)
+
+    client.edit_bookmark.side_effect = once
+    listed = client.list_bookmarks.await_count
+    nvr.send(review("update", objects=("person", "car")))
+    await nvr.until(lambda: client.edit_bookmark.await_count == 2 or nvr.stats()["bookmarked"] == 2)
+    assert [c.args[0] for c in client.edit_bookmark.await_args_list] == [100, 100]
+    assert (nvr.stats()["retried"], nvr.stats()["bookmarked"], client.list_bookmarks.await_count) == (1, 1, listed)
 
 
 async def test_bookmark_edit_answered_oddly_is_looked_for_again(nvr: Nvr, client: MagicMock, no_retry_wait) -> None:

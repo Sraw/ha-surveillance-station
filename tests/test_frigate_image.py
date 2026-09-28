@@ -407,6 +407,32 @@ async def test_thumbnails_of_reviews_that_are_over_are_kept(
         assert await (await http.get(url)).read() == JPG and len(aioclient_mock.mock_calls) == asked + 3
 
 
+async def test_kept_thumbnails_wait_for_nothing(
+    bridge: FrigateBridge, hass_client_no_auth, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A kept thumbnail (its review over) asks nothing of Frigate: served while Frigate is being
+    left alone for a minute, and ahead of lookups holding every permit."""
+    url = bridge.bookmark_thumbnail(Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20))
+    http = await hass_client_no_auth()
+    aioclient_mock.get(f"{F}/api/review/{RID}", json={"id": RID, "end_time": T + 20, "data": {"detections": ["o1"]}})
+    aioclient_mock.get(f"{F}/api/events/o1", json=event("o1", "person", 0.9))
+    aioclient_mock.get(f"{F}/api/events/o1/snapshot.jpg", content=JPG)
+    assert await (await http.get(url)).read() == JPG
+    asked = len(aioclient_mock.mock_calls)
+    bridge.thumbs_failed()  # another thumbnail failed
+    resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 200 and await resp.read() == JPG and not bridge.thumbs_from_frigate()
+    bridge._thumbs_down_until = float("-inf")
+    for _ in range(frigate_mod.FRIGATE_THUMB_PARALLEL):
+        await bridge.thumb_sem.acquire()  # slow lookups of other thumbnails
+    async with asyncio.timeout(5):
+        resp = await http.get(url, allow_redirects=False)
+    assert resp.status == 200 and await resp.read() == JPG and len(aioclient_mock.mock_calls) == asked
+    # One that waited for a permit while another request of it kept it: kept, not asked again.
+    assert await bridge.bookmark_image(RID, frigate_mod.FRIGATE_THUMB_HEIGHT) == (JPG, "image/jpeg")
+    assert len(aioclient_mock.mock_calls) == asked and bridge.cached_thumbnail(RID) is None  # another size: not kept
+
+
 async def test_thumbnails_queued(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth) -> None:
     """A page's thumbnails wait their turn outside the budget: a queue isn't Frigate being slow."""
     mine = Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20)

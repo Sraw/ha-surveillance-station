@@ -75,13 +75,17 @@ def test_a_later_message_replaces_the_earlier_wherever_it_waits() -> None:
 
 
 def test_news_keeps_when_it_came() -> None:
-    """A message replacing one that had news (it waited for SS) is as old as that one; one that
-    replaces a message without news is the news itself."""
+    """A message replacing one that had news (it waited for SS) is as old as that one, yet came
+    when it came (a bookmark still going on reaches that far); one that replaces a message without
+    news is the news itself."""
     q = queue()
     put(q, "a", "update")
-    assert put(q, "a", "update", at=T + 300).received_at == T
+    merged = put(q, "a", "update", at=T + 300)
+    assert (merged.received_at, merged.came_at) == (T, T + 300)
+    assert put(q, "a", "update", at=T + 600).came_at == T + 600
     put(q, "b", "update", objects=("bicycle",))
-    assert put(q, "b", "update", at=T + 300).received_at == T + 300
+    merged = put(q, "b", "update", at=T + 300)
+    assert (merged.received_at, merged.came_at, merged.last_received_at) == (T + 300, T + 300, None)
 
 
 def test_bounded() -> None:
@@ -245,3 +249,24 @@ def test_stored_as_0_18_stored_it() -> None:
     for unreadable in ([["a"]], [["a", {**review("new"), "_failed_at": "x"}]]):
         with pytest.raises((ValueError, TypeError)):
             queue().load(unreadable, T)
+
+
+def test_merged_keeps_when_its_latest_came_across_a_restart() -> None:
+    """A merged message is kept with both times; one stored by 0.18 (only the first) came then."""
+    q = queue()
+    put(q, "a")
+    fail(q)
+    put(q, "a", "update", at=T + 300)
+    fail(q)
+    stored = q.stored()
+    assert stored[0][1]["_received_at"] == T and stored[0][1]["_last_received_at"] == T + 300
+    again = queue()
+    again.load(stored, T + 400)
+    assert again.stored() == stored
+    item = again.waiting()["a"]
+    assert (item.received_at, item.came_at) == (T, T + 300)
+
+    old = queue()
+    old.load([["b", {"_received_at": T, **review("update", rid="b")}]], T + 400)
+    item = old.waiting()["b"]
+    assert (item.received_at, item.came_at) == (T, T)

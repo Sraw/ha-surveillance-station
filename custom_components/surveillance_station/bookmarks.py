@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 import heapq
 from itertools import islice
 import time
@@ -119,11 +119,16 @@ class BookmarkCache:
     per request queued behind it.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, track: Callable[[str, Exception | None], None]) -> None:
         self.hass = hass
+        self._track = track
         # entry_id -> (fetched at, every bookmark newest first (indexed), or the error).
         self._lists: dict[str, tuple[float, BookmarkIndex | SSError]] = {}
-        self._jobs: SharedJobs[str, BookmarkIndex] = SharedJobs(hass, "bookmarks")
+        # entry_id -> how often forget() was called: a fetch started before
+        # HA changed a bookmark may not have seen the change, so it neither
+        # answers later requests nor stores its list.
+        self._generations: dict[str, int] = {}
+        self._jobs: SharedJobs[tuple[str, int], BookmarkIndex] = SharedJobs(hass, "bookmarks")
 
     async def index(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
         if (hit := self._lists.get(entry_id)) is not None:
@@ -133,23 +138,35 @@ class BookmarkCache:
                     raise found.with_traceback(None)
             elif _monotonic() - at < BOOKMARK_CACHE_SECONDS:
                 return found
-        return await self._jobs.run(entry_id, lambda: self._load(entry_id, client), "surveillance_station bookmarks")
+        generation = self._generations.get(entry_id, 0)
+        return await self._jobs.run(
+            (entry_id, generation),
+            lambda: self._load(entry_id, generation, client),
+            "surveillance_station bookmarks",
+        )
 
-    async def _load(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
+    async def _load(self, entry_id: str, generation: int, client: SurveillanceStationClient) -> BookmarkIndex:
         try:
             cameras = await client.cameras()
             found = await client.list_bookmarks([c.id for c in cameras])
-            # Tens of thousands of bookmarks take a while: not on the loop.
-            index = await self.hass.async_add_executor_job(BookmarkIndex, found)
         except SSError as err:
-            self._lists[entry_id] = (_monotonic(), err)
+            self._track(entry_id, err)
+            self._store(entry_id, generation, err)
             raise
-        self._lists[entry_id] = (_monotonic(), index)
+        self._track(entry_id, None)
+        # Tens of thousands of bookmarks take a while: not on the loop.
+        index = await self.hass.async_add_executor_job(BookmarkIndex, found)
+        self._store(entry_id, generation, index)
         return index
+
+    def _store(self, entry_id: str, generation: int, found: BookmarkIndex | SSError) -> None:
+        if self._generations.get(entry_id, 0) == generation:
+            self._lists[entry_id] = (_monotonic(), found)
 
     def forget(self, entry_id: str) -> None:
         self._lists.pop(entry_id, None)
+        self._generations[entry_id] = self._generations.get(entry_id, 0) + 1
 
     def drop_entry(self, entry_id: str) -> None:
-        self._lists.pop(entry_id, None)
-        self._jobs.drop(lambda key: key == entry_id)
+        self.forget(entry_id)
+        self._jobs.drop(lambda key: key[0] == entry_id)

@@ -3,6 +3,7 @@
 import asyncio
 from http import HTTPStatus
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import pytest
@@ -10,8 +11,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
 from synology_ss_playback import SSConnectionError
 
+from custom_components.surveillance_station import manager as manager_mod
+from custom_components.surveillance_station.const import DOMAIN, SS_ISSUE_AFTER_SECONDS
 from custom_components.surveillance_station.manager import DATA_MANAGER
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
+
+from .conftest import T0
 
 
 class FakeUpstream:
@@ -236,6 +242,76 @@ async def test_bad_token_and_unreachable(
         await client.ws_connect(url)
     assert err.value.status == HTTPStatus.BAD_GATEWAY
     assert hass.data[DATA_MANAGER].stats()["live_streams"] == 0  # the slot is given back
+
+
+async def test_retrying_live_does_not_hide_an_outage(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A wall tablet retrying live through a NAS reboot: its tokens (made without SS) and a
+    bookmark list from memory aren't SS answering, so the outage becomes a Repairs issue."""
+    registry = ir.async_get(hass)
+    issue_id = f"ss_unreachable_{setup_integration.entry_id}"
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/bookmarks", "start": T0, "end": T0 + 60})
+    assert (await ws.receive_json())["success"]  # kept for a minute from now
+    mock_client.open_live = AsyncMock(side_effect=SSConnectionError("ss_webstream_task", "connect", None))
+    client = await hass_client_no_auth()
+    now = [1000.0]
+    with patch.object(manager_mod, "_monotonic", lambda: now[0]):
+        for _ in range(SS_ISSUE_AFTER_SECONDS // 60 + 1):  # the card retries once a minute
+            await ws.send_json_auto_id({"type": "surveillance_station/live", "camera_id": 10})
+            url = (await ws.receive_json())["result"]["url"]
+            with pytest.raises(aiohttp.WSServerHandshakeError):
+                await client.ws_connect(url)
+            await ws.send_json_auto_id({"type": "surveillance_station/bookmarks", "start": T0, "end": T0 + 60})
+            assert (await ws.receive_json())["success"]
+            now[0] += 60
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+    assert mock_client.list_bookmarks.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        {"type": "surveillance_station/cameras"},
+        {"type": "surveillance_station/recordings", "camera_id": 6, "start": T0, "end": T0 + 60},
+        {"type": "surveillance_station/bookmarks", "start": T0, "end": T0 + 60},
+        {"type": "surveillance_station/bookmark_page"},
+        {"type": "surveillance_station/vod", "camera_id": 6, "start": T0, "end": T0 + 60},
+        {"type": "surveillance_station/timelapse_days"},
+    ],
+)
+async def test_any_answer_from_ss_ends_an_outage(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    command: dict,
+) -> None:
+    """Every command that asks SS reports its answer: the Repairs issue goes at once."""
+    registry = ir.async_get(hass)
+    issue_id = f"ss_unreachable_{setup_integration.entry_id}"
+    mock_client.timelapse_recordings = AsyncMock(return_value=[])
+    mock_client.timezone = AsyncMock(return_value=ZoneInfo("UTC"))
+    manager = hass.data[DATA_MANAGER]
+    down = SSConnectionError("ss_webstream_task", "connect", None)
+    now = [1000.0]
+    with patch.object(manager_mod, "_monotonic", lambda: now[0]):
+        manager.track(setup_integration.entry_id, down)
+        now[0] += SS_ISSUE_AFTER_SECONDS
+        manager.track(setup_integration.entry_id, down)
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/live", "camera_id": 10})
+    assert (await ws.receive_json())["success"]
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None  # SS wasn't asked
+    await ws.send_json_auto_id(command)
+    assert (await ws.receive_json())["success"]
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 async def test_unload_closes_streams(

@@ -43,7 +43,7 @@ from .bookmarks import BookmarkCache, BookmarkIndex
 from .const import (
     BOOKMARK_FRAMES_MAX,
     DOMAIN,
-    FRIGATE_ISSUE_AFTER_SECONDS,
+    SS_ISSUE_AFTER_SECONDS,
     THUMBNAIL_WIDTH,
     TIMELAPSE_LIST_SECONDS,
     VOD_MAX_SESSIONS,
@@ -76,7 +76,7 @@ class VodManager:
         self.segments = SegmentCache(hass, self.client, self.track)
         self.thumbnails = ThumbnailService(hass, self.client, self.track)
         self.signer = UrlSigner(hass)
-        self.bookmark_cache = BookmarkCache(hass)
+        self.bookmark_cache = BookmarkCache(hass, self.track)
         self.live_tokens = LiveTokens()
         self._hardware: bool | None = None
         self._hardware_task: asyncio.Task | None = None
@@ -138,14 +138,16 @@ class VodManager:
     def track(self, entry_id: str, err: Exception | None) -> None:
         """Log once when Surveillance Station goes away, and once when it's back.
 
-        Still unreachable FRIGATE_ISSUE_AFTER_SECONDS later (asked again then,
-        not just once), it's a Repairs issue until it answers.
+        Still unreachable SS_ISSUE_AFTER_SECONDS later (asked again then,
+        not just once), it's a Repairs issue until it answers. None only for
+        what SS itself just answered: a cached answer, or a command that never
+        asks SS (a live token), would keep an outage from ever lasting.
         """
         if isinstance(err, SSConnectionError):
             if (since := self._unreachable.get(entry_id)) is None:
                 self._unreachable[entry_id] = _monotonic()
                 _LOGGER.warning("Surveillance Station is unreachable: %s", err)
-            elif _monotonic() - since >= FRIGATE_ISSUE_AFTER_SECONDS and entry_id not in self._unreachable_issues:
+            elif _monotonic() - since >= SS_ISSUE_AFTER_SECONDS and entry_id not in self._unreachable_issues:
                 entry = self.hass.config_entries.async_get_entry(entry_id)
                 self._unreachable_issues.add(entry_id)
                 ir.async_create_issue(

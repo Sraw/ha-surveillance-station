@@ -607,8 +607,9 @@ class FrigateBridge:
         name = bookmark_name(review.objects)
         comment = bookmark_comment(review.id, review.severity)
         # Still going on: up to now; a message replayed long after it came (SS
-        # was down), whose end never came, up to when it came, not the replay.
-        until = time.time() if self._fresh(item) else item.received_at
+        # was down), whose end never came, up to when it came, not the replay
+        # (received_at may be an earlier message's: how old the news is).
+        until = time.time() if self._fresh(item) else item.came_at
         end = int(review.ended) + 1 if review.ended else max(review.start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(until))
         if tracked is None and (item.maybe_made or not (review.kind == "new" or item.seen_new)):
             # Created before a restart, or by a try that failed after SS did
@@ -695,11 +696,13 @@ class FrigateBridge:
         elif (name, comment) != (tracked.name, tracked.comment) or (review.ended and end != tracked.end):
             try:
                 await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
-            except SSError:
-                # Deleted in SS meanwhile, or no answer: the next try looks for
-                # it afresh (and makes it again if it's gone) rather than
-                # editing an id that may be dead at every message.
-                self._tracked.pop(review.id, None)
+            except SSError as err:
+                # Deleted in SS meanwhile, or an answer without the bookmark:
+                # the next try looks for it afresh (and makes it again if it's
+                # gone) rather than editing an id that may be dead at every
+                # message. SS not reached, or "not now": the id still holds.
+                if not _not_now(err):
+                    self._tracked.pop(review.id, None)
                 raise
             self._ok()
             tracked.name, tracked.comment, tracked.end = name, comment, end
@@ -999,13 +1002,20 @@ class FrigateBridge:
                 mine.append(o)
         return self.ranked(mine)
 
-    async def bookmark_image(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
-        """A Frigate bookmark's image: its review's snapshot, else (the review gone) that of
-        the foremost object Frigate still has from the bookmark's camera and time."""
+    def cached_thumbnail(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
+        """bookmark_image's answer kept for a review that is over, if it is (no request to Frigate)."""
         key = (review_id, height)
         if (cached := self._thumb_cache.get(key)) is not None:
             self._thumb_cache.move_to_end(key)
+        return cached
+
+    async def bookmark_image(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
+        """A Frigate bookmark's image: its review's snapshot, else (the review gone) that of
+        the foremost object Frigate still has from the bookmark's camera and time."""
+        # Kept meanwhile by another request for it (both waited for a permit).
+        if (cached := self.cached_thumbnail(review_id, height)) is not None:
             return cached
+        key = (review_id, height)
         found, over = await self._review_snapshot(review_id, height)
         if found is None:
             found = await self._bookmark_snapshot(review_id, height)
@@ -1331,8 +1341,9 @@ class FrigateThumbnailView(HomeAssistantView):
         if not self.manager.check_thumbnail(request.path, request.query.get("exp"), request.query.get("sig")):
             raise web.HTTPNotFound()
         bridge = self.hass.data.get(DATA_FRIGATE, {}).get(entry_id)
-        if bridge is not None and bridge.thumbs_from_frigate():
-            found = None
+        # Kept (its review over): asks nothing of Frigate, so neither waits out its backoff nor queues.
+        found = None if bridge is None else bridge.cached_thumbnail(review_id, FRIGATE_THUMB_HEIGHT)
+        if found is None and bridge is not None and bridge.thumbs_from_frigate():
             # Queued (a page asks for 30) outside the budget: waiting isn't Frigate being slow.
             async with bridge.thumb_sem:
                 try:
@@ -1344,9 +1355,9 @@ class FrigateThumbnailView(HomeAssistantView):
                     bridge.thumbs_failed()
                 except SSError as err:  # SS's camera list (to match Frigate's cameras): not Frigate's fault
                     _LOGGER.debug("Frigate thumbnail for %s: %r", review_id, err)
-            if found is not None:
-                body, content_type = found
-                return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=3600"})
+        if found is not None:
+            body, content_type = found
+            return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=3600"})
         raise web.HTTPFound(self.manager.sign_thumbnail(entry_id, int(camera_id), int(frame)))
 
 
@@ -1363,3 +1374,9 @@ def _transient(err: SSError) -> bool:
     only come again."""
     code = err.code
     return isinstance(err, (SSConnectionError, SSAuthError)) or code in _TRANSIENT_CODES
+
+
+def _not_now(err: SSError) -> bool:
+    """An error that says nothing of the bookmark asked for: SS unreachable, credentials refused,
+    or one of DSM's "not now" codes (SS's own code, or an answer without one, may mean it is gone)."""
+    return isinstance(err, (SSConnectionError, SSAuthError)) or (err.code is not None and _transient(err))

@@ -54,8 +54,11 @@ _LOGGER = logging.getLogger(__name__)
 SESSION_ERRORS = {105, 106, 107, 119}
 # "No permission": also what a stale session can get, so it is retried once
 # like the others; returned again after a fresh login, it is the account's
-# missing permission, and that call isn't retried with a login again.
+# missing permission, and that call isn't retried with a login again for
+# PERMISSION_RETRY_SECONDS (whatever session is current: another call's
+# retry may have replaced it), then tried once more (it may have been granted).
 PERMISSION_ERROR = 105
+PERMISSION_RETRY_SECONDS = 600
 # Not 407 ("IP blocked"): DSM's auto-block expires, the password is fine;
 # but no login is tried for BLOCKED_SECONDS after it.
 AUTH_FAILED_ERRORS = {400, 401, 402, 403, 404, 406, 408, 409, 410}
@@ -86,9 +89,10 @@ DOWNLOAD_ERROR_MAX = 64 * 1024  # of a JSON error reply read
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
 RECORDING_LOOKBACK_SECONDS = 4 * 3600
-# A camera's recording list is shared this long by identical lookups (the card
-# polls each camera every 5 s, per viewer, and thumbnails ask per frame):
-# short next to the ~10 s steps in which SS moves a live recording's end.
+# A camera's recording list is shared this long by lookups of the same
+# (camera, start, end): short next to the ~10 s steps in which SS moves a live
+# recording's end. Windows that slide with the time (the card's polls) seldom
+# repeat, so it mostly merges the same lookup made by several callers at once.
 RECORDINGS_CACHE_SECONDS = 2
 RECORDINGS_CACHE_ENTRIES = 64  # lists kept at most (the oldest go first)
 # A freshly opened live socket that sends nothing at all (SS wedged) within
@@ -255,25 +259,36 @@ class SurveillanceStationClient:
         self._tz: ZoneInfo | None = None
         self._live_relogin_at = -LIVE_RELOGIN_SECONDS
         self._closed = False
-        # (api, method) -> the session that got PERMISSION_ERROR for it right
-        # after logging in again.
-        self._denied: dict[tuple[str, str], str] = {}
+        # (api, method) -> when it got PERMISSION_ERROR right after logging in
+        # again.
+        self._denied: dict[tuple[str, str], float] = {}
+        # Replaced sessions being logged out (see login()).
+        self._logouts: set[asyncio.Task[None]] = set()
         self._recording_lists: OrderedDict[tuple[int, float, float], tuple[float, list[RecordingInfo]]] = OrderedDict()
         self._recording_jobs: dict[tuple[int, float, float], asyncio.Future[list[RecordingInfo]]] = {}
         # Called when a re-login is refused at runtime (password changed).
         self.on_auth_failed: Callable[[], None] | None = None
 
-    async def login(self, stale_sid: str | None = None) -> None:
+    async def login(self, stale_sid: str | None = None, stale_alive: bool = True) -> None:
         """Get a session unless another caller already replaced ``stale_sid``.
 
         Concurrent callers that all saw the same (missing or expired) sid end
-        up with one login between them. The replaced session is logged out:
-        it may still be valid (a camera SS won't stream, a 105), and DSM
-        keeps every session open until it times out.
+        up with one login between them. The replaced session is logged out
+        unless ``stale_alive`` is false (SS said it is gone): it may still be
+        valid (a 105), and DSM keeps every session open until it times out.
+        That logout runs in the background: the retry doesn't wait for it, and
+        a caller going away doesn't cut it off (close() waits for it).
         """
         replaced = await self._login(stale_sid)
-        if replaced is not None:
-            await self._end_session(replaced)
+        if replaced is not None and stale_alive:
+            task = asyncio.ensure_future(self._end_session(replaced))
+            self._logouts.add(task)
+            task.add_done_callback(self._logged_out)
+
+    def _logged_out(self, task: asyncio.Task[None]) -> None:
+        self._logouts.discard(task)
+        if not task.cancelled() and (err := task.exception()) is not None:
+            _LOGGER.debug("Logging out a replaced session failed: %r", err)
 
     async def _login(self, stale_sid: str | None) -> str | None:
         """login(); returns the session it replaced, if any."""
@@ -338,6 +353,9 @@ class SurveillanceStationClient:
         """Log out for good: a later call raises SSError instead of logging in again."""
         self._closed = True
         await self.logout()
+        if self._logouts:
+            # Before an unload (or HA stopping) cuts them off.
+            await asyncio.wait(set(self._logouts))
 
     async def _end_session(self, sid: str) -> None:
         try:
@@ -477,11 +495,13 @@ class SurveillanceStationClient:
                 return await attempt(sid)
             except _Refused as refused:
                 code, detail = refused.code, refused.detail
-            if not retry and self._is_session_error(code, api, method, sid):
+            if not retry and self._is_session_error(code, api, method):
                 _LOGGER.debug("Session error %s on %s.%s, logging in again", code, api, method)
-                await self.login(stale_sid=sid)
+                # 106/107/119: the session is gone already, nothing to log out.
+                await self.login(stale_sid=sid, stale_alive=code == PERMISSION_ERROR)
                 continue
-            self._note_refusal(code, api, method, sid)
+            if retry:
+                self._note_refusal(code, api, method)
             raise SSError(api, method, code, detail)
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -501,18 +521,20 @@ class SurveillanceStationClient:
             if not page or len(items) >= total:
                 return items
 
-    def _is_session_error(self, code: Any, api: str, method: str, sid: str | None) -> bool:
+    def _is_session_error(self, code: Any, api: str, method: str) -> bool:
         """Whether SS's error code for this call means: log in again and retry."""
         if code == PERMISSION_ERROR:
-            return self._denied.get((api, method)) != sid
+            denied = self._denied.get((api, method))
+            return denied is None or _monotonic() - denied >= PERMISSION_RETRY_SECONDS
         return code in SESSION_ERRORS
 
-    def _note_refusal(self, code: Any, api: str, method: str, sid: str | None) -> None:
-        if code == PERMISSION_ERROR and sid is not None:
+    def _note_refusal(self, code: Any, api: str, method: str) -> None:
+        if code == PERMISSION_ERROR:
             # Refused again after a new login: the account lacks the
             # permission, which another login won't give (otherwise every
-            # Frigate review would log in again).
-            self._denied[(api, method)] = sid
+            # Frigate review would log in again). Not noted for the refusals
+            # in between, so the window runs out while the call keeps failing.
+            self._denied[(api, method)] = _monotonic()
 
     async def missing_apis(self) -> list[str]:
         """The Web APIs this client needs that the NAS lacks, or has only in older versions (no login needed)."""

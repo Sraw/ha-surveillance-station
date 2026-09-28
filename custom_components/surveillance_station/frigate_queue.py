@@ -14,7 +14,11 @@ of three queues:
   fails meanwhile.
 
 The message being handled (current) is apart: a newer message of its review
-may wait behind it. Each queue holds at most FRIGATE_QUEUE_MAX reviews.
+may wait behind it. Putting a message in pending, or keeping one in deferred,
+doesn't grow that queue past FRIGATE_QUEUE_MAX reviews (its oldest moves to
+deferred, or is given up on); a whole queue moved between replay and deferred
+(SS failing mid-replay, then answering) moves as it is, so those two can hold
+more, until replayed or given up on after a day.
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ _SEEN_NEW = "_seen_new"
 _MAYBE_MADE = "_maybe_made"
 _FAILED_AT = "_failed_at"
 _RECEIVED_AT = "_received_at"
+# Not in 0.18's format (0.18 ignores it); stored without it: received_at.
+_LAST_RECEIVED_AT = "_last_received_at"
 
 
 @dataclass
@@ -48,6 +54,13 @@ class Queued:
     seen_new: bool = False  # it replaced its review's "new"
     maybe_made: bool = False  # a try of it failed: its bookmark may exist all the same
     failed_at: float | None = None  # when it first failed (epoch), for giving up after a day
+    # When it came itself, once received_at is an earlier message's (None: received_at).
+    last_received_at: float | None = None
+
+    @property
+    def came_at(self) -> float | None:
+        """When this message came: what a replayed review still going on is bookmarked up to."""
+        return self.received_at if self.last_received_at is None else self.last_received_at
 
     def follows(self, earlier: Queued, news: bool) -> None:
         """It replaces earlier, a message of its review that waited (news: that one had an
@@ -59,11 +72,12 @@ class Queued:
         # News since the earlier one came (it waited for SS): as old as that,
         # or a replay would seem fresh.
         if earlier.received_at and news and self.received_at is not None:
+            self.last_received_at = self.came_at
             self.received_at = min(self.received_at, earlier.received_at)
 
     def stored(self) -> dict[str, Any]:
         flags: dict[str, Any] = {_SEEN_NEW: self.seen_new or None, _MAYBE_MADE: self.maybe_made or None}
-        flags |= {_FAILED_AT: self.failed_at, _RECEIVED_AT: self.received_at}
+        flags |= {_FAILED_AT: self.failed_at, _RECEIVED_AT: self.received_at, _LAST_RECEIVED_AT: self.last_received_at}
         return {**{k: v for k, v in flags.items() if v is not None}, **self.message}
 
     @classmethod
@@ -71,12 +85,14 @@ class Queued:
         """Kept by a delayed save, it may have been bookmarked after it (HA died before the
         next), so it is looked for first. Kept undated (before 0.18): dated now."""
         received_at = stored.get(_RECEIVED_AT)
+        last_received_at = stored.get(_LAST_RECEIVED_AT)
         return cls(
             message={k: v for k, v in stored.items() if not k.startswith("_")},
             received_at=None if received_at is None else float(received_at),
             seen_new=bool(stored.get(_SEEN_NEW)),
             maybe_made=True,
             failed_at=float(stored.get(_FAILED_AT) or now),
+            last_received_at=None if last_received_at is None else float(last_received_at),
         )
 
 

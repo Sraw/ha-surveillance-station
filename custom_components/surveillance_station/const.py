@@ -175,6 +175,9 @@ FRIGATE_DEFERRED_MAX_AGE = 86400  # a review SS didn't take for a day is given u
 # recovery); checked every FRIGATE_HEALTH_INTERVAL.
 FRIGATE_ISSUE_AFTER_SECONDS = 600
 FRIGATE_HEALTH_INTERVAL = 60
+# Surveillance Station unreachable this long: a Repairs issue (its text in
+# strings.json says 10 minutes).
+SS_ISSUE_AFTER_SECONDS = 600
 CONF_FRIGATE_QUIET = "frigate_quiet_minutes"
 CONF_FRIGATE_QUIET_KINDS = "frigate_quiet_kinds"
 # A camera's review with only these kinds, all seen there within this many

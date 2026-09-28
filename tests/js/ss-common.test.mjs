@@ -4,7 +4,8 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
-  audioCodecOf, codecOf, esc, findBox, kindTest, labelAttrs, prefsFor, readStreamMsg, setVeil, sliderKey, ticksOf, veilHtml,
+  audioCodecOf, codecOf, esc, findBox, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
+  sliderKey, ticksOf, veilHtml,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -200,6 +201,31 @@ describe("ticksOf", () => {
   });
 });
 
+describe("liveViewEnd", () => {
+  // An hour over 997 px: a pixel is 3.61 s.
+  const span = 3600;
+  const px = 997;
+  const step = span / px;
+  const now = 1_790_000_000.3;
+  const times = Array.from({ length: 400 }, (_, i) => now + i * 0.1); // 40 s, about 11 pixels
+  const nowPixel = (t, end) => Math.round(((t - (end - span)) / span) * px);
+
+  test("5 % of the span past now, within a pixel", () => {
+    for (const t of times) assert.ok(Math.abs(liveViewEnd(t, span, px) - (t + span * 0.05)) <= step);
+  });
+
+  test("the same view until now has moved a pixel, then one pixel on", () => {
+    // A Set: repeated ends must be the very same number, as the timeline's memo compares them.
+    const ends = [...new Set(times.map((t) => liveViewEnd(t, span, px)))];
+    assert.ok(ends.length >= 11 && ends.length <= 12, `${ends.length} views`);
+    for (let i = 1; i < ends.length; i++) assert.ok(Math.abs(ends[i] - ends[i - 1] - step) < 1e-6);
+  });
+
+  test("now stays on the same pixel of the view", () => {
+    for (const t of times) assert.equal(nowPixel(t, liveViewEnd(t, span, px)), px - Math.round(px * 0.05));
+  });
+});
+
 // ---- controls and preferences ---------------------------------------------------------
 
 describe("sliderKey", () => {
@@ -223,6 +249,43 @@ describe("sliderKey", () => {
 
   test("other keys: null (left to the page)", () => {
     for (const key of ["Tab", "Enter", " ", "a"]) assert.equal(sliderKey(key, 1500, range), null);
+  });
+});
+
+describe("setSliderValue", () => {
+  const fakeSlider = () => ({
+    attrs: {},
+    writes: 0,
+    getAttribute(k) {
+      return this.attrs[k] ?? null;
+    },
+    setAttribute(k, v) {
+      this.writes++;
+      this.attrs[k] = v;
+    },
+  });
+
+  test("the value within the range, rounded, and what it says", () => {
+    const s = fakeSlider();
+    setSliderValue(s, 1500.4, "12:25:00", 1000, 2000);
+    assert.deepEqual(s.attrs, { "aria-valuenow": "1500", "aria-valuetext": "12:25:00" });
+    setSliderValue(s, 2500, "12:41:40", 1000, 2000);
+    assert.equal(s.attrs["aria-valuenow"], "2000");
+  });
+
+  test("the same text after the range moved (a pan while paused): the value moves into it", () => {
+    const s = fakeSlider();
+    setSliderValue(s, 1500, "12:25:00", 1000, 2000);
+    setSliderValue(s, 1500, "12:25:00", 1800, 2800);
+    assert.equal(s.attrs["aria-valuenow"], "1800");
+  });
+
+  test("nothing changed: nothing written", () => {
+    const s = fakeSlider();
+    setSliderValue(s, 1500, "12:25:00", 1000, 2000);
+    const writes = s.writes;
+    setSliderValue(s, 1500.2, "12:25:00", 900, 2100);
+    assert.equal(s.writes, writes);
   });
 });
 

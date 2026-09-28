@@ -16,9 +16,9 @@ from synology_ss_playback import Bookmark, RecordingInfo, Segment, SSConnectionE
 from custom_components.surveillance_station import bookmarks, manager as manager_mod, segments, thumbnails, tokens
 from custom_components.surveillance_station.const import (
     DOMAIN,
-    FRIGATE_ISSUE_AFTER_SECONDS,
     LIVE_TOKEN_TTL_SECONDS,
     MAX_PARALLEL_FETCHES,
+    SS_ISSUE_AFTER_SECONDS,
     THUMBNAIL_ENTRY_BYTES,
     THUMBNAIL_MISS_SECONDS,
 )
@@ -267,6 +267,60 @@ async def test_bookmarks_kept_for_a_minute(
     assert mock_client.list_bookmarks.await_count == 2
 
 
+def _listed_before_and_after_a_change(mock_client) -> asyncio.Event:
+    """SS's list without, then with, a bookmark HA makes meanwhile; the first
+    answer is held until the returned gate opens."""
+    gate = asyncio.Event()
+    before = [Bookmark(id=1, camera_id=6, name="person", comment="", start=T0, end=T0 + 10)]
+    after = [Bookmark(id=2, camera_id=6, name="car", comment="", start=T0 + 60, end=T0 + 70), *before]
+    answers = [before, after]
+
+    async def listing(ids):
+        answer = answers.pop(0)
+        if answer is before:
+            await gate.wait()
+        return answer
+
+    mock_client.list_bookmarks.side_effect = listing
+    return gate
+
+
+async def test_a_fetch_older_than_a_change_is_not_kept(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
+) -> None:
+    """HA made a bookmark while the list was being fetched: that list isn't kept for the next minute."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    gate = _listed_before_and_after_a_change(mock_client)
+    first = asyncio.create_task(manager.bookmarks(entry_id, mock_client))
+    await asyncio.sleep(0.01)
+    manager.forget_bookmarks(entry_id)
+    gate.set()
+    assert [b.id for b in await first] == [1]  # asked for before the change
+    assert [b.id for b in await manager.bookmarks(entry_id, mock_client)] == [2, 1]
+    assert mock_client.list_bookmarks.await_count == 2
+
+
+async def test_a_request_after_a_change_does_not_join_an_older_fetch(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
+) -> None:
+    """Asked after HA made a bookmark: a fetch of its own, whose list the older one doesn't overwrite."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    gate = _listed_before_and_after_a_change(mock_client)
+    first = asyncio.create_task(manager.bookmarks(entry_id, mock_client))
+    await asyncio.sleep(0.01)
+    manager.forget_bookmarks(entry_id)
+    second = asyncio.create_task(manager.bookmarks(entry_id, mock_client))
+    await asyncio.sleep(0.01)
+    assert mock_client.list_bookmarks.await_count == 2
+    assert [b.id for b in await second] == [2, 1]
+    gate.set()
+    assert [b.id for b in await first] == [1]
+    assert [b.id for b in await manager.bookmarks(entry_id, mock_client)] == [2, 1]
+    assert mock_client.list_bookmarks.await_count == 2
+
+
 async def test_bookmarks_indexed_off_the_loop(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
 ) -> None:
@@ -293,7 +347,7 @@ async def test_lasting_outage_is_a_repairs_issue(hass: HomeAssistant, setup_inte
     now = [1000.0]
     with patch.object(manager_mod, "_monotonic", lambda: now[0]):
         manager.track(entry_id, down)
-        now[0] += FRIGATE_ISSUE_AFTER_SECONDS - 1
+        now[0] += SS_ISSUE_AFTER_SECONDS - 1
         manager.track(entry_id, down)
         assert registry.async_get_issue(DOMAIN, issue_id) is None
         now[0] += 1
@@ -304,7 +358,7 @@ async def test_lasting_outage_is_a_repairs_issue(hass: HomeAssistant, setup_inte
         manager.track(entry_id, None)
         assert registry.async_get_issue(DOMAIN, issue_id) is None
         manager.track(entry_id, down)
-        now[0] += FRIGATE_ISSUE_AFTER_SECONDS
+        now[0] += SS_ISSUE_AFTER_SECONDS
         manager.track(entry_id, down)
         assert registry.async_get_issue(DOMAIN, issue_id) is not None
     assert await hass.config_entries.async_unload(entry_id)

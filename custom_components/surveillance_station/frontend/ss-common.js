@@ -1,7 +1,7 @@
 /*
  * What the two cards share: MSE and the MP4 init-segment parsers, the SS
- * stream message parser, the timeline's ticks, the veil over the video, per-viewer
- * preferences, and how controls are labelled.
+ * stream message parser, the timeline's ticks and live view, the veil over the
+ * video, per-viewer preferences, and how controls are labelled.
  *
  * Each card loads this with its own version query (see the import at the top
  * of each), as the timeline card loads the time-lapse card, so a release never
@@ -75,6 +75,18 @@ export function sliderKey(key, value, { min, max, step, page = step * 10 }) {
     End: max,
   }[key];
   return to === undefined ? null : Math.min(Math.max(to, min), max);
+}
+
+/**
+ * A slider's value, within [min, max], and what it says. The text alone
+ * doesn't tell whether the value is current: after a pan or zoom while paused
+ * it is the same, but the old value can be outside the new range.
+ */
+export function setSliderValue(el, value, text, min, max) {
+  const now = String(Math.round(Math.min(Math.max(value, min), max)));
+  if (el.getAttribute("aria-valuenow") === now && el.getAttribute("aria-valuetext") === text) return;
+  el.setAttribute("aria-valuenow", now);
+  el.setAttribute("aria-valuetext", text);
 }
 
 /**
@@ -155,6 +167,17 @@ export function ticksOf(start, end, step) {
   while (d.getTime() / 1000 < start) next();
   for (; d.getTime() / 1000 <= end; next()) out.push(d.getTime() / 1000);
   return out;
+}
+
+/**
+ * Where a view `span` seconds wide and `px` pixels across ends while it shows
+ * now: 5 % of the span past it, on the view's pixel step. Until now has moved
+ * a pixel the view is exactly the same (a reload finds nothing to redraw),
+ * and now stays on the same pixel of it.
+ */
+export function liveViewEnd(now, span, px) {
+  const step = span / px;
+  return (Math.round(now / step) + Math.round(px * 0.05)) * step;
 }
 
 // ---- SS's stream and MP4 -----------------------------------------------------

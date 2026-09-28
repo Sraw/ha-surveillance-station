@@ -7,7 +7,8 @@ time-lapse** (a task set up in SS; this only reads it) one day at a time:
 camera chips, a row of days, the video with the time it shows, and a bar
 with what the day has (click or drag to go there, or from the keyboard the
 arrow keys, 1 % of what the bar shows, Page Up / Down, Home / End; the
-playhead goes there at once, however long that part takes to load). The
+playhead goes there at once, however long that part takes to load, and a
+skip, pan or zoom before the keys stop takes over from them). The
 bar zooms to 24h / 6h / 1h
 / 15m of the day (remembered in the browser), follows the playhead when
 zoomed in and pans with its arrows (it stays put for 15 s after a pan). The

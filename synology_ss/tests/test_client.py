@@ -64,6 +64,12 @@ def _json(data: dict) -> bytes:
     return json.dumps(data).encode()
 
 
+async def _settled(client: SurveillanceStationClient) -> None:
+    """Lets the replaced sessions' logouts (run in the background) finish."""
+    if client._logouts:
+        await asyncio.wait(set(client._logouts))
+
+
 async def test_login_success() -> None:
     client, session = _client([_resp(body=_json({"success": True, "data": {"sid": "abc"}}))])
     await client.login()
@@ -120,13 +126,14 @@ async def test_login_retries_if_sid_is_stale() -> None:
     await client.login()
     await client.login(stale_sid="old")
     await client.login(stale_sid="old")  # replaced already: no login, no logout
+    await _settled(client)
     assert client._sid == "new"
     assert session.request.call_count == 3
 
 
 async def test_relogin_logs_out_the_replaced_session() -> None:
-    """The old session may still be valid (a camera SS won't stream, a 105): DSM
-    would keep it open until it times out."""
+    """The old session may still be valid (a 105): DSM would keep it open until
+    it times out."""
     client, session = _client(
         [
             _resp(body=_json({"success": True, "data": {"sid": "old"}})),
@@ -136,9 +143,60 @@ async def test_relogin_logs_out_the_replaced_session() -> None:
     )
     await client.login()
     await client.login(stale_sid="old")
+    await _settled(client)
     params = session.request.call_args.kwargs["params"]
     assert (params["method"], params["_sid"]) == ("logout", "old")
     assert client._sid == "new"
+
+
+async def test_the_retry_does_not_wait_for_the_old_sessions_logout() -> None:
+    """After a 105 the old session is logged out in the background: the call
+    answers meanwhile, and close() waits for that logout."""
+    answered = asyncio.Event()
+    logout = _resp()
+
+    async def read() -> bytes:
+        await answered.wait()
+        return _json({"success": True})
+
+    logout.read = AsyncMock(side_effect=read)
+    client, session = _client(
+        [
+            _resp(body=_json({"success": True, "data": {"sid": "s1"}})),
+            _resp(body=_json({"success": False, "error": {"code": 105}})),
+            _resp(body=_json({"success": True, "data": {"sid": "s2"}})),
+            _resp(body=_json({"success": True, "data": {"cameras": []}})),
+            logout,
+            _resp(body=_json({"success": True})),  # close(): s2 logged out
+        ]
+    )
+    assert await asyncio.wait_for(client.cameras(), 5) == []
+    closing = asyncio.create_task(client.close())
+    while session.request.call_count < 6:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not closing.done()
+    answered.set()
+    await closing
+    assert [(c.kwargs["params"]["method"], c.kwargs["params"]["_sid"]) for c in session.request.call_args_list[4:]] == [
+        ("logout", "s1"),
+        ("logout", "s2"),
+    ]
+
+
+async def test_an_odd_failure_of_that_logout_is_only_logged(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("DEBUG", logger="synology_ss_playback.client")
+    client, _ = _client(
+        [
+            _resp(body=_json({"success": True, "data": {"sid": "old"}})),
+            _resp(body=_json({"success": True, "data": {"sid": "new"}})),
+            RuntimeError("Session is closed"),
+        ]
+    )
+    await client.login()
+    await client.login(stale_sid="old")
+    await _settled(client)
+    assert "Logging out a replaced session failed" in caplog.text
 
 
 async def test_logout_noop_without_a_session() -> None:
@@ -330,14 +388,15 @@ async def test_download_retries_once_on_session_error_then_raises() -> None:
             _resp(body=_json({"success": True, "data": {"sid": "s1"}})),
             _resp(body=_json({"error": {"code": 106}})),  # session expired
             _resp(body=_json({"success": True, "data": {"sid": "s2"}})),  # re-login
-            _resp(body=_json({"success": True})),  # s1 logged out
             _resp(body=_json({"error": {"code": 400}})),  # still fails
         ]
     )
     with pytest.raises(SSError) as err:
         await client.download(1, 1, 0, 1000)
     assert not isinstance(err.value, SSAuthError)
-    assert session.request.call_count == 5
+    await _settled(client)
+    # An expired session is gone already: not logged out.
+    assert session.request.call_count == 4
 
 
 async def test_call_retries_once_on_session_error() -> None:
@@ -346,41 +405,83 @@ async def test_call_retries_once_on_session_error() -> None:
             _resp(body=_json({"success": True, "data": {"sid": "s1"}})),
             _resp(body=_json({"success": False, "error": {"code": 105}})),
             _resp(body=_json({"success": True, "data": {"sid": "s2"}})),
-            _resp(body=_json({"success": True})),  # s1 logged out
             _resp(body=_json({"success": True, "data": {"cameras": []}})),
+            _resp(body=_json({"success": True})),  # s1 logged out
         ]
     )
     assert await client.cameras() == []
+    await _settled(client)
     assert session.request.call_count == 5
+    params = session.request.call_args.kwargs["params"]
+    assert (params["method"], params["_sid"]) == ("logout", "s1")
 
 
-async def test_no_permission_after_a_new_login_is_not_retried_again() -> None:
+_BOOKMARK_LIST = ("SYNO.SurveillanceStation.ThirdParty.Bookmark", "List")
+_BOOKMARK_CREATE = ("SYNO.SurveillanceStation.ThirdParty.Bookmark", "Create")
+
+
+def _denying(*denied: tuple[str, str]) -> tuple[SurveillanceStationClient, list[str]]:
+    """A client of an account that lacks the permission for ``denied``: 105 to
+    those on every session, a new sid for each login, success to anything
+    else; and the method of each request."""
+    asked: list[str] = []
+    sids = (f"s{i}" for i in range(1, 100))
+
+    def request(method, url, **kwargs):
+        params = kwargs.get("params") or kwargs["data"]
+        asked.append(params["method"])
+        if params["method"] == "login":
+            body = {"success": True, "data": {"sid": next(sids)}}
+        elif (params["api"], params["method"]) in denied:
+            body = {"success": False, "error": {"code": 105}}
+        else:
+            body = {"success": True, "data": {"serial": "S", "timezoneTZDB": "UTC"}}
+        return _Ctx(_resp(body=_json(body)))
+
+    session = MagicMock()
+    session.request = MagicMock(side_effect=request)
+    return SurveillanceStationClient(session, "nas", 5000, False, "u", "p"), asked
+
+
+async def test_no_permission_after_a_new_login_is_not_retried_for_a_while(monkeypatch: pytest.MonkeyPatch) -> None:
     """105 is retried with a new session once; refused again, it is the account's
-    permission, and that call no longer logs in (a Frigate review each time)."""
-    ok = _json({"success": True})
-    no = _json({"success": False, "error": {"code": 105}})
+    permission, and that call doesn't log in again (a Frigate review each time)
+    until PERMISSION_RETRY_SECONDS have passed; then it is tried once more."""
+    import synology_ss_playback.client as client_mod
 
-    def sid(s: str) -> MagicMock:
-        return _resp(body=_json({"success": True, "data": {"sid": s}}))
+    now = [1000.0]
+    monkeypatch.setattr(client_mod, "_monotonic", lambda: now[0])
+    client, asked = _denying(_BOOKMARK_LIST)
 
-    client, session = _client(
-        [
-            sid("s1"), _resp(body=no), sid("s2"), _resp(body=ok), _resp(body=no),  # retried once
-            _resp(body=no),  # the same call: not retried
-            _resp(body=no), sid("s3"), _resp(body=ok), _resp(body=ok),  # another call still is
-            _resp(body=no), sid("s4"), _resp(body=ok), _resp(body=_json({"success": True, "data": {"cameras": []}})),
-        ]
-    )
-    for _ in range(2):
+    async def logins() -> int:
+        before = asked.count("login")
         with pytest.raises(SSError) as err:
-            await client.cameras()
+            await client.list_bookmarks([6])
         assert err.value.code == 105
-    assert session.request.call_count == 6
-    await client.delete_bookmarks([1])
-    assert session.request.call_count == 10
-    # A new session since: retried with a login again.
-    assert await client.cameras() == []
-    assert session.request.call_count == 14
+        return asked.count("login") - before
+
+    assert await logins() == 2  # the first login, and the retry's
+    assert await logins() == 0
+    now[0] += client_mod.PERMISSION_RETRY_SECONDS - 1
+    assert await logins() == 0
+    now[0] += 1
+    assert await logins() == 1
+    assert await logins() == 0
+    await _settled(client)
+
+
+async def test_two_denied_calls_do_not_take_turns_logging_in() -> None:
+    """The bookmark list (asked every 5 s while a card is live) and a Frigate
+    bookmark, both refused: one call's retry replacing the session doesn't
+    make the other log in (and a valid session out) again."""
+    client, asked = _denying(_BOOKMARK_LIST, _BOOKMARK_CREATE)
+    for _ in range(3):
+        for call in (lambda: client.list_bookmarks([6]), lambda: client.create_bookmark(6, "x", 0, 1)):
+            with pytest.raises(SSError) as err:
+                await call()
+            assert err.value.code == 105
+    assert asked.count("login") == 3  # the first, and one retry for each call
+    await _settled(client)
 
 
 async def test_request_http_error() -> None:

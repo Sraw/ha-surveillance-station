@@ -28,14 +28,18 @@ How it works:
   is logged once.
 - `new`: bookmark from the review's start, named after its objects
   ("Person, Car", "Animal"); its end is open (30 s, or up to now; for a
-  message that waited out an SS outage, up to when it came) until `end`
-  sets it. `update`: renamed as objects are added; a review that only now
-  has an object of interest (a bicycle, then a person) is bookmarked then.
+  message that waited out an SS outage, up to when the review's latest
+  message came) until `end` sets it. `update`: renamed as objects are
+  added; a review that only now has an object of interest (a bicycle, then
+  a person) is bookmarked then.
   A bookmark deleted in SS while its review goes on is made again by the
   review's next message.
   The comment ("Frigate alert [frigate <review id>]") names the review, so
   one that ends after a restart still finds its bookmark. Zones are left
   out of it (only some cameras have them; they are in the event).
+  The tag must end the comment: text added after it (in DS cam or SS)
+  makes it a bookmark like any other, for its review, smart search and
+  thumbnails alike.
 - Written with the documented `ThirdParty.Bookmark.Create` / `Edit` (epoch
   times). The DSM account needs no more than playback rights for it.
 - Each new bookmark fires **`surveillance_station_detection`** once, with

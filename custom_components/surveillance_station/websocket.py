@@ -154,8 +154,8 @@ async def _run(
     except TranscodeUnavailable as err:
         connection.send_error(msg["id"], err.code, str(err))
         return
-    if entry_id or (entry_id := _first_entry_id(hass)):
-        manager.track(entry_id, None)
+    # SS answering is reported where it answered (see VodManager.track), not
+    # here: some commands never ask it, and a card retrying one would hide an outage.
     connection.send_result(msg["id"], result)
 
 
@@ -171,10 +171,12 @@ def _first_entry_id(hass: HomeAssistant) -> str | None:
 async def ws_cameras(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
+        cameras = await client.cameras()
+        _manager(hass).track(entry_id, None)
         bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
         return {
             "entry_id": entry_id,
-            "cameras": [{"id": c.id, "name": c.name, "enabled": c.enabled} for c in await client.cameras()],
+            "cameras": [{"id": c.id, "name": c.name, "enabled": c.enabled} for c in cameras],
             # Frigate's smart search can be asked (its URL is in the options).
             "search": bridge is not None and bridge.api is not None,
         }
@@ -207,9 +209,11 @@ _RANGE_SCHEMA = {
 @websocket_api.async_response
 async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
     async def go():
-        _, client = _client(hass, msg.get("entry_id"))
+        entry_id, client = _client(hass, msg.get("entry_id"))
         start, end = _range(msg)
         recs = await client.recordings(msg["camera_id"], start, end)
+        # SS's answer (or the same lookup's of a moment ago: the library shares it).
+        _manager(hass).track(entry_id, None)
         now = time.time()
         return {
             "now": now,
@@ -392,6 +396,7 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
         if end <= start:
             raise InvalidRequest("window is in the future")
         infos = await client.recordings(msg["camera_id"], int(start), int(end) + 1)
+        _manager(hass).track(entry_id, None)
         segments = plan_segments(recordings_from(infos), start, end, now)
         if not segments:
             return {"url": None, "runs": [], "start": start, "end": end, "live": False}
@@ -509,6 +514,7 @@ async def ws_timelapse_days(
         files = await manager.timelapse_files(entry_id, client)
         tz = await client.timezone()
         names = {c.id: c.name for c in await client.cameras()}
+        manager.track(entry_id, None)
         by_camera = {cid: _camera_files(files, cid) for cid in {f.camera_id for f in files}}
         try:
             hardware = await _transcode_on_gpu(hass, entry_id, wait=False)

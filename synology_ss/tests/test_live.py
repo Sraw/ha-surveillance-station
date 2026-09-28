@@ -53,7 +53,7 @@ def _client(sockets, checks=()):
     client = SurveillanceStationClient(session, "nas", 5000, False, "u", "p")
     sids = iter(["sid1", "sid2", "sid3"])
 
-    async def login(stale_sid=None):
+    async def login(stale_sid=None, stale_alive=True):
         client._sid = next(sids)
 
     client.login = AsyncMock(side_effect=login)
@@ -80,6 +80,8 @@ async def test_expired_sid_logs_in_again_once() -> None:
     assert (await client.open_live(10))[0] is ok
     refused.close.assert_awaited()
     assert client.login.await_count == 2
+    # The check said the session is gone: nothing to log out.
+    client.login.assert_awaited_with(stale_sid="sid1", stale_alive=False)
     assert "_sid=sid2" in session.ws_connect.await_args.args[0]
 
 

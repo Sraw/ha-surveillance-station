@@ -187,12 +187,13 @@ async def test_download_to_logs_in_again_on_a_session_error(memfd: int) -> None:
     err = json.dumps({"success": False, "error": {"code": 119}}).encode()
     client, session = _streaming_client([_stream([err[:5], err[5:]], content_type="text/plain"), _stream([b"ok"])])
 
-    async def login(stale_sid=None):
+    async def login(stale_sid=None, stale_alive=True):
         client._sid = "new"
 
     client.login = AsyncMock(side_effect=login)
     assert await client.download_to(memfd, 3, 0, 0, 1000) == 2
-    client.login.assert_awaited_once_with(stale_sid="sid")
+    # 119: the old session is gone, nothing to log out.
+    client.login.assert_awaited_once_with(stale_sid="sid", stale_alive=False)
     assert session.get.call_args.kwargs["params"]["_sid"] == "new"
     assert _content(memfd) == b"ok"
 
@@ -201,7 +202,7 @@ async def test_download_to_logs_in_first_without_a_session(memfd: int) -> None:
     client, _ = _streaming_client([_stream([b"ok"])])
     client._sid = None
 
-    async def login(stale_sid=None):
+    async def login(stale_sid=None, stale_alive=True):
         client._sid = "s"
 
     client.login = AsyncMock(side_effect=login)
