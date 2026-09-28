@@ -144,7 +144,9 @@ the card were verified against a live HA 2026.9 + SS setup:
   some frames are left out; 16x skips ~0.8 s at a time) and survives jumps.
   Paused 15 min with keep-alives, the socket stayed open and carried on. Gaps are skipped
   over, a time before the oldest recording starts at the oldest, and a time
-  in the future (or playing into the present) gives the real-time stream.
+  in the future gives the real-time stream. Playback started in the recent
+  past never gets there at 1x: SS sends it at the pace of real time, so it
+  stays that far behind (the card shows no LIVE; the Live button jumps).
 - `ThirdParty/SnapShot/Take` documents `time=` (ISO 8601) but can't take a
   past frame: with an offset or `Z` every time answers 400 (a minute ago as
   well as days); a bare local time is read an hour late in DST, so a recent

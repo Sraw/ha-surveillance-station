@@ -28,12 +28,16 @@ await sleep(1500); console.log("2x:", await aud());
 check((await sound()) === null, "2x: no sound (recordings have it at 1x only)");
 await ev((c) => { const s = c.shadowRoot.querySelector(".speed"); s.value = "1"; s.dispatchEvent(new Event("change")); });
 await sleep(2500); console.log("1x again:", await aud());
-// catch up with now
+// Recordings from 25 s ago: SS sends them at the pace of real time, so 1x
+// stays that far behind (time-shifted, not live) until the Live button.
 const N = Math.floor(Date.now() / 1000) - 25;
 await ev((c, T) => c._seekAll(T, true), N);
 for (let i = 0; i < 8; i++) { await sleep(5000); console.log(`near now +${(i + 1) * 5}s: behind now`, await ev((c) => (Date.now() / 1000 - c._leader.wall()).toFixed(1)), "liveTag", await ev((c) => !c._liveTag.hidden), await snap(ev, Date.now() / 1000)); }
 const near = await ev((c) => ({ behind: Date.now() / 1000 - c._leader.wall(), tag: !c._liveTag.hidden }));
-check(near.tag && near.behind < 10, `recordings played into the present are live (${near.behind.toFixed(1)} s behind, LIVE shown)`);
+const w1 = await ev((c) => c._leader.wall()); await sleep(3000);
+const pace = ((await ev((c) => c._leader.wall())) - w1) / 3;
+check(!near.tag && near.behind > 15 && near.behind < 40 && pace > 0.7 && pace < 1.3,
+  `recordings near the present stay time-shifted at 1x (${near.behind.toFixed(1)} s behind, LIVE ${near.tag ? "shown" : "hidden"}, ${pace.toFixed(2)} s of footage a second)`);
 await ev((c) => c.shadowRoot.querySelector('[data-act="live"]').click());
 await sleep(3000); console.log("Live button:", await snap(ev, Date.now() / 1000), await aud());
 check(await ev((c) => !!c._leader.feed?.live && !c._leader.video.paused), "Live button: the real-time stream, playing");
