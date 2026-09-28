@@ -9,9 +9,15 @@
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; published on [PyPI](https://pypi.org/project/synology-ss-playback/)): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts, time-lapse files), the 10 s segment planner and playlist renderer, `fetch_segment` (download + ffmpeg remux + fMP4 split), and for time-lapse the day planner (`plan_day`) and `fetch_timelapse_segment` (streamed download + transcode) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics (including the Frigate bridge: subscribed?, review messages (several per review) and how each ended — ignored by reason, dropped, failed, or bookmarked then announced / not announced — queue, failing now, last error) |
 | `…/errors.py` | The WebSocket commands' own refusals (entry not loaded, session gone: `not_found`; bad input: `invalid_format`), so that any other error reaches HA's handler and is logged |
-| `…/bookmarks.py` | The bookmark list indexed once per fetch (by camera, kinds and start) for the event list's pages and kind chips |
-| `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
+| `…/views.py` | The HTTP views: the stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE; event thumbnails `/api/surveillance_station/thumbnail/…` |
+| `…/manager.py` | `VodManager`, what the views, the WebSocket commands and the Frigate bridge ask for playback: sessions, the GPU check, the time-lapse file list, bookmark frames, whether each entry's SS answers (a Repairs issue if an outage lasts); the parts below do the rest |
+| `…/segments.py` | Playback sessions (`VodSession`) and their segments: fetched on demand, one job per segment, in a byte-bounded cache, behind the fetch queue |
+| `…/thumbnails.py` | Event thumbnails and notification images: one job per frame, kept in memory and on disk (`thumbnail_store.py`) |
+| `…/tokens.py` | Signed image URLs and single-use live-stream tokens (what stands in for HA's auth where a browser can't send it) |
+| `…/bookmarks.py` | The bookmark list, fetched once for everyone (cached 60 s) and indexed once per fetch (by camera, kinds and start) for the event list's pages and kind chips; what a bookmark's name says was seen |
+| `…/shared.py` | What the caches share: one job per key whose result every waiting request shares (optionally cancelled once all of them left), and an LRU map bounded by bytes |
 | `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*); with a Frigate URL, the notification image and the Frigate bookmarks' thumbnails (Frigate's snapshots, `/api/surveillance_station/frigate_image/…`) |
+| `…/frigate_queue.py` | The Frigate review messages waiting for SS, one per review (fresh, replayed, deferred), kept across restarts for a day |
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE), `/timelapse_days`, `/timelapse` (a time-lapse session: one camera, one day) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 | `…/frontend/ss-timelapse-card.js` | `custom:ss-timelapse-card`, loaded by the timeline card (same version, no resource of its own) |
@@ -84,11 +90,11 @@ the card were verified against a live HA 2026.9 + SS setup:
   prints `FAIL` for a check that failed and exits 1. Covered: live; jumps (buffered,
   over the socket, from live); a recording-file boundary; 1/2/4/8x; pause
   (SS paused by flow control) and resume; the 4-camera grid in step after
-  jumps, speed changes, pause and a master change; a follower's 72-minute gap
-  and a gap the master lands in; gaps all cameras share; a 29 s hole inside a
+  jumps, speed changes, pause and a leader change; a follower's 72-minute gap
+  and a gap the leader lands in; gaps all cameras share; a 29 s hole inside a
   recording file (bridged in ~1.5 s); sound kept within ~0.1 s of the video;
   the no-MSE path (native HLS) on a phone-sized viewport; the live timeline
-  scrolling with the present; races (a follower made master while it holds
+  scrolling with the present; races (a follower made leader while it holds
   its first frame; Live, a past time, Live again before anything landed);
   notification deep links; grid / one-camera modes and the overlay menu;
   the event list beside and under the video, kind chips, smart search;

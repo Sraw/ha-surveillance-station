@@ -179,7 +179,7 @@ async def test_vod_playlist_and_segments(
 
     base = res["url"].rsplit("/", 1)[0]
     fetch = AsyncMock(return_value=(b"init", b"media"))
-    with patch("custom_components.surveillance_station.views.fetch_segment", fetch):
+    with patch("custom_components.surveillance_station.segments.fetch_segment", fetch):
         init = await client.get(f"{base}/init/0.mp4")
         seg = await client.get(f"{base}/seg/0.m4s")
         again = await client.get(f"{base}/seg/0.m4s")
@@ -384,7 +384,7 @@ async def test_thumbnail(
     client = await hass_client_no_auth()
 
     snap = AsyncMock(return_value=b"\xff\xd8jpeg")
-    with patch("custom_components.surveillance_station.views.fetch_snapshot", snap):
+    with patch("custom_components.surveillance_station.thumbnails.fetch_snapshot", snap):
         first = await client.get(url)
         second = await client.get(url)
     assert first.status == HTTPStatus.OK
@@ -410,14 +410,14 @@ async def test_thumbnail_bad_signature_is_404(
     other_ts = path.replace(f"/{T0 + 2001}.jpg", f"/{T0 + 5}.jpg")
     later = query.replace(f"exp={exp}", f"exp={int(exp) + 3600}")
     snap = AsyncMock(return_value=b"\xff\xd8jpeg")
-    with patch("custom_components.surveillance_station.views.fetch_snapshot", snap):
+    with patch("custom_components.surveillance_station.thumbnails.fetch_snapshot", snap):
         for bad in (
             path, f"{other_ts}?{query}", f"{path}?{later}", f"{path}?exp={exp}&sig=00",
             f"{path}?exp=%C2%B2&sig=00", f"{path}?exp={exp}&sig=%C3%A9",  # non-ASCII: 404, not 500
         ):
             assert (await client.get(bad)).status == HTTPStatus.NOT_FOUND, bad
         # Expired, e.g. a card left open for days.
-        with patch("custom_components.surveillance_station.views.time.time", return_value=int(exp) + 1):
+        with patch("custom_components.surveillance_station.tokens.time.time", return_value=int(exp) + 1):
             assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
     snap.assert_not_awaited()
 
@@ -432,7 +432,7 @@ async def test_thumbnail_nothing_recorded(
     await ws.send_json_auto_id({"type": "surveillance_station/bookmark_page"})
     url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
     client = await hass_client_no_auth()
-    with patch("custom_components.surveillance_station.views.fetch_snapshot", AsyncMock(return_value=None)):
+    with patch("custom_components.surveillance_station.thumbnails.fetch_snapshot", AsyncMock(return_value=None)):
         assert (await client.get(url)).status == HTTPStatus.NOT_FOUND
 
 
@@ -447,7 +447,7 @@ async def test_thumbnail_surveillance_station_unreachable(
     url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
     client = await hass_client_no_auth()
     down = AsyncMock(side_effect=SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None))
-    with patch("custom_components.surveillance_station.views.fetch_snapshot", down):
+    with patch("custom_components.surveillance_station.thumbnails.fetch_snapshot", down):
         assert (await client.get(url)).status == HTTPStatus.BAD_GATEWAY
 
 
@@ -462,7 +462,7 @@ async def test_thumbnail_surveillance_station_error(
     url = (await ws.receive_json())["result"]["bookmarks"][0]["thumbnail"]
     client = await hass_client_no_auth()
     failed = AsyncMock(side_effect=SSError("SYNO.SurveillanceStation.Recording", "Download", 119))
-    with patch("custom_components.surveillance_station.views.fetch_snapshot", failed):
+    with patch("custom_components.surveillance_station.thumbnails.fetch_snapshot", failed):
         assert (await client.get(url)).status == HTTPStatus.BAD_GATEWAY
 
 
@@ -477,7 +477,7 @@ async def test_vod_segment_surveillance_station_unreachable(
     base = (await ws.receive_json())["result"]["url"].rsplit("/", 1)[0]
     client = await hass_client_no_auth()
     down = AsyncMock(side_effect=SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None))
-    with patch("custom_components.surveillance_station.views.fetch_segment", down):
+    with patch("custom_components.surveillance_station.segments.fetch_segment", down):
         assert (await client.get(f"{base}/init/0.mp4")).status == HTTPStatus.BAD_GATEWAY
 
 
@@ -492,7 +492,7 @@ async def test_vod_segment_surveillance_station_error(
     base = (await ws.receive_json())["result"]["url"].rsplit("/", 1)[0]
     client = await hass_client_no_auth()
     failed = AsyncMock(side_effect=SSError("SYNO.SurveillanceStation.Recording", "Download", 119))
-    with patch("custom_components.surveillance_station.views.fetch_segment", failed):
+    with patch("custom_components.surveillance_station.segments.fetch_segment", failed):
         assert (await client.get(f"{base}/seg/0.m4s")).status == HTTPStatus.BAD_GATEWAY
 
 

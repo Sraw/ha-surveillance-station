@@ -4,12 +4,12 @@ import { open, sleep } from "./harness.mjs";
 const { browser, page, card, ev } = await open({ prefs: { grid: true } });
 let failed = false;
 await sleep(6000);
-const st = () => ev((c) => `grid=${c._grid} shown=[${c._shown}] master=${c._cameraId} gridSet=[${c._gridSet}] ` +
+const st = () => ev((c) => `grid=${c._grid} shown=[${c._shown}] leader=${c._cameraId} gridSet=[${c._gridSet}] ` +
   [...c._players.values()].map((p) => `${p.cameraId}${p.video.paused && !p.loading ? "P" : ">"}`).join(" ") + ` btn="${c.shadowRoot.querySelector('.controls [data-act="solo"]').title}"`);
 const step = async (label, fn, want) => {
   await fn(); await sleep(2500);
-  const [shown, master, playing] = await ev((c) => [c._shown.join(), c._cameraId, !c._master.video.paused]);
-  const ok = shown === want[0] && master === want[1] && playing;
+  const [shown, leader, playing] = await ev((c) => [c._shown.join(), c._cameraId, !c._leader.video.paused]);
+  const ok = shown === want[0] && leader === want[1] && playing;
   if (!ok) failed = true;
   console.log(ok ? "ok  " : "FAIL", label.padEnd(26), await st());
 };

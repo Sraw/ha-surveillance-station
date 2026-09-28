@@ -10,7 +10,7 @@ const { check, done } = checks();
 if (noMse) await page.addInitScript(() => { delete window.MediaSource; delete window.ManagedMediaSource; });
 if (noMse) { await page.reload(); await page.locator("ss-timeline-card").waitFor({ state: "attached" }); }
 await sleep(5000);
-const at = () => ev((c) => ({ cam: c._master?.cameraId, wall: c._master?.wall(), playing: !c._master?.video.paused }));
+const at = () => ev((c) => ({ cam: c._leader?.cameraId, wall: c._leader?.wall(), playing: !c._leader?.video.paused }));
 const mse = await page.evaluate(() => !!window.MediaSource);
 console.log("deep link:", await snap(ev, T + 5), "MSE", mse);
 check(mse === !noMse, noMse ? "MSE hidden: the HLS path" : "MSE there");

@@ -10,7 +10,7 @@ const { check, done } = checks();
 await sleep(5000);
 await ev((c, t) => c._seekAll(t, true), t - 6);
 const walls = [];
-for (let i = 0; i < 12; i++) { await sleep(1000); walls.push(await ev((c) => c._master.wall())); console.log(`+${i + 1}s`, new Date(walls.at(-1) * 1000).toISOString().slice(11, 21), await snap(ev, 0)); }
+for (let i = 0; i < 12; i++) { await sleep(1000); walls.push(await ev((c) => c._leader.wall())); console.log(`+${i + 1}s`, new Date(walls.at(-1) * 1000).toISOString().slice(11, 21), await snap(ev, 0)); }
 check(walls.at(-1) > t + 5, `past the hole: ${(walls.at(-1) - t).toFixed(1)} s after its start`);
 check(walls.at(-1) - walls.at(-2) > 0.5, "and playing");
 await done(browser);

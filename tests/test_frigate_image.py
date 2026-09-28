@@ -14,7 +14,7 @@ from custom_components.surveillance_station import frigate as frigate_mod
 from custom_components.surveillance_station.const import DETECTION_EVENT, FRIGATE_IMAGE_URL
 from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge
 from custom_components.surveillance_station.frigate_api import FrigateAPI, FrigateAPIError
-from custom_components.surveillance_station.views import DATA_MANAGER
+from custom_components.surveillance_station.manager import DATA_MANAGER
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 

@@ -42,7 +42,7 @@ from custom_components.surveillance_station.frigate import (
     review_id_of,
     store_key,
 )
-from custom_components.surveillance_station.views import DATA_MANAGER, VodManager
+from custom_components.surveillance_station.manager import DATA_MANAGER, VodManager
 from homeassistant.components import mqtt as mqtt_mod
 from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
@@ -246,7 +246,7 @@ async def test_over_mqtt(hass: HomeAssistant, mqtt_mock, mock_config_entry: Mock
     )
     entry.add_to_hass(hass)
     with patch(
-        "custom_components.surveillance_station.views.VodManager.thumbnail_when_recorded", AsyncMock(return_value=None)
+        "custom_components.surveillance_station.manager.VodManager.thumbnail_when_recorded", AsyncMock(return_value=None)
     ), patch("custom_components.surveillance_station.frigate.FRIGATE_RETRY_SECONDS", 0):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -711,7 +711,7 @@ async def test_a_full_queue_pushes_the_oldest_out(nvr: Nvr, client: MagicMock) -
     """SS slow while reviews pour in: a review's messages are one, and the oldest waiting
     beyond the bound waits with those SS failed (bookmarked later, not lost), fresh ones first."""
     gate = slow(client, "q0")
-    with patch("custom_components.surveillance_station.frigate.FRIGATE_QUEUE_MAX", 2):
+    with patch("custom_components.surveillance_station.frigate_queue.FRIGATE_QUEUE_MAX", 2):
         nvr.send(review("new", rid="q0"))
         await nvr.until(lambda: client.create_bookmark.await_count == 1)
         for rid in ("q1", "q2", "q1", "q3"):
@@ -740,7 +740,7 @@ async def test_full_queue_keeps_the_canary_and_bounds_the_rest(nvr: Nvr, client:
 
     client.create_bookmark.side_effect = ss
     client.list_bookmarks.return_value = []
-    with patch("custom_components.surveillance_station.frigate.FRIGATE_QUEUE_MAX", 2):
+    with patch("custom_components.surveillance_station.frigate_queue.FRIGATE_QUEUE_MAX", 2):
         nvr.send(review("new", rid="k"))
         await nvr.until(lambda: nvr.stats()["deferred"] == 1)
         nvr.send(review("new", rid="b"))
@@ -783,7 +783,7 @@ async def test_canary_mark_cleared_once_tried(nvr: Nvr, client: MagicMock, no_re
 
     client.create_bookmark.side_effect = logged
     client.edit_bookmark.side_effect = edited
-    with patch("custom_components.surveillance_station.frigate.FRIGATE_QUEUE_MAX", 2):
+    with patch("custom_components.surveillance_station.frigate_queue.FRIGATE_QUEUE_MAX", 2):
         nvr.send(review("new", rid="g"))
         await nvr.until(lambda: order == ["g"])
         nvr.send(review("update", rid="k", objects=("person", "car")))
@@ -1027,7 +1027,7 @@ async def test_failure_after_a_newer_message_was_pushed_out(nvr: Nvr, client: Ma
 
     client.create_bookmark.side_effect = ss
     client.list_bookmarks.side_effect = lambda ids: list(made_in_ss)
-    with patch("custom_components.surveillance_station.frigate.FRIGATE_QUEUE_MAX", 2):
+    with patch("custom_components.surveillance_station.frigate_queue.FRIGATE_QUEUE_MAX", 2):
         nvr.send(review("new", rid="x"))
         await nvr.until(lambda: nvr.stats()["deferred"] == 1)
         nvr.send(review("new", rid="r"))

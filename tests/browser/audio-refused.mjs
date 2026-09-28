@@ -15,7 +15,7 @@ await sleep(5000);
 await ev((c) => c.shadowRoot.querySelector('[data-act="mute"]').click());
 await sleep(3000);
 const state = () => ev((c) => {
-  const p = c._master, b = c.shadowRoot.querySelector('[data-act="mute"]');
+  const p = c._leader, b = c.shadowRoot.querySelector('[data-act="mute"]');
   return { unplayable: p.audioUnplayable ?? null, audio: !!p.feed?.audio, icon: b.querySelector("ha-icon")?.getAttribute("icon"), title: b.title,
     playing: !p.video.paused, t: p.video.currentTime.toFixed(1) };
 });

@@ -11,10 +11,11 @@
  * HLS instead: `vod` returns a playlist URL plus `runs`, the map between
  * playlist time and wall-clock time (a new run starts after every gap).
  *
- * One Player per camera shown; one camera shown is the single view, several
- * are the grid. One player is the master: it has the sound and the clock and
- * the others follow its wall-clock time (see Player.follow). The timeline and
- * the event list cover the cameras shown.
+ * One Player per camera shown (a StreamPlayer, or an HlsPlayer without MSE);
+ * one camera shown is the single view, several are the grid. One player is
+ * the leader: it has the sound and the clock and the others follow its
+ * wall-clock time (see follow()). The timeline and the event list cover the
+ * cameras shown.
  *
  * Layout: camera chips, the stage (sized so chips-to-timeline fit on the
  * screen), controls and timeline; the event list is a sidebar on wide cards
@@ -24,7 +25,7 @@
  * Card options (all optional):
  *   cameras:  names or ids in the grid (default: all); the viewer's last choice
  *             (the camera chips) wins
- *   camera:   name or id of the camera to start on (the master)
+ *   camera:   name or id of the camera to start on (the leader)
  *   view:     "single" to start on one camera instead of the grid; the
  *             viewer's last choice wins
  *   span:     timeline width in seconds (default 3600); the viewer's last choice wins
@@ -232,8 +233,8 @@ const STYLE = `
   .cams button.shown { color: var(--primary-text-color); border-color: color-mix(in srgb, var(--cam) 55%, var(--divider-color));
     background: color-mix(in srgb, var(--cam) 14%, transparent); }
   .cams button.shown .dot { background: var(--cam); }
-  /* The master (sound + clock), when several are shown. */
-  .cams.multi button.master { border-color: var(--cam); box-shadow: inset 0 0 0 1px var(--cam); font-weight: 500; }
+  /* The leader (sound + clock), when several are shown. */
+  .cams.multi button.leader { border-color: var(--cam); box-shadow: inset 0 0 0 1px var(--cam); font-weight: 500; }
   .head .evtoggle { flex: none; }
   .badge { font-size: 11px; min-width: 18px; padding: 0 5px; border-radius: 9px; line-height: 18px;
     background: var(--secondary-background-color); color: var(--secondary-text-color); }
@@ -249,7 +250,7 @@ const STYLE = `
   .vp { position: relative; transform-origin: center center; will-change: transform; }
   video::-webkit-media-controls-overlay-play-button, video::-webkit-media-controls-start-playback-button { display: none !important; }
   video { display: block; width: 100%; aspect-ratio: 16 / 9; background: #000; object-fit: contain; }
-  .stage.grid .cell.master { outline: 2px solid var(--cam, var(--primary-color)); outline-offset: -2px; z-index: 1; }
+  .stage.grid .cell.leader { outline: 2px solid var(--cam, var(--primary-color)); outline-offset: -2px; z-index: 1; }
   .label { position: absolute; left: 6px; bottom: 6px; z-index: 2; padding: 1px 6px; border-radius: 4px;
     font-size: 11px; color: #fff; background: rgba(0,0,0,.55); pointer-events: none; display: flex; align-items: center; gap: 5px; }
   .label::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--cam); }
@@ -560,9 +561,9 @@ const HOLE_MS = 1500;
 const SEEK_SETTLE_MS = 1000; // after a jump, by when SS surely has it
 const PACE_SETTLE_MS = 1500; // after a change of speed, by when frames come at the new one
 // A follower asks SS for this many seconds (times the speed) past the
-// master's time, and holds its first frame until the master gets there:
+// leader's time, and holds its first frame until the leader gets there:
 // SS starts at the keyframe before the time asked for, so asking for the
-// master's time exactly would leave it behind, and SS never sends faster than
+// leader's time exactly would leave it behind, and SS never sends faster than
 // the speed asked for, so behind can't be caught up.
 const FOLLOW_LEAD = 1;
 
@@ -813,7 +814,7 @@ class StreamFeed {
     this.player = player;
     if (player.audioUnplayable) {
       player.audioUnplayable = null; // until this stream's audio says otherwise
-      player.card?._syncMuteIcon();
+      player.host.syncMuteIcon();
     }
     this.video = player.video;
     this.live = at == null;
@@ -861,7 +862,7 @@ class StreamFeed {
   }
 
   get follower() {
-    return this.player.card._master !== this.player;
+    return !this.player.isLeader();
   }
 
   send(s) {
@@ -1089,14 +1090,14 @@ class StreamFeed {
 
   // ---- sound ----
 
-  /** Sound on (the master, unmuted, at 1x) or off. */
+  /** Sound on (the leader, unmuted, at 1x) or off. */
   setAudio(on) {
     if (on && !this.audio && !this.player.audioUnplayable) this.startAudio();
     if (!on && this.audio) this.stopAudio();
   }
 
   /**
-   * Runs inside the tap that unmuted (or picked the master): play() is asked
+   * Runs inside the tap that unmuted (or picked the leader): play() is asked
    * for now, while the browser allows it (Safari needs the tap), and starts
    * once there is sound to play.
    */
@@ -1134,7 +1135,7 @@ class StreamFeed {
 
   audioUnplayableNow(codec) {
     this.player.audioUnplayable = codec;
-    this.player.card._syncMuteIcon();
+    this.player.host.syncMuteIcon();
     this.stopAudio();
   }
 
@@ -1225,16 +1226,20 @@ class StreamFeed {
 }
 
 /**
- * Plays one camera: SS's stream (live, or the recordings from a time on)
- * through MSE; without MSE, the integration's HLS sessions over a window of
- * wall-clock time. Its loading veil, and the wall <-> media mapping.
+ * Plays one camera in its cell: the cell with its video, veil and zoom, and
+ * what is wanted of it (target, autoplay, loading). How it plays is one of
+ * two backends behind the same methods (wall, seek, load, follow, setRate,
+ * syncAudio, takeLead, onLive, showsLive, destroyMedia): StreamPlayer, SS's
+ * stream through MSE (live, or the recordings from a time on), and HlsPlayer,
+ * the integration's HLS sessions over a window of wall-clock time, for
+ * browsers without MSE. What it needs from the card goes through `host`
+ * (see SSTimelineCard._playerHost).
  */
 class Player {
-  constructor(card, cameraId) {
-    this.card = card;
+  constructor(host, cameraId) {
+    this.host = host;
     this.cameraId = cameraId;
-    this.feed = null; // SS's stream, with MSE
-    this.session = null; // {live, ws} on the stream; without MSE the last vod response
+    this.session = null; // {live, ws} on the stream; on HLS the last vod response
     this.mediaReady = false;
     this.target = nowS() - LIVE_LAG; // wall time we want / are at when nothing is playing
     this.seq = 0;
@@ -1249,20 +1254,20 @@ class Player {
     el.innerHTML = `
       <div class="vp"><video muted playsinline preload="auto" poster="${BLANK_POSTER}" disablepictureinpicture></video><canvas class="still"></canvas></div>
       ${VEIL_HTML}
-      <div class="label">${esc(card._cameraName(cameraId))}</div>`;
+      <div class="label">${esc(host.cameraName(cameraId))}</div>`;
     this.video = el.querySelector("video");
     this.still = el.querySelector(".still");
     this.veil = el.querySelector(".veil");
-    this.zoom = new Zoom(el, el.querySelector(".vp"), (double, x, y) => card._onCellTap(this, double, x, y));
+    this.zoom = new Zoom(el, el.querySelector(".vp"), (double, x, y) => host.cellTap(this, double, x, y));
 
     const v = this.video;
-    const isMaster = () => card._master === this;
-    v.playbackRate = v.defaultPlaybackRate = card._rate;
-    v.addEventListener("timeupdate", () => isMaster() && card._onTime());
-    v.addEventListener("seeked", () => isMaster() && card._onTime());
+    const isLeader = () => this.isLeader();
+    v.playbackRate = v.defaultPlaybackRate = host.rate();
+    v.addEventListener("timeupdate", () => isLeader() && host.onLeaderTime());
+    v.addEventListener("seeked", () => isLeader() && host.onLeaderTime());
     v.addEventListener("loadeddata", () => {
       this.mediaReady = true;
-      if (isMaster()) card._onTime();
+      if (isLeader()) host.onLeaderTime();
     });
     // Short stalls shouldn't flash the veil.
     v.addEventListener("waiting", () => {
@@ -1281,14 +1286,16 @@ class Player {
     // Paused: a frame is on screen once it can play / the seek landed.
     v.addEventListener("canplay", () => v.paused && ready());
     v.addEventListener("seeked", () => v.paused && ready());
-    v.addEventListener("play", () => isMaster() && card._syncPlayIcon());
-    v.addEventListener("pause", () => isMaster() && card._syncPlayIcon());
-    // Followers don't continue on their own: follow() moves them.
-    v.addEventListener("ended", () => isMaster() && this.continue());
+    v.addEventListener("play", () => isLeader() && host.syncPlayIcon());
+    v.addEventListener("pause", () => isLeader() && host.syncPlayIcon());
+  }
+
+  isLeader() {
+    return this.host.leader() === this;
   }
 
   subline(t) {
-    return `${this.card._cameraName(this.cameraId)} · ${fmtDate(t)} ${fmtTime(t)}`;
+    return `${this.host.cameraName(this.cameraId)} · ${fmtDate(t)} ${fmtTime(t)}`;
   }
 
   setStatus(text, kind = "loading", sub = "", retry = null) {
@@ -1321,7 +1328,386 @@ class Player {
     }
   }
 
-  // ---- time mapping (HLS) -------------------------------------------------
+  /** Playing, or about to (a load that will autoplay). */
+  intendsPlay() {
+    return this.loading ? !!this.autoplay : !this.video.paused;
+  }
+
+  destroyMedia() {
+    this.mediaReady = false;
+    const v = this.video;
+    v.pause();
+    v.removeAttribute("src");
+    v.load();
+  }
+
+  destroy() {
+    this.seq++;
+    this.goingLive = this.connecting = this.reconnecting = false;
+    clearTimeout(this.bufTimer);
+    clearTimeout(this.veilTimer);
+    this.destroyMedia();
+    this.session = null;
+    this.el.remove();
+  }
+
+  /** The card left the page: nothing plays or connects until it's back. */
+  suspend() {
+    this.seq++;
+    this.loading = false;
+    this.goingLive = this.connecting = this.reconnecting = false;
+    this.destroyMedia();
+    this.session = null;
+  }
+
+  play() {
+    // Loading: play once it lands (the old media must stay paused).
+    if (this.loading) this.autoplay = true;
+    // In a gap (or nothing loaded): play from the next footage.
+    else if (!this.session || this.gap) this.seek(this.target, true);
+    else this.video.play().catch(() => {});
+    this.host.syncPlayIcon();
+  }
+
+  pause() {
+    this.autoplay = false;
+    this.video.pause();
+    this.host.syncPlayIcon();
+  }
+}
+
+/**
+ * A Player on SS's stream (a WebSocket relayed by HA, see StreamFeed): live,
+ * or the recordings from a time on, which a jump moves within the same
+ * connection.
+ */
+class StreamPlayer extends Player {
+  constructor(host, cameraId) {
+    super(host, cameraId);
+    this.feed = null; // SS's stream
+  }
+
+  wall() {
+    if (this.feed) return (this.mediaReady && !this.loading && this.feed.wall(this.video.currentTime)) || this.target;
+    return this.target;
+  }
+
+  destroyMedia() {
+    if (this.feed) {
+      this.feed.close();
+      this.feed = null;
+    }
+    super.destroyMedia();
+  }
+
+  seek(t, autoplay) {
+    if (!isLiveTime(t)) return this.stream(t, autoplay);
+    // Already live (or connecting): just the play intent.
+    if (this.feed?.live || this.goingLive) {
+      this.autoplay = autoplay;
+      if (!this.loading) autoplay ? this.video.play().catch(() => {}) : this.video.pause();
+      return;
+    }
+    return this.stream(null, autoplay);
+  }
+
+  /** Load wall time t afresh: a new stream connection. */
+  load(t, autoplay) {
+    return this.stream(isLiveTime(t) ? null : t, autoplay, true);
+  }
+
+  /**
+   * Play SS's stream: the camera live (at == null) or its recordings from
+   * wall time `at`. An open recordings stream jumps there, at once when it's
+   * in what's buffered (unless `viaSS`: a follower whose stream is barely
+   * ahead of the leader needs SS to send from further on); `fresh` connects
+   * anew instead.
+   */
+  async stream(at, autoplay, fresh = false, viaSS = false) {
+    const host = this.host;
+    const live = at == null;
+    const isLeader = this.isLeader();
+    // A follower asks for a little more, then waits for the leader (see FOLLOW_LEAD).
+    const ask = live || isLeader ? at : at + FOLLOW_LEAD * this.lead * host.rate();
+    const f = this.feed;
+    if (!live && !fresh && f && !f.live && !f.ended && f.started) {
+      this.seq++; // cancels a pending reconnect, or a live connection on its way
+      this.goingLive = this.reconnecting = this.connecting = false;
+      this.autoplay = autoplay;
+      this.target = at;
+      this.gap = false;
+      if (this.veilKind && this.veilKind !== "loading") this.setStatus("");
+      if (isLeader) host.paint(at);
+      const m = this.loading || viaSS ? null : f.mediaAt(at);
+      if (m != null) {
+        this.asked = at;
+        this.video.currentTime = m;
+        // A follower is started by follow(), which knows whether the leader plays.
+        if (!autoplay) this.video.pause();
+        else if (isLeader) this.video.play().catch(() => {});
+        return;
+      }
+      this.asked = ask;
+      this.lastLoad = { at: Date.now(), wall: at };
+      this.video.pause();
+      this.loading = true;
+      this.veilSoon(this.subline(at));
+      f.seekTo(ask);
+      return;
+    }
+    const seq = ++this.seq;
+    const name = host.cameraName(this.cameraId);
+    this.target = live ? nowS() : at;
+    this.asked = ask;
+    this.autoplay = autoplay;
+    this.lastLoad = { at: Date.now(), wall: this.target };
+    if (isLeader) host.paint(this.target);
+    this.freeze();
+    this.video.pause();
+    this.setStatus(live ? "Connecting" : "Loading", "loading", live ? `${name} · Live` : this.subline(at));
+    this.loading = true;
+    this.goingLive = live;
+    this.reconnecting = false;
+    this.connecting = true; // the current feed ending meanwhile changes nothing
+    let res;
+    try {
+      res = await host.ws({ type: "surveillance_station/live", camera_id: this.cameraId, ...(live ? {} : { time: ask }) });
+    } catch (e) {
+      if (seq === this.seq) {
+        this.loading = this.goingLive = this.connecting = false;
+        this.setStatus(live ? "Live view failed" : "Playback failed", "error", errText(e), () => this.stream(at, true, true));
+      }
+      return;
+    }
+    if (seq !== this.seq) return;
+    this.connecting = false;
+    this.destroyMedia();
+    this.gap = false;
+    this.session = { live, ws: true };
+    const url = host.hassUrl(res.url).replace(/^http/, "ws");
+    const feed = new StreamFeed(this, url, {
+      at: ask,
+      speed: host.rate(),
+      onStart: () => {
+        if (feed !== this.feed) return;
+        this.startedAt = Date.now();
+        this.landed();
+      },
+      onLanded: () => feed === this.feed && this.landed(),
+      onEnd: (why, detail) => feed === this.feed && this.streamEnded(feed, why, detail),
+    });
+    this.feed = feed;
+    this.syncAudio();
+  }
+
+  /** The stream shows the place asked for (or the footage after it). */
+  landed() {
+    this.loading = this.goingLive = this.streamFailed = false;
+    if (this.veilKind === "loading") this.setStatus("");
+    clearTimeout(this.veilTimer);
+    const host = this.host;
+    if (this.isLeader() || this.feed.live) {
+      if (this.autoplay) this.video.play().catch(() => {});
+    } else this.justLanded = true; // follow() lines it up and starts it
+    if (!this.isLeader()) return;
+    // Nothing recorded at the time asked for: SS went on to the next
+    // footage, and the others go there too, straight away.
+    const t = this.wall();
+    const skipped = !this.feed.live && t - this.target > 5;
+    host.onLeaderTime();
+    if (skipped) host.seekFollowers(t, this.autoplay);
+  }
+
+  /** The stream ended: reconnect where it was, backing off, or give up. */
+  streamEnded(feed, why, detail) {
+    // A new connection is on its way: it replaces this one anyway.
+    if (this.connecting) {
+      feed.close();
+      return;
+    }
+    const playing = this.intendsPlay();
+    const live = feed.live;
+    const at = live ? null : this.wall(); // what it showed, or where it was going
+    const started = feed.started;
+    this.destroyMedia();
+    this.loading = this.goingLive = false;
+    this.session = null;
+    const name = this.host.cameraName(this.cameraId);
+    const retry = () => {
+      this.drops = 0;
+      this.reconnecting = false;
+      this.streamFailed = false;
+      const m = this.host.leader();
+      this.stream(live ? null : m && m !== this ? m.wall() : at, true, true);
+    };
+    if (why === "codec") {
+      this.streamFailed = true;
+      if (/^(hev1|hvc1)/.test(detail ?? "")) this.host.noHevc();
+      this.setStatus("This browser can't decode this camera's video", "error", detail ?? "", retry);
+      return;
+    }
+    // Reconnect, backing off (1, 2, 4 s) while it keeps failing straight
+    // away, or never starts (refused, SS unreachable).
+    const quick = !started || Date.now() - this.startedAt < 10000;
+    this.drops = quick ? (this.drops ?? 0) + 1 : 1;
+    if (this.drops > 3) {
+      this.streamFailed = true;
+      this.setStatus(live ? "Live view unavailable" : "Playback unavailable", "error", name, retry);
+      // And keep trying, slowly, while the card is on screen: a wall tablet
+      // must come back by itself after the NAS reboots (monthly DSM updates).
+      const seq = this.seq;
+      const later = () => {
+        if (seq !== this.seq || !this.streamFailed) return; // moved on, or retried by hand
+        if (document.visibilityState === "visible" && this.host.onScreen()) retry();
+        else setTimeout(later, STREAM_RETRY_MS);
+      };
+      setTimeout(later, STREAM_RETRY_MS);
+      return;
+    }
+    this.setStatus("Reconnecting", "loading", live ? `${name} · Live` : this.subline(at));
+    const seq = this.seq;
+    this.reconnecting = true; // follow() leaves it to this
+    setTimeout(() => seq === this.seq && this.stream(at, playing, true), 1000 * 2 ** (this.drops - 1));
+  }
+
+  /** Sound: from the leader, when not muted, live or at 1x. */
+  syncAudio() {
+    const f = this.feed;
+    f?.setAudio(this.isLeader() && !this.video.muted && (f.live || this.host.rate() === 1));
+  }
+
+  /** The card's playback speed changed. */
+  setRate(rate) {
+    if (this.feed) this.feed.setSpeed(rate);
+    else this.video.playbackRate = this.video.defaultPlaybackRate = rate;
+    this.syncAudio();
+  }
+
+  /** Made the leader: it sets the pace (a follower may have been mid-nudge). */
+  takeLead(rate) {
+    if (this.feed) this.feed.nudge = 1;
+    else this.video.playbackRate = rate;
+  }
+
+  /** On the real-time stream, or connecting to it. */
+  onLive() {
+    return !!this.feed?.live || !!this.goingLive;
+  }
+
+  /** Showing wall time t is live: the stream close to now (live, or recordings that caught up). */
+  showsLive(t) {
+    return !!this.feed && nowS() - t < 10;
+  }
+
+  /**
+   * Grid follower: stay at the leader's wall time. Small drift is closed by
+   * nudging the speed, large drift by seeking; a moment this camera has no
+   * footage for pauses it behind a "No recording" veil.
+   */
+  follow(wall, playing, rate, stalled = false, leaderLive = false) {
+    if (this.loading) return;
+    if (leaderLive) {
+      // The leader is on the real-time stream: so is this camera, each
+      // keeping its own margin; only play / pause is shared.
+      if (!this.feed?.live) {
+        const last = this.lastLoad;
+        const wasLive = last && isLiveTime(last.wall + (Date.now() - last.at) / 1000);
+        if (!this.streamFailed && !this.reconnecting && (!last || Date.now() - last.at > 5000 || !wasLive)) this.stream(null, playing);
+        return;
+      }
+      const v = this.video;
+      if (playing && v.paused) v.play().catch(() => {});
+      else if (!playing && !v.paused) v.pause();
+      return;
+    }
+    return this.followStream(wall, playing, rate, stalled);
+  }
+
+  /**
+   * follow() on SS's stream. Within what's buffered a follower lines up at
+   * once; ahead of the leader it holds its frame until the leader gets
+   * there (showing "No recording" when that's a gap in its recordings);
+   * a little off, it plays a little faster or slower; further behind, it
+   * jumps (SS never sends faster than the speed asked for).
+   */
+  followStream(wall, playing, rate, stalled) {
+    const f = this.feed;
+    if (!f || f.live) {
+      const last = this.lastLoad;
+      if (!this.streamFailed && !this.reconnecting && (!last || Date.now() - last.at > 3000)) this.stream(wall, playing);
+      return;
+    }
+    if (!this.mediaReady || !f.started) return;
+    const v = this.video;
+    const drift = this.wall() - wall; // footage seconds; > 0: ahead of the leader
+    const lead = FOLLOW_LEAD * this.lead * rate;
+    let landedBehind = false;
+    if (this.justLanded) {
+      // Landed behind (a keyframe further back than the lead): ask for more
+      // (again, now: it doesn't loop, the lead doubles up to 8x). Landed
+      // ahead: a little less next time, so each camera ends up with a lead
+      // that fits how far apart its keyframes are.
+      this.justLanded = false;
+      landedBehind = drift < -0.1 * rate - 0.05;
+      this.lead = landedBehind ? Math.min(this.lead * 2, 8) : Math.max(1, this.lead * 0.8);
+      this.held = drift > 0;
+    }
+    const near = 0.6 * rate + 0.2; // this much off is made up by speed
+    let nudge = 1;
+    let hold = false;
+    if (this.held && drift > 0.03) hold = true; // released once in step, not near it
+    else if (Math.abs(drift) > 0.1 * rate + 0.05) {
+      const m = Math.abs(drift) > near || !playing ? f.mediaAt(wall) : null;
+      if (m != null) v.currentTime = m;
+      else if (drift > 0) {
+        // The leader went back before what this camera asked for: go there too.
+        if (wall < (this.asked ?? wall) - lead - 1) return this.resync(wall, playing);
+        // Once holding (a jump landed ahead, as asked), until it's in step.
+        if (drift > near || this.held) hold = true;
+        else nudge = 1 - clamp((drift / rate) * 0.5, 0, 0.2);
+      } else {
+        // Speed only helps with footage for the leader's time on its way
+        // (SS paces its stream: it doesn't catch up by itself).
+        const edge = (f.lastWall ?? 0) - wall;
+        if (-drift > near || edge < 0.2 * rate) return this.resync(wall, playing, landedBehind);
+        nudge = 1 + clamp((-drift / rate) * 0.5, 0, 0.2);
+      }
+    }
+    f.nudge = nudge;
+    this.held = hold;
+    // Further ahead than the lead explains: nothing recorded here until then
+    // (and still, until it plays again).
+    const gap = hold && (this.gap || drift > lead + 2 * rate + 1);
+    if (gap !== !!this.gap) {
+      this.gap = gap;
+      if (gap) this.setStatus("No recording", "empty", this.subline(wall));
+      else if (this.veilKind === "empty") this.setStatus("");
+    }
+    if (v.seeking) return;
+    const run = playing && !stalled && !hold;
+    if (run && v.paused) v.play().catch(() => {});
+    if (!run && !v.paused) v.pause();
+  }
+
+  /** Jump to the leader's time, unless the last jump is still recent. */
+  resync(wall, playing, now = false) {
+    const last = this.lastLoad;
+    if (!now && last && Date.now() - last.at < 1500) return;
+    this.stream(wall, playing, false, true);
+  }
+}
+
+/**
+ * A Player on the integration's HLS sessions (browsers without MSE): a
+ * window of wall-clock time per session, mapped to playlist time by its
+ * runs, and whatever was recorded next loaded when a window ends.
+ */
+class HlsPlayer extends Player {
+  constructor(host, cameraId) {
+    super(host, cameraId);
+    // Followers don't continue on their own: follow() moves them.
+    this.video.addEventListener("ended", () => this.isLeader() && this.continue());
+  }
 
   /** Playlist position for a wall time; inside a gap, the start of the next run. */
   wallToMedia(t) {
@@ -1358,70 +1744,19 @@ class Player {
     return null;
   }
 
-  /** Playing, or about to (a load that will autoplay). */
-  intendsPlay() {
-    return this.loading ? !!this.autoplay : !this.video.paused;
-  }
-
   wall() {
-    if (this.feed) return (this.mediaReady && !this.loading && this.feed.wall(this.video.currentTime)) || this.target;
     // In a gap the media sits at the next run's start; the time is target.
     if (this.session && this.mediaReady && !this.loading && !this.gap) return this.mediaToWall(this.video.currentTime) ?? this.target;
     return this.target;
   }
 
-  // ---- playback -----------------------------------------------------------
-
   destroyMedia() {
-    if (this.feed) {
-      this.feed.close();
-      this.feed = null;
-    }
     this.windowEvents?.abort();
     this.windowEvents = null;
-    this.mediaReady = false;
-    const v = this.video;
-    v.pause();
-    v.removeAttribute("src");
-    v.load();
-  }
-
-  destroy() {
-    this.seq++;
-    this.goingLive = this.connecting = this.reconnecting = false;
-    clearTimeout(this.bufTimer);
-    clearTimeout(this.veilTimer);
-    this.destroyMedia();
-    this.session = null;
-    this.el.remove();
-  }
-
-  play() {
-    // Loading: play once it lands (the old media must stay paused).
-    if (this.loading) this.autoplay = true;
-    // In a gap (or nothing loaded): play from the next footage.
-    else if (!this.session || this.gap) this.seek(this.target, true);
-    else this.video.play().catch(() => {});
-    this.card._syncPlayIcon();
-  }
-
-  pause() {
-    this.autoplay = false;
-    this.video.pause();
-    this.card._syncPlayIcon();
+    super.destroyMedia();
   }
 
   seek(t, autoplay) {
-    if (MSE) {
-      if (!isLiveTime(t)) return this.stream(t, autoplay);
-      // Already live (or connecting): just the play intent.
-      if (this.feed?.live || this.goingLive) {
-        this.autoplay = autoplay;
-        if (!this.loading) autoplay ? this.video.play().catch(() => {}) : this.video.pause();
-        return;
-      }
-      return this.stream(null, autoplay);
-    }
     t = Math.min(t, nowS() - LIVE_LAG);
     const s = this.session;
     if (this.loading) {
@@ -1445,10 +1780,10 @@ class Player {
         if (this.veilKind && this.veilKind !== "loading") this.setStatus("");
         this.target = t;
         this.video.currentTime = m;
-        if (this.card._master === this) this.card._paint(t);
+        const isLeader = this.isLeader();
+        if (isLeader) this.host.paint(t);
         // A follower sent into a gap stays paused; follow() shows the gap.
-        const isMaster = this.card._master === this;
-        if (autoplay && (isMaster || this.exactMedia(t) != null)) this.video.play().catch(() => {});
+        if (autoplay && (isLeader || this.exactMedia(t) != null)) this.video.play().catch(() => {});
         return;
       }
     }
@@ -1456,28 +1791,26 @@ class Player {
   }
 
   /**
-   * Load wall time t afresh: with MSE a new stream connection; without, a
-   * playback window around t.
+   * Load wall time t afresh: a playback window around t.
    * `after`: when continuing past the end of a window, the wall time the new
    * window must get beyond; otherwise playback stops instead of looping.
    */
   async load(t, autoplay, after = null) {
-    if (MSE) return this.stream(isLiveTime(t) ? null : t, autoplay, true);
     const seq = ++this.seq;
-    const card = this.card;
+    const host = this.host;
     const now = nowS();
     t = Math.min(t, now - LIVE_LAG);
     this.target = t;
     this.autoplay = autoplay; // play() / pause() during the load change it
     this.lastLoad = { at: Date.now(), wall: t };
-    if (card._master === this) card._paint(t);
+    if (this.isLeader()) host.paint(t);
     this.freeze();
     this.video.pause(); // the old window mustn't play (or move the playhead) under the veil
     this.setStatus("Loading", "loading", this.subline(t));
     this.loading = true;
     let res;
     try {
-      res = await card._ws({
+      res = await host.ws({
         type: "surveillance_station/vod",
         camera_id: this.cameraId,
         start: t - PRE_ROLL,
@@ -1505,20 +1838,20 @@ class Player {
     // Requested start: time before the first run is a known gap, not "outside".
     res.reqStart = t - PRE_ROLL;
     this.session = res;
-    if (card._master !== this && this.exactMedia(t) == null) this.autoplay = false;
+    if (!this.isLeader() && this.exactMedia(t) == null) this.autoplay = false;
     let start = this.wallToMedia(t);
     if (start == null && res.live) start = this.wallToMediaLive(t);
     if (start == null) return stop(`No recording after ${fmtTime(t)}`);
     if (t < res.runs[0].wall_start - 1) this.target = res.runs[0].wall_start; // started in a gap
     this.loading = false;
     const v = this.video;
-    v.playbackRate = v.defaultPlaybackRate = card._rate;
+    v.playbackRate = v.defaultPlaybackRate = host.rate();
     // No MSE (Safari before 17.1): the browser plays HLS itself.
     if (!v.canPlayType("application/vnd.apple.mpegurl")) {
       this.setStatus("This browser can't play this video", "error");
       return;
     }
-    v.src = card._hass.hassUrl(res.url); // absolute, as the stream's (HA Cast)
+    v.src = host.hassUrl(res.url); // absolute, as the stream's (HA Cast)
     // This window's listeners go with it (destroyMedia): an error one that
     // never fired would otherwise stay on the element for every window after.
     const { signal } = (this.windowEvents = new AbortController());
@@ -1543,7 +1876,7 @@ class Player {
       const timer = setInterval(async () => {
         if (this.session !== res) return clearInterval(timer);
         try {
-          const upd = await card._ws({ type: "surveillance_station/vod_runs", token });
+          const upd = await host.ws({ type: "surveillance_station/vod_runs", token });
           if (this.session === res) Object.assign(res, upd);
         } catch (e) {
           /* the next round retries */
@@ -1552,186 +1885,19 @@ class Player {
     }
   }
 
-  /**
-   * Play SS's stream: the camera live (at == null) or its recordings from
-   * wall time `at`. An open recordings stream jumps there, at once when it's
-   * in what's buffered (unless `viaSS`: a follower whose stream is barely
-   * ahead of the master needs SS to send from further on); `fresh` connects
-   * anew instead.
-   */
-  async stream(at, autoplay, fresh = false, viaSS = false) {
-    const card = this.card;
-    const live = at == null;
-    const isMaster = card._master === this;
-    // A follower asks for a little more, then waits for the master (see FOLLOW_LEAD).
-    const ask = live || isMaster ? at : at + FOLLOW_LEAD * this.lead * card._rate;
-    const f = this.feed;
-    if (!live && !fresh && f && !f.live && !f.ended && f.started) {
-      this.seq++; // cancels a pending reconnect, or a live connection on its way
-      this.goingLive = this.reconnecting = this.connecting = false;
-      this.autoplay = autoplay;
-      this.target = at;
-      this.gap = false;
-      if (this.veilKind && this.veilKind !== "loading") this.setStatus("");
-      if (isMaster) card._paint(at);
-      const m = this.loading || viaSS ? null : f.mediaAt(at);
-      if (m != null) {
-        this.asked = at;
-        this.video.currentTime = m;
-        // A follower is started by follow(), which knows whether the master plays.
-        if (!autoplay) this.video.pause();
-        else if (isMaster) this.video.play().catch(() => {});
-        return;
-      }
-      this.asked = ask;
-      this.lastLoad = { at: Date.now(), wall: at };
-      this.video.pause();
-      this.loading = true;
-      this.veilSoon(this.subline(at));
-      f.seekTo(ask);
-      return;
-    }
-    const seq = ++this.seq;
-    const name = card._cameraName(this.cameraId);
-    this.target = live ? nowS() : at;
-    this.asked = ask;
-    this.autoplay = autoplay;
-    this.lastLoad = { at: Date.now(), wall: this.target };
-    if (isMaster) card._paint(this.target);
-    this.freeze();
-    this.video.pause();
-    this.setStatus(live ? "Connecting" : "Loading", "loading", live ? `${name} · Live` : this.subline(at));
-    this.loading = true;
-    this.goingLive = live;
-    this.reconnecting = false;
-    this.connecting = true; // the current feed ending meanwhile changes nothing
-    let res;
-    try {
-      res = await card._ws({ type: "surveillance_station/live", camera_id: this.cameraId, ...(live ? {} : { time: ask }) });
-    } catch (e) {
-      if (seq === this.seq) {
-        this.loading = this.goingLive = this.connecting = false;
-        this.setStatus(live ? "Live view failed" : "Playback failed", "error", errText(e), () => this.stream(at, true, true));
-      }
-      return;
-    }
-    if (seq !== this.seq) return;
-    this.connecting = false;
-    this.destroyMedia();
-    this.gap = false;
-    this.session = { live, ws: true };
-    const url = card._hass.hassUrl(res.url).replace(/^http/, "ws");
-    const feed = new StreamFeed(this, url, {
-      at: ask,
-      speed: card._rate,
-      onStart: () => {
-        if (feed !== this.feed) return;
-        this.startedAt = Date.now();
-        this.landed();
-      },
-      onLanded: () => feed === this.feed && this.landed(),
-      onEnd: (why, detail) => feed === this.feed && this.streamEnded(feed, why, detail),
-    });
-    this.feed = feed;
-    this.syncAudio();
-  }
-
-  /** The stream shows the place asked for (or the footage after it). */
-  landed() {
-    this.loading = this.goingLive = this.streamFailed = false;
-    if (this.veilKind === "loading") this.setStatus("");
-    clearTimeout(this.veilTimer);
-    const card = this.card;
-    if (card._master === this || this.feed.live) {
-      if (this.autoplay) this.video.play().catch(() => {});
-    } else this.justLanded = true; // follow() lines it up and starts it
-    if (card._master !== this) return;
-    // Nothing recorded at the time asked for: SS went on to the next
-    // footage, and the others go there too, straight away.
-    const t = this.wall();
-    const skipped = !this.feed.live && t - this.target > 5;
-    card._onTime();
-    if (skipped) for (const p of card._players.values()) if (p !== this) p.seek(t, this.autoplay);
-  }
-
-  /** The stream ended: reconnect where it was, backing off, or give up. */
-  streamEnded(feed, why, detail) {
-    // A new connection is on its way: it replaces this one anyway.
-    if (this.connecting) {
-      feed.close();
-      return;
-    }
-    const playing = this.intendsPlay();
-    const live = feed.live;
-    const at = live ? null : this.wall(); // what it showed, or where it was going
-    const started = feed.started;
-    this.destroyMedia();
-    this.loading = this.goingLive = false;
-    this.session = null;
-    const name = this.card._cameraName(this.cameraId);
-    const retry = () => {
-      this.drops = 0;
-      this.reconnecting = false;
-      this.streamFailed = false;
-      const m = this.card._master;
-      this.stream(live ? null : m && m !== this ? m.wall() : at, true, true);
-    };
-    if (why === "codec") {
-      this.streamFailed = true;
-      if (/^(hev1|hvc1)/.test(detail ?? "")) this.card._noHevc();
-      this.setStatus("This browser can't decode this camera's video", "error", detail ?? "", retry);
-      return;
-    }
-    // Reconnect, backing off (1, 2, 4 s) while it keeps failing straight
-    // away, or never starts (refused, SS unreachable).
-    const quick = !started || Date.now() - this.startedAt < 10000;
-    this.drops = quick ? (this.drops ?? 0) + 1 : 1;
-    if (this.drops > 3) {
-      this.streamFailed = true;
-      this.setStatus(live ? "Live view unavailable" : "Playback unavailable", "error", name, retry);
-      // And keep trying, slowly, while the card is on screen: a wall tablet
-      // must come back by itself after the NAS reboots (monthly DSM updates).
-      const seq = this.seq;
-      const later = () => {
-        if (seq !== this.seq || !this.streamFailed) return; // moved on, or retried by hand
-        if (document.visibilityState === "visible" && this.card.isConnected) retry();
-        else setTimeout(later, STREAM_RETRY_MS);
-      };
-      setTimeout(later, STREAM_RETRY_MS);
-      return;
-    }
-    this.setStatus("Reconnecting", "loading", live ? `${name} · Live` : this.subline(at));
-    const seq = this.seq;
-    this.reconnecting = true; // follow() leaves it to this
-    setTimeout(() => seq === this.seq && this.stream(at, playing, true), 1000 * 2 ** (this.drops - 1));
-  }
-
-  /** Sound: from the master, when not muted, live or at 1x. */
-  syncAudio() {
-    const f = this.feed;
-    f?.setAudio(this.card._master === this && !this.video.muted && (f.live || this.card._rate === 1));
-  }
-
-  /** The card's playback speed changed. */
-  setRate(rate) {
-    if (this.feed) this.feed.setSpeed(rate);
-    else this.video.playbackRate = this.video.defaultPlaybackRate = rate;
-    this.syncAudio();
-  }
-
   /** At the end of an HLS window, carry on into whatever was recorded next. */
   async continue() {
     // "ended" means the playlist is closed: an old window, or a live one that
     // hit the server's window cap.
     const s = this.session;
-    if (!s || this.feed) return;
+    if (!s) return;
     const seq = this.seq;
     const next = s.end;
     this.setStatus("Finding the next recording", "loading", this.subline(next));
     let recs;
     try {
       recs = (
-        await this.card._ws({
+        await this.host.ws({
           type: "surveillance_station/recordings",
           camera_id: this.cameraId,
           start: Math.floor(next),
@@ -1752,34 +1918,42 @@ class Player {
     this.load(Math.max(rec.start, next), true, next);
   }
 
+  /** Sound: the <video> plays its own (muted or not). */
+  syncAudio() {}
+
+  /** The card's playback speed changed. */
+  setRate(rate) {
+    this.video.playbackRate = this.video.defaultPlaybackRate = rate;
+  }
+
+  /** Made the leader: it sets the pace (a follower may have been mid-nudge). */
+  takeLead(rate) {
+    this.video.playbackRate = rate;
+  }
+
+  /** HLS has no real-time stream. */
+  onLive() {
+    return false;
+  }
+
+  /** Showing wall time t is live: close to the end of the growing recording. */
+  showsLive(t) {
+    return !!this.session?.live && nowS() - t < LIVE_LAG + 20;
+  }
+
   /**
-   * Grid follower: stay at the master's wall time. Small drift is closed by
+   * Grid follower: stay at the leader's wall time. Small drift is closed by
    * nudging the speed, large drift by seeking; a moment this camera has no
    * footage for pauses it behind a "No recording" veil.
    */
-  follow(wall, playing, rate, stalled = false, masterLive = false) {
+  follow(wall, playing, rate, stalled = false) {
     if (this.loading) return;
-    if (masterLive) {
-      // The master is on the real-time stream: so is this camera, each
-      // keeping its own margin; only play / pause is shared.
-      if (!this.feed?.live) {
-        const last = this.lastLoad;
-        const wasLive = last && isLiveTime(last.wall + (Date.now() - last.at) / 1000);
-        if (!this.streamFailed && !this.reconnecting && (!last || Date.now() - last.at > 5000 || !wasLive)) this.stream(null, playing);
-        return;
-      }
-      const v = this.video;
-      if (playing && v.paused) v.play().catch(() => {});
-      else if (!playing && !v.paused) v.pause();
-      return;
-    }
-    if (MSE) return this.followStream(wall, playing, rate, stalled);
     const s = this.session;
     const inWindow = s && wall >= Math.min(s.start, s.reqStart ?? s.start) - 1 && (s.live || wall < s.end);
     if (!inWindow) {
       const last = this.lastLoad;
       // Nothing recorded in the window we last asked for: don't ask again
-      // until the master leaves it; otherwise at most every 5 s.
+      // until the leader leaves it; otherwise at most every 5 s.
       const covered = !s && last && wall >= last.wall - PRE_ROLL && wall < last.wall + WINDOW_AHEAD;
       if (!covered && (!last || Date.now() - last.at > 5000)) this.load(wall, playing);
       return;
@@ -1816,79 +1990,6 @@ class Player {
     if (playing && v.paused && !v.ended) v.play().catch(() => {});
     if (!playing && !v.paused) v.pause();
   }
-
-  /**
-   * follow() on SS's stream. Within what's buffered a follower lines up at
-   * once; ahead of the master it holds its frame until the master gets
-   * there (showing "No recording" when that's a gap in its recordings);
-   * a little off, it plays a little faster or slower; further behind, it
-   * jumps (SS never sends faster than the speed asked for).
-   */
-  followStream(wall, playing, rate, stalled) {
-    const f = this.feed;
-    if (!f || f.live) {
-      const last = this.lastLoad;
-      if (!this.streamFailed && !this.reconnecting && (!last || Date.now() - last.at > 3000)) this.stream(wall, playing);
-      return;
-    }
-    if (!this.mediaReady || !f.started) return;
-    const v = this.video;
-    const drift = this.wall() - wall; // footage seconds; > 0: ahead of the master
-    const lead = FOLLOW_LEAD * this.lead * rate;
-    let landedBehind = false;
-    if (this.justLanded) {
-      // Landed behind (a keyframe further back than the lead): ask for more
-      // (again, now: it doesn't loop, the lead doubles up to 8x). Landed
-      // ahead: a little less next time, so each camera ends up with a lead
-      // that fits how far apart its keyframes are.
-      this.justLanded = false;
-      landedBehind = drift < -0.1 * rate - 0.05;
-      this.lead = landedBehind ? Math.min(this.lead * 2, 8) : Math.max(1, this.lead * 0.8);
-      this.held = drift > 0;
-    }
-    const near = 0.6 * rate + 0.2; // this much off is made up by speed
-    let nudge = 1;
-    let hold = false;
-    if (this.held && drift > 0.03) hold = true; // released once in step, not near it
-    else if (Math.abs(drift) > 0.1 * rate + 0.05) {
-      const m = Math.abs(drift) > near || !playing ? f.mediaAt(wall) : null;
-      if (m != null) v.currentTime = m;
-      else if (drift > 0) {
-        // The master went back before what this camera asked for: go there too.
-        if (wall < (this.asked ?? wall) - lead - 1) return this.resync(wall, playing);
-        // Once holding (a jump landed ahead, as asked), until it's in step.
-        if (drift > near || this.held) hold = true;
-        else nudge = 1 - clamp((drift / rate) * 0.5, 0, 0.2);
-      } else {
-        // Speed only helps with footage for the master's time on its way
-        // (SS paces its stream: it doesn't catch up by itself).
-        const edge = (f.lastWall ?? 0) - wall;
-        if (-drift > near || edge < 0.2 * rate) return this.resync(wall, playing, landedBehind);
-        nudge = 1 + clamp((-drift / rate) * 0.5, 0, 0.2);
-      }
-    }
-    f.nudge = nudge;
-    this.held = hold;
-    // Further ahead than the lead explains: nothing recorded here until then
-    // (and still, until it plays again).
-    const gap = hold && (this.gap || drift > lead + 2 * rate + 1);
-    if (gap !== !!this.gap) {
-      this.gap = gap;
-      if (gap) this.setStatus("No recording", "empty", this.subline(wall));
-      else if (this.veilKind === "empty") this.setStatus("");
-    }
-    if (v.seeking) return;
-    const run = playing && !stalled && !hold;
-    if (run && v.paused) v.play().catch(() => {});
-    if (!run && !v.paused) v.pause();
-  }
-
-  /** Jump to the master's time, unless the last jump is still recent. */
-  resync(wall, playing, now = false) {
-    const last = this.lastLoad;
-    if (!now && last && Date.now() - last.at < 1500) return;
-    this.stream(wall, playing, false, true);
-  }
 }
 
 class SSTimelineCard extends HTMLElement {
@@ -1896,9 +1997,9 @@ class SSTimelineCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._cameras = [];
-    this._cameraId = null; // the master's camera
+    this._cameraId = null; // the leader's camera
     this._players = new Map(); // cameraId -> Player
-    this._master = null;
+    this._leader = null;
     this._recs = [];
     this._bookmarks = [];
     this._rate = 1;
@@ -1930,7 +2031,7 @@ class SSTimelineCard extends HTMLElement {
     // (A link is taken out of the address once followed, so going back or
     // closing a dialog later doesn't return to it.)
     this._onLocation = () => {
-      if (this._inited && this._master && this.isConnected) this._followLink();
+      if (this._inited && this._leader && this.isConnected) this._followLink();
     };
     // HA came back (e.g. restarted): its playback sessions and thumbnail
     // links are gone, and events may have been missed meanwhile. HA's own
@@ -1947,20 +2048,20 @@ class SSTimelineCard extends HTMLElement {
 
   _reconnected() {
     if (!this.isConnected || !this._inited) return;
-    if (!this._master) {
+    if (!this._leader) {
       // Still on "Can't list cameras": try again now that HA is back.
       if (!this._camsFailed) return; // or still loading them
       this._inited = false;
       this._init();
       return;
     }
-    const t = this._master.wall();
+    const t = this._leader.wall();
     const at = this._wantsLive(t) ? nowS() : t;
-    const playing = this._master.intendsPlay();
+    const playing = this._leader.intendsPlay();
     this._loadTimeline();
     // New sessions: a seek could stay inside one the server no longer has.
-    this._master.load(at, playing);
-    for (const p of this._players.values()) if (p !== this._master) p.load(at, playing);
+    this._leader.load(at, playing);
+    for (const p of this._players.values()) if (p !== this._leader) p.load(at, playing);
     this._resetEvents();
   }
 
@@ -2000,8 +2101,8 @@ class SSTimelineCard extends HTMLElement {
 
   connectedCallback() {
     if (this._hass && !this._inited) this._init();
-    else if (this._inited && this._master && this._followLink()) this._resume = null;
-    else if (this._inited && this._resume && this._master) {
+    else if (this._inited && this._leader && this._followLink()) this._resume = null;
+    else if (this._inited && this._resume && this._leader) {
       // Back on the view: live again if it was live, else where it was.
       const { t, playing, live } = this._resume;
       this._resume = null;
@@ -2036,17 +2137,11 @@ class SSTimelineCard extends HTMLElement {
     this._endTrackKeys();
     this._hass?.connection?.removeEventListener?.("ready", this._onReconnect);
     // Whatever state it was in (loading, a gap), pick up there on return.
-    if (this._master) {
-      const t = this._master.wall();
-      this._resume = { t, playing: this._master.intendsPlay(), live: this._wantsLive(t) };
+    if (this._leader) {
+      const t = this._leader.wall();
+      this._resume = { t, playing: this._leader.intendsPlay(), live: this._wantsLive(t) };
     }
-    for (const p of this._players.values()) {
-      p.seq++;
-      p.loading = false;
-      p.goingLive = p.connecting = p.reconnecting = false;
-      p.destroyMedia();
-      p.session = null;
-    }
+    for (const p of this._players.values()) p.suspend();
   }
 
   // ---- setup ------------------------------------------------------------
@@ -2377,18 +2472,41 @@ class SSTimelineCard extends HTMLElement {
   // ---- players / layout ---------------------------------------------------
 
   _makePlayer(id) {
-    const p = new Player(this, id);
+    this._host ??= this._playerHost();
+    const p = new (MSE ? StreamPlayer : HlsPlayer)(this._host, id);
     p.el.style.setProperty("--cam", this._camColor(id));
     this._stage.insertBefore(p.el, this._clock);
     return p;
   }
 
+  /** What a Player may ask of the card: all it knows of it. */
+  _playerHost() {
+    return {
+      leader: () => this._leader,
+      rate: () => this._rate,
+      cameraName: (id) => this._cameraName(id),
+      ws: (msg) => this._ws(msg),
+      hassUrl: (path) => this._hass.hassUrl(path),
+      onLeaderTime: () => this._onTime(),
+      paint: (t) => this._paint(t),
+      syncPlayIcon: () => this._syncPlayIcon(),
+      syncMuteIcon: () => this._syncMuteIcon(),
+      cellTap: (player, double, x, y) => this._onCellTap(player, double, x, y),
+      noHevc: () => this._noHevc(),
+      // The leader landed past a gap: the others go there too, straight away.
+      seekFollowers: (t, autoplay) => {
+        for (const p of this._players.values()) if (p !== this._leader) p.seek(t, autoplay);
+      },
+      onScreen: () => this.isConnected,
+    };
+  }
+
   /**
-   * Create / drop players to match this._shown; the master is this._cameraId.
+   * Create / drop players to match this._shown; the leader is this._cameraId.
    * One camera shown is the single view, several are the grid.
    */
   _buildPlayers() {
-    // The master is always shown.
+    // The leader is always shown.
     if (!this._shown.includes(this._cameraId)) this._shown = [...this._shown, this._cameraId];
     const want = this._cameras.filter((c) => this._shown.includes(c.id)).map((c) => c.id);
     this._shown = want; // camera order
@@ -2416,7 +2534,7 @@ class SSTimelineCard extends HTMLElement {
     this._stage.classList.toggle("single", n <= 1);
     this._stage.classList.toggle("nocam", n === 0);
     requestAnimationFrame(() => this._fit());
-    this._setMaster(this._cameraId);
+    this._setLeader(this._cameraId);
     for (const b of this.shadowRoot.querySelectorAll('[data-act="solo"]')) {
       b.hidden = this._cameras.length < 2;
       setLabel(b, this._grid ? "One camera (the chips switch it)" : "Grid (the chips add and remove cameras)");
@@ -2425,59 +2543,58 @@ class SSTimelineCard extends HTMLElement {
     return added;
   }
 
-  _setMaster(id) {
-    const old = this._master;
+  _setLeader(id) {
+    const old = this._leader;
     const p = this._players.get(id);
     if (!p) return;
-    // A follower in a gap is paused on its next run; as master it holds the
+    // A follower in a gap is paused on its next run; as leader it holds the
     // time it was showing "No recording" for (play then goes to its next footage).
     if (p !== old && p.gap && old) p.target = old.wall();
-    // Sound only from the master; it inherits the old master's choice (read
-    // before the loop below mutes the old master).
+    // Sound only from the leader; it inherits the old leader's choice (read
+    // before the loop below mutes the old leader).
     const muted = old && old !== p ? old.video.muted : p.video.muted;
-    this._master = p;
+    this._leader = p;
     this._cameraId = id;
     prefs.set("camera", id);
     for (const q of this._players.values()) {
-      q.el.classList.toggle("master", q === p);
+      q.el.classList.toggle("leader", q === p);
       if (q !== p) q.video.muted = true;
     }
     p.video.muted = muted;
     for (const q of this._players.values()) q.syncAudio();
-    // A follower holding its frame (waiting for the old master, or in a gap)
-    // is paused: as master it carries on what the old one was doing.
+    // A follower holding its frame (waiting for the old leader, or in a gap)
+    // is paused: as leader it carries on what the old one was doing.
     if (old && p !== old && old.intendsPlay() && !p.intendsPlay()) p.play();
-    // A follower may have been mid-nudge; the master sets the pace.
-    if (p.feed) p.feed.nudge = 1;
-    else p.video.playbackRate = this._rate;
+    // A follower may have been mid-nudge; the leader sets the pace.
+    p.takeLead(this._rate);
     this._markCameras();
     this._syncPlayIcon();
     this._syncMuteIcon();
   }
 
-  /** Chips: tinted = shown, a ring in its colour = the master (when several are shown). */
+  /** Chips: tinted = shown, a ring in its colour = the leader (when several are shown). */
   _markCameras() {
     this.shadowRoot.querySelector(".cams")?.classList.toggle("multi", this._shown.length > 1);
     for (const b of this.shadowRoot.querySelectorAll("[data-cam]")) {
       const id = Number(b.dataset.cam);
-      b.classList.toggle("master", id === this._cameraId);
+      b.classList.toggle("leader", id === this._cameraId);
       b.classList.toggle("shown", this._shown.includes(id));
       b.setAttribute("aria-pressed", String(this._shown.includes(id)));
     }
   }
 
   /**
-   * Show exactly these cameras (plus the master), keeping everyone at the
-   * master's time. The timeline and the event list follow the shown set.
+   * Show exactly these cameras (plus the leader), keeping everyone at the
+   * leader's time. The timeline and the event list follow the shown set.
    */
-  _setShown(ids, master = this._cameraId, at = null, autoplay = null, keep = true) {
-    const m = this._master;
+  _setShown(ids, leader = this._cameraId, at = null, autoplay = null, keep = true) {
+    const m = this._leader;
     if (!m) return;
     const wall = at ?? m.wall();
     const playing = autoplay ?? m.intendsPlay();
     const before = [...this._shown];
-    this._shown = [...new Set([...ids, master])];
-    this._cameraId = master;
+    this._shown = [...new Set([...ids, leader])];
+    this._cameraId = leader;
     const added = this._buildPlayers();
     if (this._grid && keep) {
       this._gridSet = this._shown;
@@ -2485,9 +2602,9 @@ class SSTimelineCard extends HTMLElement {
     }
     for (const p of this._players.values()) p.zoom.reset(); // the cell size changed
     // New cells start empty. Moving a video element in the DOM pauses it:
-    // the master resumes here, followers through follow().
+    // the leader resumes here, followers through follow().
     for (const p of added) p.load(wall, playing);
-    const nm = this._master;
+    const nm = this._leader;
     if (!added.includes(nm) && !nm.loading && playing) nm.play();
     if (this._shown.join() !== before.join()) {
       this._recs = [];
@@ -2511,7 +2628,7 @@ class SSTimelineCard extends HTMLElement {
     this._setShown(rest, id === this._cameraId ? rest[0] : this._cameraId);
   }
 
-  /** Grid <-> one camera (the master; back in the grid, the grid's cameras). */
+  /** Grid <-> one camera (the leader; back in the grid, the grid's cameras). */
   _toggleGrid() {
     this._grid = !this._grid;
     prefs.set("grid", this._grid);
@@ -2521,9 +2638,9 @@ class SSTimelineCard extends HTMLElement {
     this._setShown(ids, ids.includes(this._cameraId) ? this._cameraId : ids[0]);
   }
 
-  /** Make a camera the master (showing it if needed) and go to t. */
+  /** Make a camera the leader (showing it if needed) and go to t. */
   _selectCamera(id, t, autoplay, keep = true) {
-    if (this._shown.includes(id)) this._setMaster(id);
+    if (this._shown.includes(id)) this._setLeader(id);
     // _seekAll then finds it loading there.
     else this._setShown(this._grid ? [...this._shown, id] : [id], id, t, autoplay, keep);
     this._centerOn(t);
@@ -2549,32 +2666,32 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _seekAll(t, autoplay) {
-    // Master first: followers then correct to wherever it actually lands.
-    this._master?.seek(t, autoplay);
-    for (const p of this._players.values()) if (p !== this._master) p.seek(t, autoplay);
+    // Leader first: followers then correct to wherever it actually lands.
+    this._leader?.seek(t, autoplay);
+    for (const p of this._players.values()) if (p !== this._leader) p.seek(t, autoplay);
   }
 
   _sync() {
-    const m = this._master;
+    const m = this._leader;
     if (this._players.size < 2 || !m) return;
     const followers = [...this._players.values()].filter((p) => p !== m);
-    if (m.feed?.live || m.goingLive) {
-      // Live: no waiting for the master's stalls (each stream has its own).
+    if (m.onLive()) {
+      // Live: no waiting for the leader's stalls (each stream has its own).
       for (const p of followers) p.follow(m.wall(), m.intendsPlay(), this._rate, false, true);
       return;
     }
     if (m.loading || (m.session && !m.mediaReady && !m.gap)) {
-      // Wait where they are; they'll be moved once the master's media is up.
+      // Wait where they are; they'll be moved once the leader's media is up.
       for (const p of followers) if (!p.loading && !p.video.paused) p.video.pause();
       return;
     }
-    // A master with nothing recorded at its time (no session, or in a gap)
+    // A leader with nothing recorded at its time (no session, or in a gap)
     // still holds that time: the others show it, paused.
     const live = m.session && m.mediaReady && !m.gap;
     const wall = live ? m.wall() : m.target;
     const v = m.video;
     const playing = live && !v.paused;
-    // A buffering master isn't moving: followers pause, but aren't re-seeked.
+    // A buffering leader isn't moving: followers pause, but aren't re-seeked.
     const stalled = playing && (v.seeking || v.readyState < 3);
     for (const p of followers) p.follow(wall, playing && !stalled, this._rate, stalled);
   }
@@ -2583,16 +2700,16 @@ class SSTimelineCard extends HTMLElement {
     if (this._players.size > 1) {
       if (double) {
         // Double tap a cell: that camera alone.
-        this._setMaster(player.cameraId);
+        this._setLeader(player.cameraId);
         this._toggleGrid();
-      } else this._setMaster(player.cameraId);
+      } else this._setLeader(player.cameraId);
     } else if (double) {
       player.zoom.toggleAt(x, y);
     }
   }
 
   _syncPlayIcon() {
-    const paused = !this._master?.intendsPlay();
+    const paused = !this._leader?.intendsPlay();
     for (const b of this.shadowRoot.querySelectorAll('[data-act="play"]')) {
       b.querySelector("ha-icon").setAttribute("icon", paused ? "mdi:play" : "mdi:pause");
       setLabel(b, paused ? "Play" : "Pause");
@@ -2600,8 +2717,8 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _syncMuteIcon() {
-    const muted = !this._master || this._master.video.muted;
-    const unplayable = this._master?.audioUnplayable;
+    const muted = !this._leader || this._leader.video.muted;
+    const unplayable = this._leader?.audioUnplayable;
     const button = this.shadowRoot.querySelector('[data-act="mute"]');
     button?.querySelector("ha-icon")?.setAttribute(
       "icon", unplayable && !muted ? "mdi:volume-variant-off" : muted ? "mdi:volume-off" : "mdi:volume-high"
@@ -2651,7 +2768,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _videoFullscreen() {
-    const v = this._master?.video;
+    const v = this._leader?.video;
     try {
       // Throws before metadata; there's nothing to show fullscreen yet anyway.
       if (v && v.readyState >= 1) v.webkitEnterFullscreen?.();
@@ -2683,158 +2800,190 @@ class SSTimelineCard extends HTMLElement {
 
   // ---- controls -------------------------------------------------------------
 
+  /**
+   * A tap on a button: what it does is named by the data attribute it
+   * carries (see _buttonHandlers; data-act by its value, see _actionHandlers).
+   * Most need the leader, and do nothing while there is none (the camera list
+   * failed, or is still loading).
+   */
   _onClick(e) {
-    const b = e.target.closest("button");
-    if (!b) return;
-    const m = this._master;
-    if (b.dataset.cam) {
-      const id = Number(b.dataset.cam);
-      this._chip(id);
+    const button = e.target.closest("button");
+    if (!button) return;
+    this._buttons ??= this._buttonHandlers();
+    for (const [attr, { anytime, run }] of this._buttons) {
+      const value = button.dataset[attr];
+      if (!value) continue;
+      if (anytime || this._leader) run(value, button, e);
       return;
     }
-    if (b.dataset.act === "events") {
-      const open = this._layoutEl.classList.toggle("noside") === false;
-      prefs.set("events", open);
-      this.shadowRoot.querySelector(".evtoggle").setAttribute("aria-pressed", String(open));
-      this._fit();
-      return;
-    }
-    // What's shown on the video: CSS only, no player needed.
-    if (b.dataset.show) {
-      const k = b.dataset.show;
-      this._shows[k] = !this._shows[k];
-      prefs.set(k, this._shows[k]);
-      this._applyShows();
-      return;
-    }
-    if (b.dataset.kind) {
-      const k = b.dataset.kind;
-      if (this._kinds.has(k)) this._kinds.delete(k);
-      else this._kinds.add(k);
-      prefs.set("kinds", [...this._kinds]);
-      this._drawKinds();
-      this._drawTimeline();
-      this._resetEvents(); // the bookmarks, of these kinds (and a search shown, asked anew)
-      return;
-    }
-    if (b.dataset.similar) {
-      const id = Number(b.dataset.similar);
-      const ev = this._evItems.find((x) => x.id === id) ?? this._search?.items.find((x) => x.bookmark_id === id);
-      const what = ev ? `${ev.name} · ${this._cameraName(ev.camera_id)} ${fmtDate(ev.start)} ${fmtTime(ev.start)}` : "this event";
-      this._runSearch({ bookmark_id: id }, `Similar to ${what}`);
-      return;
-    }
-    if (b.dataset.act === "search-close") {
-      this._endSearch();
-      return;
-    }
-    if (b.dataset.act === "shows") {
-      this._jumpBox.hidden = true;
-      this._showsBox.hidden = !this._showsBox.hidden;
-      // Into the list, so Escape (and the keyboard) work there straight away.
-      if (!this._showsBox.hidden) this._showsBox.querySelector("button")?.focus();
-      return;
-    }
-    if (!m) {
+  }
+
+  /** Button data attribute -> {anytime: works without a leader, run(value, button, event)}. */
+  _buttonHandlers() {
+    return new Map([
+      ["cam", { anytime: true, run: (id) => this._chip(Number(id)) }],
+      // What's shown on the video: CSS only, no player needed.
+      ["show", { anytime: true, run: (key) => this._toggleShow(key) }],
+      ["kind", { anytime: true, run: (kind) => this._toggleKind(kind) }],
+      ["similar", { anytime: true, run: (id) => this._searchSimilar(Number(id)) }],
+      ["act", { anytime: true, run: (act, button) => this._act(act, button) }],
+      ["skip", { run: (seconds) => this._skip(Number(seconds)) }],
+      ["span", { run: (span) => this._setSpan(Number(span)) }],
+      ["sr", { run: (key) => this._playResult(key) }],
+      ["ev", { run: (id) => this._playEvent(this._evItems, id) }],
+      // A bookmark pin from the keyboard (detail 0); a tap on one is the track's (see _render).
+      ["bm", { run: (id, button, e) => e.detail === 0 && this._playEvent(this._bookmarks, id) }],
+    ]);
+  }
+
+  /** data-act value -> {anytime, run(button)}, as in _buttonHandlers. */
+  _actionHandlers() {
+    return new Map([
+      ["events", { anytime: true, run: () => this._toggleEvents() }],
+      ["search-close", { anytime: true, run: () => this._endSearch() }],
+      ["shows", { anytime: true, run: () => this._toggleShowsBox() }],
+      ["retry", { anytime: true, run: (button) => this._retry(button) }],
+      ["play", { run: () => this._togglePlay() }],
+      ["live", { run: () => this._goTo(nowS()) }],
+      ["jump", { run: () => this._toggleJumpBox() }],
+      ["go", { run: () => this._goToInput() }],
+      ["mute", { run: () => this._toggleMute() }],
+      ["solo", { run: () => this._toggleGrid() }],
+      ["fs", { run: () => this._toggleFullscreen() }],
+      ["pan-back", { run: () => this._pan(-0.5) }],
+      ["pan-fwd", { run: () => this._pan(0.5) }],
+    ]);
+  }
+
+  _act(act, button) {
+    this._actions ??= this._actionHandlers();
+    const action = this._actions.get(act);
+    if (action && (action.anytime || this._leader)) action.run(button);
+  }
+
+  _toggleEvents() {
+    const open = this._layoutEl.classList.toggle("noside") === false;
+    prefs.set("events", open);
+    this.shadowRoot.querySelector(".evtoggle").setAttribute("aria-pressed", String(open));
+    this._fit();
+  }
+
+  _toggleShow(key) {
+    this._shows[key] = !this._shows[key];
+    prefs.set(key, this._shows[key]);
+    this._applyShows();
+  }
+
+  _toggleKind(kind) {
+    if (this._kinds.has(kind)) this._kinds.delete(kind);
+    else this._kinds.add(kind);
+    prefs.set("kinds", [...this._kinds]);
+    this._drawKinds();
+    this._drawTimeline();
+    this._resetEvents(); // the bookmarks, of these kinds (and a search shown, asked anew)
+  }
+
+  _searchSimilar(id) {
+    const ev = this._evItems.find((x) => x.id === id) ?? this._search?.items.find((x) => x.bookmark_id === id);
+    const what = ev ? `${ev.name} · ${this._cameraName(ev.camera_id)} ${fmtDate(ev.start)} ${fmtTime(ev.start)}` : "this event";
+    this._runSearch({ bookmark_id: id }, `Similar to ${what}`);
+  }
+
+  _toggleShowsBox() {
+    this._jumpBox.hidden = true;
+    this._showsBox.hidden = !this._showsBox.hidden;
+    // Into the list, so Escape (and the keyboard) work there straight away.
+    if (!this._showsBox.hidden) this._showsBox.querySelector("button")?.focus();
+  }
+
+  /** A veil's Retry: the camera list failed (no leader), or a cell's stream. */
+  _retry(button) {
+    const leader = this._leader;
+    if (!leader) {
       // The camera list failed: try again.
-      if (b.dataset.act === "retry") {
-        this._inited = false;
-        this._init();
-      }
+      this._inited = false;
+      this._init();
       return;
     }
-    if (b.dataset.skip) {
-      const d = Number(b.dataset.skip);
-      // Forward past the newest recording: live.
-      const t = d > 0 ? liveIfRecent(m.wall() + d) : m.wall() + d;
-      this._seekAll(t, m.intendsPlay());
-      return;
+    const player = this._players.get(Number(button.closest(".cell")?.dataset.cell));
+    const at = player && player !== leader ? leader.wall() : player?.target;
+    if (player) (player.retry ?? (() => player.load(at, true)))();
+  }
+
+  _skip(seconds) {
+    const leader = this._leader;
+    // Forward past the newest recording: live.
+    const t = seconds > 0 ? liveIfRecent(leader.wall() + seconds) : leader.wall() + seconds;
+    this._seekAll(t, leader.intendsPlay());
+  }
+
+  _setSpan(span) {
+    this._span = span;
+    prefs.set("span", this._span);
+    this._centerOn(this._leader.wall());
+    this._markSpan();
+    this._loadTimeline();
+  }
+
+  _playResult(key) {
+    const result = this._search?.items.find((x) => x.key === key);
+    if (result) this._jumpToEvent(result);
+  }
+
+  /** A bookmark of the list (or of the timeline's) by its id. */
+  _playEvent(bookmarks, id) {
+    const ev = bookmarks.find((x) => String(x.id) === id);
+    if (ev) this._jumpToEvent(ev);
+  }
+
+  _togglePlay() {
+    const leader = this._leader;
+    // Followers with media resume through follow(), which keeps a
+    // follower in a gap paused.
+    if (!leader.intendsPlay()) {
+      leader.play();
+      // L3: a follower with nothing loaded starts at the leader's time.
+      for (const p of this._players.values()) if (p !== leader && !p.session && !p.loading) p.load(leader.wall(), true);
+    } else for (const p of this._players.values()) p.pause();
+  }
+
+  /** Every camera to wall time t (now: live), the timeline around it. */
+  _goTo(t) {
+    this._centerOn(t);
+    this._loadTimeline();
+    this._seekAll(t, true);
+  }
+
+  _toggleJumpBox() {
+    this._showsBox.hidden = true;
+    this._jumpBox.hidden = !this._jumpBox.hidden;
+    if (!this._jumpBox.hidden) {
+      this._when.value = toLocalInput(this._leader.wall());
+      this._when.focus();
     }
-    if (b.dataset.span) {
-      this._span = Number(b.dataset.span);
-      prefs.set("span", this._span);
-      this._centerOn(m.wall());
-      this._markSpan();
-      this._loadTimeline();
-      return;
-    }
-    if (b.dataset.sr) {
-      const r = this._search?.items.find((x) => x.key === b.dataset.sr);
-      if (r) this._jumpToEvent(r);
-      return;
-    }
-    if (b.dataset.ev) {
-      const ev = this._evItems.find((x) => String(x.id) === b.dataset.ev);
-      if (ev) this._jumpToEvent(ev);
-      return;
-    }
-    // A bookmark pin from the keyboard (detail 0); a tap on one is the track's (see _render).
-    if (b.dataset.bm) {
-      const ev = e.detail === 0 && this._bookmarks.find((x) => String(x.id) === b.dataset.bm);
-      if (ev) this._jumpToEvent(ev);
-      return;
-    }
-    switch (b.dataset.act) {
-      case "play":
-        // Followers with media resume through follow(), which keeps a
-        // follower in a gap paused.
-        if (!m.intendsPlay()) {
-          m.play();
-          // L3: a follower with nothing loaded starts at the master's time.
-          for (const p of this._players.values()) if (p !== m && !p.session && !p.loading) p.load(m.wall(), true);
-        } else for (const p of this._players.values()) p.pause();
-        break;
-      case "live": {
-        const t = nowS();
-        this._centerOn(t);
-        this._loadTimeline();
-        this._seekAll(t, true);
-        break;
-      }
-      case "jump":
-        this._showsBox.hidden = true;
-        this._jumpBox.hidden = !this._jumpBox.hidden;
-        if (!this._jumpBox.hidden) {
-          this._when.value = toLocalInput(m.wall());
-          this._when.focus();
-        }
-        break;
-      case "go": {
-        const t = new Date(this._when.value).getTime() / 1000;
-        if (!Number.isFinite(t)) return;
-        this._jumpBox.hidden = true;
-        this._centerOn(t);
-        this._loadTimeline();
-        this._seekAll(t, true);
-        break;
-      }
-      case "retry": {
-        const p = this._players.get(Number(b.closest(".cell")?.dataset.cell));
-        const at = p && p !== this._master ? this._master.wall() : p?.target;
-        if (p) (p.retry ?? (() => p.load(at, true)))();
-        break;
-      }
-      case "mute":
-        m.video.muted = !m.video.muted;
-        m.syncAudio();
-        this._syncMuteIcon();
-        break;
-      case "solo":
-        this._toggleGrid();
-        break;
-      case "fs":
-        this._toggleFullscreen();
-        break;
-      case "pan-back":
-      case "pan-fwd": {
-        const d = (b.dataset.act === "pan-back" ? -0.5 : 0.5) * this._span;
-        const end = Math.min(this._view.end + d, nowS() + this._span * 0.05);
-        this._view = { start: end - this._span, end };
-        this._followPausedUntil = Date.now() + FOLLOW_PAUSE_MS;
-        this._loadTimeline();
-        break;
-      }
-    }
+  }
+
+  _goToInput() {
+    const t = new Date(this._when.value).getTime() / 1000;
+    if (!Number.isFinite(t)) return;
+    this._jumpBox.hidden = true;
+    this._goTo(t);
+  }
+
+  _toggleMute() {
+    const leader = this._leader;
+    leader.video.muted = !leader.video.muted;
+    leader.syncAudio();
+    this._syncMuteIcon();
+  }
+
+  /** Move the view by `spans` of its width (not past now). */
+  _pan(spans) {
+    const shift = spans * this._span;
+    const end = Math.min(this._view.end + shift, nowS() + this._span * 0.05);
+    this._view = { start: end - this._span, end };
+    this._followPausedUntil = Date.now() + FOLLOW_PAUSE_MS;
+    this._loadTimeline();
   }
 
   _markSpan() {
@@ -2971,7 +3120,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _currentWall() {
-    return this._master ? this._master.wall() : nowS() - LIVE_LAG;
+    return this._leader ? this._leader.wall() : nowS() - LIVE_LAG;
   }
 
   // ---- event list -------------------------------------------------------
@@ -3321,7 +3470,7 @@ class SSTimelineCard extends HTMLElement {
     for (const b of this._evItemsEl.querySelectorAll(".ev")) b.classList.toggle("on", ids.includes(b.dataset.sr ?? b.dataset.ev));
   }
 
-  /** Play an event: its camera becomes the master, from a little before it. */
+  /** Play an event: its camera becomes the leader, from a little before it. */
   _jumpToEvent(ev) {
     this._selectCamera(ev.camera_id, ev.start - 3, true);
     // On a phone the list is below the video; bring the video back into view.
@@ -3343,7 +3492,7 @@ class SSTimelineCard extends HTMLElement {
    * the cameras go there once the keys stop, not on every repeat of a held one.
    */
   _onTrackKey(e) {
-    const m = this._master;
+    const m = this._leader;
     if (!m) return;
     const { start, end } = this._view;
     const from = this._keyAt ?? clamp(m.wall(), start, end);
@@ -3356,7 +3505,7 @@ class SSTimelineCard extends HTMLElement {
     clearTimeout(this._keyTimer);
     this._keyTimer = setTimeout(() => {
       this._keyAt = null;
-      const lead = this._master;
+      const lead = this._leader;
       if (lead) this._seekAll(liveIfRecent(t), lead.intendsPlay());
     }, 400);
   }
@@ -3404,15 +3553,14 @@ class SSTimelineCard extends HTMLElement {
 
   /** Where to resume: live if it was playing (or about to play) the newest footage. */
   _wantsLive(t) {
-    return this._isLive(t) || !!this._master?.goingLive || (!!this._master?.intendsPlay() && nowS() - t < LIVE_LAG + 20);
+    return this._isLive(t) || !!this._leader?.goingLive || (!!this._leader?.intendsPlay() && nowS() - t < LIVE_LAG + 20);
   }
 
   /** Playing (close to) the newest footage of a live playlist. */
   _isLive(t) {
-    const m = this._master;
-    // With MSE, the stream close to now (live, or recordings that caught up);
-    // without, the growing recording.
-    return MSE ? !!m?.feed && nowS() - t < 10 : !!m?.session?.live && nowS() - t < LIVE_LAG + 20;
+    // On the stream, close to now (live, or recordings that caught up); on
+    // HLS, the growing recording (see showsLive).
+    return !!this._leader?.showsLive(t);
   }
 
   /**
@@ -3449,7 +3597,7 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _onTime() {
-    const m = this._master;
+    const m = this._leader;
     if (!m?.session || !m.mediaReady) return;
     const t = m.wall();
     m.target = t;

@@ -24,19 +24,18 @@ from typing import Any
 
 from synology_ss_playback import Bookmark
 
-from .const import FRIGATE_SEARCH_ASK, FRIGATE_SEARCH_MAX
+from .bookmarks import name_kinds, wanted_kinds
+from .const import (
+    FRIGATE_BOOKMARK_SLACK,
+    FRIGATE_SEARCH_ASK,
+    FRIGATE_SEARCH_EMPTY_RETRY_SECONDS,
+    FRIGATE_SEARCH_MAX,
+    FRIGATE_SEARCH_TIMEOUT_SECONDS,
+)
 from .errors import EntryNotLoaded, InvalidRequest
-from .frigate import BOOKMARK_SLACK, FrigateBridge, event_time as _time, kinds, name_kinds, review_id_of
+from .frigate import FrigateBridge, event_time, kind_of, review_id_of
 from .frigate_api import FRIGATE_ID, FrigateAPIError
-from .views import VodManager
-
-# The whole search (Frigate's answers and the SS camera list) within this.
-SEARCH_TIMEOUT_SECONDS = 15
-# An object is a bookmark's when their times overlap, give or take this.
-_SLACK = BOOKMARK_SLACK
-# Frigate (0.18) may answer a search that ran into another client's with
-# nothing: an empty answer is asked once more, this much later.
-_EMPTY_RETRY_SECONDS = 0.5
+from .manager import VodManager
 
 
 async def search(
@@ -52,9 +51,9 @@ async def search(
 ) -> list[dict[str, Any]]:
     """Results, best first: bookmarks (of these kinds, if any given). InvalidRequest: nothing
     to search by; FrigateAPIError: Frigate's."""
-    wanted = {k.strip().casefold() for k in kinds or [] if k.strip()}
+    wanted = wanted_kinds(kinds)
     try:
-        async with asyncio.timeout(SEARCH_TIMEOUT_SECONDS):
+        async with asyncio.timeout(FRIGATE_SEARCH_TIMEOUT_SECONDS):
             return await _search(manager, entry_id, bridge, query, bookmark_id, camera_ids, wanted, limit)
     except TimeoutError:
         raise FrigateAPIError("search: no answer in time (Frigate or Surveillance Station)") from None
@@ -97,7 +96,7 @@ async def _search(
     async with bridge.search_lock:
         found = await api.json("/api/events/search", {**params, "limit": FRIGATE_SEARCH_ASK})
         if found == []:
-            await asyncio.sleep(_EMPTY_RETRY_SECONDS)
+            await asyncio.sleep(FRIGATE_SEARCH_EMPTY_RETRY_SECONDS)
             found = await api.json("/api/events/search", {**params, "limit": FRIGATE_SEARCH_ASK})
     if not isinstance(found, list):
         raise FrigateAPIError("/api/events/search: not a list")
@@ -109,12 +108,12 @@ async def _search(
         if not isinstance(obj, dict) or not FRIGATE_ID.fullmatch(str(obj.get("id"))):
             continue
         camera_id = await _placed(bridge, obj)
-        start = _time(obj.get("start_time"))
+        start = event_time(obj.get("start_time"))
         if camera_id is None or start is None or (camera_ids is not None and camera_id not in camera_ids):
             continue
-        end = _time(obj.get("end_time"))
+        end = event_time(obj.get("end_time"))
         label = obj.get("label") if isinstance(obj.get("label"), str) else ""
-        kind = (kinds([label]) or [""])[0] if label else ""
+        kind = kind_of(label) if label else ""
         bm = index.bookmark_of(camera_id, kind, start, time.time() if end is None else end)
         if bm is None or (source is not None and bm.id == source.id):
             continue  # not an event (no bookmark), or the bookmark searched from
@@ -124,9 +123,9 @@ async def _search(
         seen_keys.add(key)
         # The bookmark's stretch of the object (a car parked since the morning, in a
         # bookmark of the afternoon): the result plays the event, not the morning.
-        if start < bm.start - _SLACK:
+        if start < bm.start - FRIGATE_BOOKMARK_SLACK:
             start = bm.start
-        if end is None or end > bm.end + _SLACK:
+        if end is None or end > bm.end + FRIGATE_BOOKMARK_SLACK:
             end = bm.end
         results.append(
             {
@@ -153,22 +152,9 @@ async def _search(
 async def _source_object(bridge: FrigateBridge, source: Bookmark) -> dict[str, Any] | None:
     """The foremost object seen in a Frigate bookmark: by its review while Frigate
     has it (exact), else by the bookmark's camera and time."""
-    api = bridge.api
-    assert api is not None
-    rid = review_id_of(source.comment)
-    try:
-        review = await api.json(f"/api/review/{rid}")
-    except FrigateAPIError as err:
-        if err.status != 404:
-            raise
-        review = None
-    data = review.get("data") if isinstance(review, dict) else None
-    ids = data.get("detections") if isinstance(data, dict) else None
-    ids = [i for i in ids if isinstance(i, str) and FRIGATE_ID.fullmatch(i)][:16] if isinstance(ids, list) else []
-    if ids:
-        found = await asyncio.gather(*(api.json(f"/api/events/{i}") for i in ids), return_exceptions=True)
-        if (best := bridge.foremost([o for o in found if isinstance(o, dict)])) is not None:
-            return best
+    review = await bridge.review_objects(str(review_id_of(source.comment)))
+    if review is not None and (best := bridge.foremost([o for o in review.found if isinstance(o, dict)])) is not None:
+        return best
     ranked = await bridge.bookmark_objects(source)
     return ranked[0] if ranked else None
 
@@ -200,10 +186,11 @@ class _Index:
         # Overlapping: begun by the object's end, and ended after its start, so begun
         # no earlier than that less the camera's longest bookmark. Newest first, as SS
         # lists them: of two as near, the newer.
-        lo = bisect_left(starts, start - _SLACK - self._longest[camera_id])
-        hi = bisect_right(starts, end + _SLACK)
-        mine = [b for b in reversed(marks[lo:hi]) if b.end >= start - _SLACK and kind in self.kinds[b.id]]
-        began = [b for b in mine if b.start - _SLACK <= start <= b.end + _SLACK]
+        slack = FRIGATE_BOOKMARK_SLACK
+        lo = bisect_left(starts, start - slack - self._longest[camera_id])
+        hi = bisect_right(starts, end + slack)
+        mine = [b for b in reversed(marks[lo:hi]) if b.end >= start - slack and kind in self.kinds[b.id]]
+        began = [b for b in mine if b.start - slack <= start <= b.end + slack]
         if began:
             return min(began, key=lambda b: abs(b.start - start))
         return max(mine, key=lambda b: min(end, b.end) - max(start, b.start), default=None)

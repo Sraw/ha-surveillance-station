@@ -43,9 +43,8 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
-import itertools
 import json
 import logging
 import math
@@ -67,27 +66,28 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.hass_dict import HassKey
 
+from .bookmarks import name_kinds
 from .const import (
     DETECTION_EVENT,
     DOMAIN,
     FRIGATE_ANIMALS,
     FRIGATE_ANNOUNCE_MAX_AGE,
+    FRIGATE_BOOKMARK_LOOKBACK,
+    FRIGATE_BOOKMARK_SLACK,
     FRIGATE_CAMERAS_TTL,
     FRIGATE_DECIDED_MAX,
-    FRIGATE_DEFERRED_MAX_AGE,
     FRIGATE_EVENT_WAIT_SECONDS,
+    FRIGATE_HEALTH_INTERVAL,
     FRIGATE_IMAGE_BACKOFF_SECONDS,
     FRIGATE_IMAGE_BUDGET_SECONDS,
     FRIGATE_IMAGE_FALLBACK_SECONDS,
     FRIGATE_IMAGE_URL,
-    FRIGATE_HEALTH_INTERVAL,
     FRIGATE_ISSUE_AFTER_SECONDS,
     FRIGATE_MQTT_RETRY_SECONDS,
-    FRIGATE_QUEUE_MAX,
-    FRIGATE_RETRIES,
-    FRIGATE_RETRY_SECONDS,
     FRIGATE_OPEN_BOOKMARK_SECONDS,
     FRIGATE_QUIET_KINDS,
+    FRIGATE_RETRIES,
+    FRIGATE_RETRY_SECONDS,
     FRIGATE_SNAPSHOT_SETTLE_SECONDS,
     FRIGATE_SNAPSHOT_TRIES,
     FRIGATE_THUMB_CACHE_BYTES,
@@ -96,8 +96,9 @@ from .const import (
     FRIGATE_TRACKED_MAX,
     LARGE_IMAGE_WIDTH,
 )
-from .frigate_api import FRIGATE_ID, FrigateAPI, FrigateAPIError
-from .views import VodManager
+from .frigate_api import FRIGATE_ID, FRIGATE_ID_PATTERN, FrigateAPI, FrigateAPIError
+from .frigate_queue import Queued, ReviewQueue
+from .manager import VodManager
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -108,12 +109,7 @@ _monotonic = time.monotonic
 
 # At the comment's end, as _find looks for it: nothing earlier in a comment
 # (a severity off MQTT) can name another review.
-_REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]\Z")
-
-
-def name_kinds(name: str) -> list[str]:
-    """What a bookmark's name says was seen: "Person, Car" is Person and Car."""
-    return [k.strip() for k in name.split(",") if k.strip()]
+_REVIEW_ID = re.compile(rf"\[frigate ({FRIGATE_ID_PATTERN})\]\Z")
 
 
 def review_id_of(comment: str | None) -> str | None:
@@ -132,9 +128,14 @@ def _rank(label: str) -> tuple[int, str]:
     return (order.get(label, 3 if label in FRIGATE_ANIMALS else 2), label)
 
 
+def kind_of(label: str) -> str:
+    """A Frigate label as bookmarks and events name it: "Person", "Car", "Animal"."""
+    return "Animal" if label in FRIGATE_ANIMALS else label.replace("_", " ").capitalize()
+
+
 def kinds(objects: list[str]) -> list[str]:
-    """What was seen, as bookmarks and events name it: "Person", "Car", "Animal"."""
-    return list(dict.fromkeys("Animal" if o in FRIGATE_ANIMALS else o.replace("_", " ").capitalize() for o in objects))
+    """What was seen, as bookmarks and events name it (each kind once)."""
+    return list(dict.fromkeys(kind_of(o) for o in objects))
 
 
 def bookmark_name(objects: list[str]) -> str:
@@ -159,6 +160,50 @@ class _Tracked:
     start: int
     end: int
     frame: int | None = None
+
+
+@dataclass(frozen=True)
+class _Review:
+    """What handle() reads of a review message."""
+
+    kind: str  # new, update, end
+    id: str
+    after: dict[str, Any]
+    camera: str  # Frigate's
+    severity: str
+    start: int
+    ended: float | None  # its end, once it has one
+    objects: list[str]  # the chosen ones seen, foremost first
+    zones: list[str]
+    # The frame Frigate picked as showing the object best (it may pick a
+    # better one as the review goes on): the bookmark's thumbnail. SS cuts
+    # from the keyframe at or before a second (every second here): rounded
+    # up, that keyframe is within a second of Frigate's frame either way.
+    frame: int | None
+
+
+@dataclass(frozen=True)
+class ReviewObjects:
+    """A review's tracked objects as Frigate has them."""
+
+    ended: bool
+    ids: list[str]  # 16 at most
+    found: list[Any]  # for each: its /api/events answer, or the exception instead
+
+
+@dataclass(frozen=True)
+class _Detection:
+    """What a detection event says: the review, its bookmark and camera, what was seen."""
+
+    review_id: str
+    bookmark_id: int
+    camera_id: int
+    camera_name: str
+    start: int
+    after: dict[str, Any]
+    objects: list[str]
+    zones: list[str]
+    frame: int
 
 
 class FrigateBridge:
@@ -210,33 +255,22 @@ class FrigateBridge:
         self._cameras_at = -math.inf
         self._unknown: set[str] = set()  # Frigate cameras warned about
         self._tracked: OrderedDict[str, _Tracked] = OrderedDict()
-        # Waiting for SS: the latest message of each review, in the order the
-        # reviews first came in. A review's later message replaces its earlier
-        # one (it says everything the earlier one did), so a backlog after an
-        # outage is one message per review, not a minute-old queue of updates.
-        self._pending: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # Reviews that failed because SS was unreachable: kept (across
-        # restarts too, for a day) and tried again once it answers. The
-        # oldest is tried every minute; once one goes through the rest are
-        # replayed, after anything fresh, and back to waiting if SS fails
-        # again meanwhile. An outage loses no bookmark.
-        self._deferred: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self._replay: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        self._current: tuple[str, dict[str, Any]] | None = None  # being handled
-        self._canary_key: str | None = None
+        # Waiting for SS: the latest message of each review. Those that failed
+        # because SS was unreachable are kept (across restarts too, for a day)
+        # and tried again once it answers: an outage loses no bookmark.
+        self._queue = ReviewQueue(self._selected)
         self._forget_bookmarks = False
         # SS refusing bookmarks (an error code) while answering otherwise
         # (rights taken away): since when, cleared by a bookmark made.
         self._rejected_since: float | None = None
         self._rejected: set[str] = set()  # the reviews refused since then
-        self._wake = asyncio.Event()
         self._worker: asyncio.Task | None = None
         self._unsubscribe: list[Callable[[], None]] = []
         self._subscribed = False
         self._announcing: set[asyncio.Task] = set()
         self._announcing_ids: set[str] = set()
         # A message of a review being announced: the event says what it does.
-        self._announcing_latest: dict[str, tuple[dict[str, Any], list[str], list[str], int]] = {}
+        self._announcing_latest: dict[str, _Detection] = {}
         self._probe: asyncio.Task | None = None
         self._stop_health: Callable[[], None] | None = None
         self._stop_listener: Callable[[], None] | None = None
@@ -256,9 +290,9 @@ class FrigateBridge:
         # handled ends as ignored (by reason), failed (after retries), or went
         # through (bookmarked counts new bookmarks; each review is then
         # announced or not_announced; announced_again counts its further
-        # notifications, outside that sum).
+        # notifications, outside that sum). The queue counts coalesced and dropped.
         self._counts = {
-            "messages": 0, "coalesced": 0, "dropped": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
+            "messages": 0, "retried": 0, "failed": 0, "rejected": 0, "bookmarked": 0,
             "announced": 0, "announced_again": 0, "not_announced": 0, "held_quiet": 0, "announce_failed": 0,
             "images_frigate": 0, "images_ss": 0, "images_no_snapshot": 0, "images_failed": 0,
         }
@@ -303,9 +337,11 @@ class FrigateBridge:
             "quiet_kinds": sorted(self.quiet_kinds),
             "frigate_api": self.api is not None,
             **self._counts,
+            "coalesced": self._queue.coalesced,
+            "dropped": self._queue.dropped,
             "ignored": dict(self._ignored),
-            "queued": len(self._pending) + len(self._replay),
-            "deferred": len(self._deferred),
+            "queued": self._queue.queued,
+            "deferred": self._queue.deferred,
             "announcing": len(self._announcing),
             "failing": self._failing,
             "issues": sorted(self._issues),
@@ -345,13 +381,7 @@ class FrigateBridge:
             for camera_id, kind, t, *rid in stored.get("last_seen") or []:
                 if now - float(t) < self.quiet:
                     self._last_seen[(int(camera_id), str(kind))] = (float(t), str(rid[0]) if rid else "")
-            for key, review in stored.get("deferred") or []:
-                if isinstance(review, dict) and isinstance(review.get("after"), dict):
-                    review.setdefault(_FAILED_AT, now)
-                    # Kept by a delayed save: it may have been bookmarked
-                    # after it (HA died before the next), so look first.
-                    review[_MAYBE_MADE] = True
-                    self._deferred[str(key)] = review
+            self._queue.load(stored.get("deferred") or [], now)
         except (ValueError, TypeError, AttributeError, HomeAssistantError):
             _LOGGER.warning("Ignoring unreadable Frigate state %s", store_key(self.entry_id))
         finally:
@@ -395,7 +425,7 @@ class FrigateBridge:
         self._unsubscribe = unsubscribe
         self._subscribed = True
         self._worker = self.hass.async_create_background_task(self._work(), "surveillance_station frigate")
-        self._canary()  # left over from before a restart: try now, not in a minute
+        self._queue.canary()  # left over from before a restart: try now, not in a minute
         return True
 
     @callback
@@ -404,10 +434,7 @@ class FrigateBridge:
         self._subscribed = False
         # Not handled yet, or cut short: kept for next time (async_flush
         # writes it).
-        self._deferred = self._waiting()
-        self._replay.clear()
-        self._pending.clear()
-        self._current = None
+        self._queue.stop()
         for unsubscribe in self._unsubscribe:
             unsubscribe()
         self._unsubscribe = []
@@ -427,7 +454,7 @@ class FrigateBridge:
     @callback
     def _ha_stopping(self, _event: Event) -> None:
         # A delayed save while stopping is written at HA's final write, by
-        # when the worker is cancelled (and a review cut short is _current).
+        # when the worker is cancelled (and a review cut short is the queue's current).
         self._save()
 
     async def async_flush(self) -> None:
@@ -462,69 +489,36 @@ class FrigateBridge:
         if not (isinstance(review, dict) and isinstance(review.get("after"), dict)):
             return
         self._counts["messages"] += 1
-        review[_RECEIVED_AT] = time.time()
+        item = Queued(review, received_at=time.time())
         self._last_message = time.time()
         key = str(review["after"].get("id") or "") or f"_{self._counts['messages']}"
-        # A review's newer message replaces what of it waits anywhere,
-        # keeping what the earlier one told: it was new; a try of it failed
-        # (so its bookmark may exist).
-        earlier = self._pending.get(key) or self._replay.pop(key, None) or self._deferred.pop(key, None)
-        if earlier is not None:
-            self._counts["coalesced"] += 1
-            if earlier.get("type") == "new" or earlier.get(_SEEN_NEW):
-                review[_SEEN_NEW] = True
-            if earlier.get(_MAYBE_MADE):
-                review[_MAYBE_MADE] = True
-            # News since the earlier one came (it had an object of interest,
-            # waited for SS): as old as that, or a replay would seem fresh.
-            if earlier.get(_RECEIVED_AT) and self._selected(earlier):
-                review[_RECEIVED_AT] = min(review[_RECEIVED_AT], earlier[_RECEIVED_AT])
-        self._pending[key] = review  # an existing key keeps its place
-        if len(self._pending) > FRIGATE_QUEUE_MAX:
-            # SS stuck for a long while: the oldest (but not the one being
-            # tried to see whether SS is back) waits with those SS failed.
-            oldest = next(k for k in itertools.islice(self._pending, 2) if k != self._canary_key)
-            self._keep(oldest, self._pending.pop(oldest))
-            if not self._dropping:
-                self._dropping = True
-                _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; the oldest wait for later")
-        self._wake.set()
+        if self._queue.put(key, item) and not self._dropping:
+            self._dropping = True
+            _LOGGER.warning("Frigate reviews arrive faster than bookmarks can be made; the oldest wait for later")
 
     async def _work(self) -> None:
         # One review at a time, in order.
         while True:
-            if self._failing and self._replay:
-                # SS failed again mid-replay: the rest wait again (no request
-                # each, stalling fresh reviews behind timeouts).
-                for key, review in self._replay.items():
-                    self._deferred.setdefault(key, review)
-                self._replay.clear()
+            if self._failing and self._queue.hold_replay():
                 self._save()
-            if self._pending:  # fresh reviews first
-                key, review = self._pending.popitem(last=False)
-            elif self._replay:
-                key, review = self._replay.popitem(last=False)
-            else:
+            if (next_ := self._queue.next()) is None:
                 self._dropping = False
                 if self._forget_bookmarks:  # once after a replay, not per bookmark
                     self._forget_bookmarks = False
                     self.manager.forget_bookmarks(self.entry_id)
-                self._wake.clear()
-                await self._wake.wait()
+                await self._queue.wait()
                 continue
-            # Kept if cancelled (unload, HA stopping): stop() and the final
-            # write keep it for next time. _process handles every Exception.
-            self._current = (key, review)
-            await self._process(key, review)
-            self._current = None
-            if key == self._canary_key:
-                self._canary_key = None
+            # _process handles every Exception; cancelled (unload, HA
+            # stopping), the message stays the queue's current.
+            key, item = next_
+            await self._process(key, item)
+            self._queue.done(key)
 
-    async def _process(self, key: str, review: dict[str, Any]) -> None:
+    async def _process(self, key: str, item: Queued) -> None:
         retries = 0
         while True:
             try:
-                await self.handle(review)
+                await self.handle(item)
             except SSError as err:
                 # A create may have gone through before the error (only the
                 # answer lost): list the bookmarks afresh and look for it
@@ -532,7 +526,7 @@ class FrigateBridge:
                 # replaced in SS (same name, new id): list the cameras again.
                 self.manager.forget_bookmarks(self.entry_id)
                 self._cameras_at = -math.inf
-                review = {**review, _MAYBE_MADE: True}
+                item = replace(item, maybe_made=True)
                 transient = _transient(err)
                 if not transient:
                     # SS said no to this one (an error code): trying it again
@@ -549,16 +543,16 @@ class FrigateBridge:
                     return
                 if self._failing or retries >= FRIGATE_RETRIES:
                     self._fail(err)
-                    self._defer(key, review)
+                    self._queue.defer(key, item)
+                    self._save()
                     return
                 retries += 1
                 self._counts["retried"] += 1
                 await asyncio.sleep(FRIGATE_RETRY_SECONDS)
                 # A newer message of the same review may have come meanwhile.
-                if (newer := self._pending.pop(key, None)) is not None:
-                    review = {**newer, _MAYBE_MADE: True}
-                if self._current is not None and self._current[0] == key:
-                    self._current = (key, review)
+                if (newer := self._queue.newer(key)) is not None:
+                    item = replace(newer, maybe_made=True)
+                self._queue.retrying(key, item)
                 continue
             except Exception as err:  # noqa: BLE001 - one bad message must not stop the bridge
                 # This message, not SS: counted and logged, not retried, and
@@ -577,60 +571,6 @@ class FrigateBridge:
             self._failing_since = _monotonic()
             _LOGGER.warning("Frigate review not turned into a bookmark (tried again once SS answers): %s", err)
 
-    def _defer(self, key: str, review: dict[str, Any]) -> None:
-        if not self._newer_waits(key):
-            self._keep(key, review)
-        self._save()
-
-    def _newer_waits(self, key: str, queues: tuple[OrderedDict[str, dict[str, Any]], ...] | None = None) -> bool:
-        """Is a newer message of the review in flight waiting? It then goes instead, knowing the bookmark may exist.
-
-        Anything of the review waiting while one of its messages is handled
-        came later: _received takes an earlier one out of every queue."""
-        for queue in queues or (self._pending, self._replay, self._deferred):
-            if (newer := queue.get(key)) is not None:
-                newer[_MAYBE_MADE] = True
-                return True
-        return False
-
-    def _waiting(self) -> OrderedDict[str, dict[str, Any]]:
-        """Everything not bookmarked yet, one message per review, as kept for next time (queues untouched)."""
-        waiting = OrderedDict((k, dict(r)) for k, r in self._deferred.items())
-        replay = OrderedDict((k, dict(r)) for k, r in self._replay.items())
-        pending = OrderedDict((k, dict(r)) for k, r in self._pending.items())
-        if self._current is not None:
-            key, review = self._current
-            if not self._newer_waits(key, (pending, replay, waiting)):
-                replay[key] = {**review, _MAYBE_MADE: True}
-        for key, review in (*replay.items(), *pending.items()):
-            self._keep(key, review, waiting)
-        return waiting
-
-    def _keep(
-        self, key: str, review: dict[str, Any], into: OrderedDict[str, dict[str, Any]] | None = None
-    ) -> None:
-        """Wait for SS (the review's latest message, with what earlier ones told)."""
-        into = self._deferred if into is None else into
-        earlier = into.pop(key, None) or {}
-        review = {**review, _FAILED_AT: earlier.get(_FAILED_AT) or review.get(_FAILED_AT) or time.time()}
-        for flag in (_MAYBE_MADE, _SEEN_NEW):
-            if earlier.get(flag):
-                review[flag] = True
-        into[key] = _compact(review)
-        if len(into) > FRIGATE_QUEUE_MAX:
-            into.popitem(last=False)
-            if into is self._deferred:
-                self._counts["dropped"] += 1
-
-    def _canary(self) -> None:
-        """Try the oldest review waiting for SS again, first in line."""
-        if self._deferred:
-            key, review = self._deferred.popitem(last=False)
-            self._pending.setdefault(key, review)
-            self._pending.move_to_end(key, last=False)
-            self._canary_key = key
-            self._wake.set()
-
     def _ok(self, bookmark: bool = True) -> None:
         """A bookmark was made or changed: not failing, and what failed meanwhile is tried again.
 
@@ -643,115 +583,145 @@ class FrigateBridge:
         if bookmark:
             self._rejected_since = None
             self._rejected.clear()
-        if self._deferred:
-            for key, review in self._deferred.items():
-                if key not in self._pending:  # a newer message waiting wins
-                    self._replay.setdefault(key, review)
-            self._deferred.clear()
-            self._wake.set()
+        if self._queue.release():
             self._save()
 
-    async def handle(self, review: dict[str, Any]) -> None:
-        kind = review.get("type")
-        after = review["after"]
-        review_id = str(after.get("id") or "")
-        if kind not in ("new", "update", "end") or not _REVIEW_ID.fullmatch(f"[frigate {review_id}]"):
-            self._ignore("malformed" if kind in ("new", "update", "end") else "other_type")
+    async def handle(self, message: dict[str, Any] | Queued) -> None:
+        """Bookmark (and announce) a review message: queued, or a plain one, as just received."""
+        item = message if isinstance(message, Queued) else Queued(message)
+        if (review := self._parse(item.message)) is None:
             return
-        try:
-            start = int(float(after["start_time"]))
-        except (KeyError, TypeError, ValueError):
-            self._ignore("malformed")
-            return
-        data = after.get("data") if isinstance(after.get("data"), dict) else {}
-        # An object a sub label was given to (a known face, a plate) is
-        # listed as "<label>-verified". Frigate lists them in no fixed order.
-        seen = {str(o).removesuffix("-verified") for o in _strings(data.get("objects"))}
-        objects = sorted((o for o in self.objects if o in seen), key=_rank)
-        tracked = self._tracked.get(review_id)
-        if tracked is None and not objects:
+        tracked = self._tracked.get(review.id)
+        if tracked is None and not review.objects:
             self._ignore("no_objects")  # none of the chosen objects (yet)
-            if kind == "end":
-                self._not_yet.pop(review_id, None)
-            elif self._live(review):
-                self._note_not_yet(review_id)
+            if review.kind == "end":
+                self._not_yet.pop(review.id, None)
+            elif self._fresh(item):
+                self._note_not_yet(review.id)
             return
-        camera = await self._camera(str(after.get("camera") or ""))
+        camera = await self.ss_camera(review.camera)
         if camera is None:
             self._ignore("unknown_camera")
             return
         camera_id, camera_name = camera
-        zones = _strings(data.get("zones"))
-        name = bookmark_name(objects)
-        comment = bookmark_comment(review_id, str(after.get("severity")))
+        name = bookmark_name(review.objects)
+        comment = bookmark_comment(review.id, review.severity)
+        # Still going on: up to now; a message replayed long after it came (SS
+        # was down), whose end never came, up to when it came, not the replay.
+        until = time.time() if self._fresh(item) else item.received_at
+        end = int(review.ended) + 1 if review.ended else max(review.start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(until))
+        if tracked is None and (item.maybe_made or not (review.kind == "new" or item.seen_new)):
+            # Created before a restart, or by a try that failed after SS did
+            # it (its comment names the review)?
+            tracked = await self._find(review.id, camera_id)
+        now = time.time()
+        repeat = self._repeat(review, camera_id, now)
+        tracked = await self._sync_bookmark(review, tracked, camera_id, name, comment, end)
+        detection = _Detection(
+            review.id, tracked.bookmark_id, camera_id, camera_name, review.start, review.after, review.objects,
+            review.zones, review.frame or review.start,
+        )
+        self._decide_announcement(item, review, detection, repeat, now)
+        self._mark_seen(item, review, camera_id, now)
+        self._save()
+        if review.frame is not None and review.frame != tracked.frame:
+            tracked.frame = review.frame
+            self.manager.set_frame(self.entry_id, tracked.bookmark_id, review.frame)
+        if review.kind == "end":
+            self._tracked.pop(review.id, None)
+
+    def _parse(self, message: dict[str, Any]) -> _Review | None:
+        """A review message as handle() reads it; None: not one (counted as ignored)."""
+        kind = message.get("type")
+        after = message["after"]
+        review_id = str(after.get("id") or "")
+        if kind not in ("new", "update", "end") or not FRIGATE_ID.fullmatch(review_id):
+            self._ignore("malformed" if kind in ("new", "update", "end") else "other_type")
+            return None
+        try:
+            start = int(float(after["start_time"]))
+        except (KeyError, TypeError, ValueError):
+            self._ignore("malformed")
+            return None
+        data = after.get("data") if isinstance(after.get("data"), dict) else {}
+        # An object a sub label was given to (a known face, a plate) is
+        # listed as "<label>-verified". Frigate lists them in no fixed order.
+        seen = {str(o).removesuffix("-verified") for o in _strings(data.get("objects"))}
         try:
             ended = float(after["end_time"]) if after.get("end_time") else None
         except (TypeError, ValueError):
             ended = None
-        # Still going on: up to now; a message replayed long after it came (SS
-        # was down), whose end never came, up to when it came, not the replay.
-        until = time.time() if self._live(review) else review[_RECEIVED_AT]
-        end = int(ended) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(until))
-
-        if tracked is None and (review.get(_MAYBE_MADE) or not (kind == "new" or review.get(_SEEN_NEW))):
-            # Created before a restart, or by a try that failed after SS did
-            # it (its comment names the review)?
-            tracked = await self._find(review_id, camera_id)
-        # The frame Frigate picked as showing the object best (it may pick a
-        # better one as the review goes on): the bookmark's thumbnail. SS cuts
-        # from the keyframe at or before a second (every second here): rounded
-        # up, that keyframe is within a second of Frigate's frame either way.
         try:
             frame = math.ceil(float(data["thumb_time"])) if data.get("thumb_time") else None
         except (TypeError, ValueError):
             frame = None
-        # Only kinds seen on this camera lately (before this review), and all
-        # of them ones that may be quiet: no second notification.
-        now = time.time()
+        return _Review(
+            kind=kind,
+            id=review_id,
+            after=after,
+            camera=str(after.get("camera") or ""),
+            severity=str(after.get("severity")),
+            start=start,
+            ended=ended,
+            objects=sorted((o for o in self.objects if o in seen), key=_rank),
+            zones=_strings(data.get("zones")),
+            frame=frame,
+        )
+
+    def _repeat(self, review: _Review, camera_id: int, now: float) -> bool:
+        """Only kinds seen on this camera lately (before this review), and all of them ones
+        that may be quiet (or kept quiet in this review): no second notification."""
+
         def seen_lately(kind: str) -> bool:
             t, by = self._last_seen.get((camera_id, kind), (-math.inf, ""))
-            return by != review_id and now - t < self.quiet
+            return by != review.id and now - t < self.quiet
 
-        silenced = self._not_yet.get(review_id, frozenset())
-        repeat = bool(objects) and all(
-            k in silenced or (k in self.quiet_kinds and seen_lately(k)) for k in kinds(objects)
+        silenced = self._not_yet.get(review.id, frozenset())
+        return bool(review.objects) and all(
+            k in silenced or (k in self.quiet_kinds and seen_lately(k)) for k in kinds(review.objects)
         )
+
+    async def _sync_bookmark(
+        self, review: _Review, tracked: _Tracked | None, camera_id: int, name: str, comment: str, end: int
+    ) -> _Tracked:
+        """The review's bookmark: made, or changed as its name, comment or end did."""
         if tracked is None:
-            bm = await self.client.create_bookmark(camera_id, name, start, end, comment)
+            bm = await self.client.create_bookmark(camera_id, name, review.start, end, comment)
             self._ok()
-            tracked = _Tracked(bm.id, camera_id, name, comment, start, end)
-            self._remember(review_id, tracked)
+            tracked = _Tracked(bm.id, camera_id, name, comment, review.start, end)
+            self._remember(review.id, tracked)
             self._counts["bookmarked"] += 1
             self._bookmarks_changed()
-        elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
+        elif (name, comment) != (tracked.name, tracked.comment) or (review.ended and end != tracked.end):
             try:
                 await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
             except SSError:
                 # Deleted in SS meanwhile, or no answer: the next try looks for
                 # it afresh (and makes it again if it's gone) rather than
                 # editing an id that may be dead at every message.
-                self._tracked.pop(review_id, None)
+                self._tracked.pop(review.id, None)
                 raise
             self._ok()
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self._bookmarks_changed()
+        return tracked
+
+    def _decide_announcement(self, item: Queued, review: _Review, detection: _Detection, repeat: bool, now: float) -> None:
+        review_id, objects = review.id, review.objects
         if review_id in self._announcing_ids:
             # Sent in a moment: with this message's objects (a person that
             # joined meanwhile is in it, rather than one more notification).
             if objects:
-                self._announcing_latest[review_id] = (after, objects, zones, frame or start)
+                self._announcing_latest[review_id] = detection
         elif review_id in self._decided:
             # Sent already: again if something more important has joined (a
             # person after a dog), of a kind that is never quiet (a quiet car
             # joining a dog's review is not worth a second alert).
             told = self._decided[review_id]
-            if told is not None and self._live(review) and any(
-                _rank(o)[0] < _rank(told)[0] and kinds([o])[0] not in self.quiet_kinds for o in objects
+            if told is not None and self._fresh(item) and any(
+                _rank(o)[0] < _rank(told)[0] and kind_of(o) not in self.quiet_kinds for o in objects
             ):
-                self._announce(
-                    review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start,
-                    again=True,
-                )
+                self._announce(detection, again=True)
         else:
             # Once per review, as soon as it has its bookmark: normally at its
             # first message; later if that one failed (even at its end). Long
@@ -762,13 +732,11 @@ class FrigateBridge:
             # outage) of a review that began lately, or that we saw going on
             # without being news until now (a person joining a quiet dog's
             # review, or appearing minutes into one of bicycles).
-            live = self._live(review)
-            news = objects and live and (now - start <= FRIGATE_ANNOUNCE_MAX_AGE or review_id in self._not_yet)
+            fresh = self._fresh(item)
+            news = objects and fresh and (now - review.start <= FRIGATE_ANNOUNCE_MAX_AGE or review_id in self._not_yet)
             if news and not repeat:
-                self._announce(
-                    review_id, tracked.bookmark_id, camera_id, camera_name, after, objects, zones, start, frame or start
-                )
-            elif news and kind != "end":
+                self._announce(detection)
+            elif news and review.kind != "end":
                 # Only quiet kinds seen lately: not now, but a later message
                 # adding another kind is news.
                 if set(kinds(objects)) - self._not_yet.get(review_id, frozenset()):
@@ -778,39 +746,35 @@ class FrigateBridge:
                 self._counts["not_announced"] += 1
                 self._not_yet.pop(review_id, None)
                 self._decide(review_id)
-        # Bookmarked: its kinds count as seen here (still going on: now;
-        # ended: when last active; one replayed long after: when it began,
-        # not now, or it would silence what happens now).
-        active = ended or (now if self._live(review) else float(start))
-        for k in kinds(objects):
+
+    def _mark_seen(self, item: Queued, review: _Review, camera_id: int, now: float) -> None:
+        """Bookmarked: its kinds count as seen here (still going on: now; ended: when last
+        active; one replayed long after: when it began, not now, or it would silence
+        what happens now)."""
+        active = review.ended or (now if self._fresh(item) else float(review.start))
+        for k in kinds(review.objects):
             last = self._last_seen.get((camera_id, k))
             if last is None or active >= last[0]:
-                self._last_seen[(camera_id, k)] = (active, review_id)
+                self._last_seen[(camera_id, k)] = (active, review.id)
         if len(self._last_seen) > 256:
             self._last_seen = {k: v for k, v in self._last_seen.items() if now - v[0] < self.quiet}
-        self._save()
-        if frame is not None and frame != tracked.frame:
-            tracked.frame = frame
-            self.manager.set_frame(self.entry_id, tracked.bookmark_id, frame)
-        if kind == "end":
-            self._tracked.pop(review_id, None)
 
     def _bookmarks_changed(self) -> None:
         # The card's list: re-read now, or once a replay is done (not for
         # each of hundreds of bookmarks it makes).
-        if self._replay:
+        if self._queue.replaying:
             self._forget_bookmarks = True
         else:
             self.manager.forget_bookmarks(self.entry_id)
 
-    def _selected(self, review: dict[str, Any]) -> bool:
+    def _selected(self, message: dict[str, Any]) -> bool:
         """Does the message have any of the objects bookmarked?"""
-        data = review["after"].get("data") if isinstance(review["after"].get("data"), dict) else {}
+        data = message["after"].get("data") if isinstance(message["after"].get("data"), dict) else {}
         return any(str(o).removesuffix("-verified") in self.objects for o in _strings(data.get("objects")))
 
-    def _live(self, review: dict[str, Any]) -> bool:
+    def _fresh(self, item: Queued) -> bool:
         """Received just now, not replayed after an outage (a message handled directly: now)."""
-        return time.time() - review.get(_RECEIVED_AT, time.time()) <= FRIGATE_ANNOUNCE_MAX_AGE
+        return item.received_at is None or time.time() - item.received_at <= FRIGATE_ANNOUNCE_MAX_AGE
 
     def _note_not_yet(self, review_id: str, quiet: list[str] | None = None) -> None:
         self._not_yet[review_id] = self._not_yet.get(review_id, frozenset()) | frozenset(quiet or ())
@@ -829,7 +793,7 @@ class FrigateBridge:
             "decided": [[rid, told] for rid, told in self._decided.items()],
             "last_seen": [[c, k, t, rid] for (c, k), (t, rid) in self._last_seen.items()],
             "not_yet": [[rid, sorted(quiet)] for rid, quiet in self._not_yet.items()],
-            "deferred": [[key, review] for key, review in self._waiting().items()],
+            "deferred": self._queue.stored(),
         }
 
     def _save(self) -> None:
@@ -850,22 +814,24 @@ class FrigateBridge:
                 return tracked
         return None
 
-    async def _camera(self, frigate_camera: str) -> tuple[int, str] | None:
+    def _lookup(self, frigate_camera: str) -> tuple[int, str] | None:
+        """The SS camera (id, name) a Frigate camera is, as SS last listed them."""
         key = camera_key(frigate_camera)
+        if (name := self._aliases.get(key)) is not None:  # mapped in the options: that SS camera exactly
+            return self._cameras_by_name.get(name)
+        return self._cameras.get(key)
 
-        def lookup() -> tuple[int, str] | None:
-            if (name := self._aliases.get(key)) is not None:  # mapped in the options: that SS camera exactly
-                return self._cameras_by_name.get(name)
-            return self._cameras.get(key)
-
+    async def ss_camera(self, frigate_camera: str) -> tuple[int, str] | None:
+        """The SS camera (id, name) a Frigate camera is, as its reviews are bookmarked on."""
         age = _monotonic() - self._cameras_at
         # Listed again at most once a minute for a camera not there (added or
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
-        if age > FRIGATE_CAMERAS_TTL or (lookup() is None and age > 60):
+        if age > FRIGATE_CAMERAS_TTL or (self._lookup(frigate_camera) is None and age > 60):
             self._cameras_at = _monotonic()
             self._set_cameras(await self.client.cameras())
-        if (found := lookup()) is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
+        found = self._lookup(frigate_camera)
+        if found is None and frigate_camera not in self._unknown and len(self._unknown) < 64:
             self._unknown.add(frigate_camera)
             _LOGGER.warning(
                 "Frigate camera %r matches no Surveillance Station camera by name (map it in the integration's"
@@ -878,36 +844,27 @@ class FrigateBridge:
         self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
         self._cameras_by_name = {c.name: (c.id, c.name) for c in cameras}
 
-    def _announce(
-        self,
-        review_id: str,
-        bookmark_id: int,
-        camera_id: int,
-        camera_name: str,
-        after: dict[str, Any],
-        objects: list[str],
-        zones: list[str],
-        start: int,
-        frame: int,
-        again: bool = False,
-    ) -> None:
-        def payload(after: dict[str, Any], objects: list[str], zones: list[str], frame: int) -> dict[str, Any]:
-            return {
-                "entry_id": self.entry_id,
-                "review_id": review_id,
-                "bookmark_id": bookmark_id,
-                "camera_id": camera_id,
-                "camera": camera_name,
-                "frigate_camera": after.get("camera"),
-                "severity": after.get("severity"),
-                "objects": kinds(objects),
-                "labels": list(dict.fromkeys(objects)),
-                "zones": zones,
-                "start": start,
-                "image": self._image_url(review_id, camera_id, frame),
-                "thumbnail": self.manager.sign_thumbnail(self.entry_id, camera_id, frame),
-                "url": self._url(camera_id, start),
-            }
+    def _payload(self, detection: _Detection) -> dict[str, Any]:
+        d = detection
+        return {
+            "entry_id": self.entry_id,
+            "review_id": d.review_id,
+            "bookmark_id": d.bookmark_id,
+            "camera_id": d.camera_id,
+            "camera": d.camera_name,
+            "frigate_camera": d.after.get("camera"),
+            "severity": d.after.get("severity"),
+            "objects": kinds(d.objects),
+            "labels": list(dict.fromkeys(d.objects)),
+            "zones": d.zones,
+            "start": d.start,
+            "image": self._image_url(d.review_id, d.camera_id, d.frame),
+            "thumbnail": self.manager.sign_thumbnail(self.entry_id, d.camera_id, d.frame),
+            "url": self._url(d.camera_id, d.start),
+        }
+
+    def _announce(self, detection: _Detection, again: bool = False) -> None:
+        review_id, camera_id, frame = detection.review_id, detection.camera_id, detection.frame
 
         async def announce() -> None:
             # Not when cancelled (the entry unloads): the frame may not be there yet.
@@ -918,12 +875,14 @@ class FrigateBridge:
                     await wait_for_frame()
             finally:
                 self._announcing_ids.discard(review_id)
-                latest = self._announcing_latest.pop(review_id, (after, objects, zones, frame))
-            self.hass.bus.async_fire(DETECTION_EVENT, payload(*latest))
+                seen = self._announcing_latest.pop(review_id, detection)
+            # Its bookmark and camera as announced; what was seen as its latest message says.
+            latest = replace(detection, after=seen.after, objects=seen.objects, zones=seen.zones, frame=seen.frame)
+            self.hass.bus.async_fire(DETECTION_EVENT, self._payload(latest))
             # A review counts as announced (or not) once; again: its later notifications.
             self._counts["announced_again" if again else "announced"] += 1
             self._not_yet.pop(review_id, None)
-            self._decide(review_id, latest[1][0])
+            self._decide(review_id, latest.objects[0])
             self._save()
 
         async def wait_for_frame() -> None:
@@ -968,21 +927,30 @@ class FrigateBridge:
         """
         return (await self._review_snapshot(review_id, height))[0]
 
-    async def _review_snapshot(self, review_id: str, height: int | None) -> tuple[tuple[bytes, str] | None, bool]:
-        """review_image's answer, and whether the review is over (ended, or gone)."""
-        if self.api is None:
-            return None, False
+    async def review_objects(self, review_id: str) -> ReviewObjects | None:
+        """A review's tracked objects as Frigate has them (None: the review gone, Frigate's
+        retention). FrigateAPIError: anything else (refused: a wrong URL; not JSON; failing)
+        is Frigate's trouble."""
+        assert self.api is not None
         try:
             review = await self.api.json(f"/api/review/{review_id}")
         except FrigateAPIError as err:
             if err.status == 404:
-                return None, True  # gone (Frigate's retention): no snapshot
-            raise  # anything else (refused: a wrong URL; not JSON; failing) is Frigate's trouble
-        ended = isinstance(review, dict) and review.get("end_time") is not None
+                return None
+            raise
         data = review.get("data") if isinstance(review, dict) else None
         ids = [i for i in _strings(data.get("detections") if isinstance(data, dict) else None) if FRIGATE_ID.fullmatch(i)]
         ids = ids[:16]
         found = await asyncio.gather(*(self.api.json(f"/api/events/{i}") for i in ids), return_exceptions=True)
+        return ReviewObjects(isinstance(review, dict) and review.get("end_time") is not None, ids, found)
+
+    async def _review_snapshot(self, review_id: str, height: int | None) -> tuple[tuple[bytes, str] | None, bool]:
+        """review_image's answer, and whether the review is over (ended, or gone)."""
+        if self.api is None:
+            return None, False
+        if (review := await self.review_objects(review_id)) is None:
+            return None, True  # gone: no snapshot
+        ids, found = review.ids, review.found
         # Not in Frigate's database yet: an object is written there a moment
         # after it's first seen (once it has a snapshot), while its snapshot
         # is served from memory already.
@@ -991,7 +959,7 @@ class FrigateBridge:
             raise next((f for f in found if isinstance(f, FrigateAPIError)), FrigateAPIError("/api/events: no answer"))
         ranked = [e["id"] for e in self.ranked([e for e in found if isinstance(e, dict) and e.get("has_snapshot")])]
         # A few at most: the phone is waiting (and running out the budget counts as Frigate failing).
-        return await self._snapshot([*ranked, *unwritten], height), ended
+        return await self._snapshot([*ranked, *unwritten], height), review.ended
 
     async def _snapshot(self, ids: list[str], height: int | None) -> tuple[bytes, str] | None:
         """The first of these objects' snapshots (box drawn) Frigate has; a few tried at most."""
@@ -1012,7 +980,8 @@ class FrigateBridge:
         reviews days, objects as long as their snapshots)."""
         assert self.api is not None
         params: dict[str, Any] = {
-            "after": bm.start - BOOKMARK_LOOKBACK, "before": bm.end + BOOKMARK_SLACK, "has_snapshot": 1, "limit": 100,
+            "after": bm.start - FRIGATE_BOOKMARK_LOOKBACK, "before": bm.end + FRIGATE_BOOKMARK_SLACK, "has_snapshot": 1,
+            "limit": 100,
         }
         if names := await self.frigate_cameras([bm.camera_id]):
             params["cameras"] = ",".join(names)
@@ -1023,7 +992,7 @@ class FrigateBridge:
         for o in near if isinstance(near, list) else []:
             if not isinstance(o, dict) or not overlaps(o, bm):
                 continue
-            if not {k.casefold() for k in kinds([str(o.get("label") or "")])} & its:
+            if kind_of(str(o.get("label") or "")).casefold() not in its:
                 continue
             camera = o.get("camera")
             if isinstance(camera, str) and (found := await self.ss_camera(camera)) and found[0] == bm.camera_id:
@@ -1084,10 +1053,6 @@ class FrigateBridge:
         """Of Frigate's tracked objects, the foremost chosen one (see ranked)."""
         return next(iter(self.ranked(events)), None)
 
-    async def ss_camera(self, frigate_camera: str) -> tuple[int, str] | None:
-        """The SS camera (id, name) a Frigate camera is, as its reviews are bookmarked on."""
-        return await self._camera(frigate_camera)
-
     async def frigate_cameras(self, ss_ids: list[int]) -> list[str] | None:
         """Frigate's cameras that are these SS cameras (None: Frigate's list unknown)."""
         if self.api is None:
@@ -1095,13 +1060,14 @@ class FrigateBridge:
         wanted = set(ss_ids)
 
         async def names() -> list[str]:
-            return [n for n in self._frigate_camera_names if (c := await self._camera(n)) is not None and c[0] in wanted]
+            return [n for n in self._frigate_camera_names if (c := await self.ss_camera(n)) is not None and c[0] in wanted]
 
         age = _monotonic() - self._frigate_cameras_at
         found = await names() if age <= FRIGATE_CAMERAS_TTL else []
         # Listed again every FRIGATE_CAMERAS_TTL, or after a minute for a
         # camera not among them (added or renamed in Frigate).
-        if age > FRIGATE_CAMERAS_TTL or (len({self._ss_id(n) for n in found} & wanted) < len(wanted) and age > 60):
+        placed = {c[0] for n in found if (c := self._lookup(n)) is not None}
+        if age > FRIGATE_CAMERAS_TTL or (len(placed & wanted) < len(wanted) and age > 60):
             self._frigate_cameras_at = _monotonic()  # also after a failure: not every search
             try:
                 config = await self.api.json("/api/config")
@@ -1115,30 +1081,23 @@ class FrigateBridge:
             return None
         return found
 
-    def _ss_id(self, frigate_camera: str) -> int | None:
-        key = camera_key(frigate_camera)
-        found = self._cameras_by_name.get(self._aliases[key]) if key in self._aliases else self._cameras.get(key)
-        return found[0] if found else None
-
     def image_from_frigate(self) -> bool:
         """Whether to ask Frigate for an image now (it has an API, and didn't fail just now)."""
         return self.api is not None and _monotonic() >= self._image_down_until
 
-    def count_image(self, frigate: bool, err: Exception | None = None, asked: bool = True) -> None:
-        """How Frigate's image went: sent; none for want of a snapshot; none because Frigate
-        failed (err); not asked (it failed just now). SS's frame then: count_ss_image."""
-        if frigate:
-            self._counts["images_frigate"] += 1
-            if self._image_down_until > -math.inf:
-                _LOGGER.info("Frigate gives notification images again")
-            self._image_down_until = -math.inf
-            return
-        if not asked:
-            return
+    def frigate_image_sent(self) -> None:
+        """Frigate's image went to the phone."""
+        self._counts["images_frigate"] += 1
+        if self._image_down_until > -math.inf:
+            _LOGGER.info("Frigate gives notification images again")
+        self._image_down_until = -math.inf
+
+    def frigate_image_missing(self, err: Exception | None = None) -> None:
+        """Frigate gave no image: for want of a snapshot, or failing (err). SS's frame then: count_ss_image."""
         if err is None:
             self._counts["images_no_snapshot"] += 1
-            return
-        self.frigate_failed(err)
+        else:
+            self.frigate_failed(err)
 
     def thumbs_from_frigate(self) -> bool:
         """Whether to ask Frigate for bookmark thumbnails now (not while it, or they, just failed)."""
@@ -1152,8 +1111,11 @@ class FrigateBridge:
 
     def frigate_failed(self, err: Exception) -> None:
         """Frigate didn't give an image (unreachable, too slow, failing): shown, and not asked for a minute."""
-        detail = str(err)[:200]
-        text = str(err) if isinstance(err, FrigateAPIError) else f"{type(err).__name__}: {detail}" if detail else type(err).__name__
+        if isinstance(err, FrigateAPIError):
+            text = str(err)
+        else:
+            detail = str(err)[:200]
+            text = f"{type(err).__name__}: {detail}" if detail else type(err).__name__
         self._image_error = (time.time(), text)
         if self._image_down_until == -math.inf:
             _LOGGER.warning("No notification image from Frigate (%s); using Surveillance Station's frames for now", text)
@@ -1185,16 +1147,12 @@ class FrigateBridge:
         def lasting(since: float | None) -> bool:
             return since is not None and now - since >= FRIGATE_ISSUE_AFTER_SECONDS
 
-        stale = [k for k, r in self._deferred.items() if time.time() - r.get(_FAILED_AT, 0) > FRIGATE_DEFERRED_MAX_AGE]
-        for key in stale:
-            del self._deferred[key]
-            self._counts["dropped"] += 1
-        if stale:
-            _LOGGER.warning("Gave up on %d Frigate reviews Surveillance Station didn't take for a day", len(stale))
+        if stale := self._queue.expire():
+            _LOGGER.warning("Gave up on %d Frigate reviews Surveillance Station didn't take for a day", stale)
             self._save()
-        if self._subscribed and self._deferred:
+        if self._subscribed and self._queue.deferred:
             # The oldest again; if it goes through, _ok() brings the others.
-            self._canary()
+            self._queue.canary()
         elif self._subscribed and self._failing and (self._probe is None or self._probe.done()):
             # Nothing waiting to go: is SS back at all?
             self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
@@ -1230,7 +1188,6 @@ class FrigateBridge:
                 self._issues.discard(issue)
                 ir.async_delete_issue(self.hass, DOMAIN, self._issue_id(issue))
 
-
     async def _probe_ss(self) -> None:
         """Bookmarks failed and nothing is waiting: does SS answer again?"""
         try:
@@ -1257,15 +1214,6 @@ def _mqtt_connected(hass: HomeAssistant) -> bool:
         return False
 
 
-# An object is a bookmark's when their times overlap, give or take this
-# (a review, and so its bookmark, starts when an object qualifies, which is
-# after the object itself was first seen).
-BOOKMARK_SLACK = 2
-# A bookmark's objects by time: looked for back this far (one can have
-# started long before its review: a car parked for hours, then moving).
-BOOKMARK_LOOKBACK = 3600
-
-
 def event_time(value: Any) -> float | None:
     """A Frigate time (epoch seconds), if it is one."""
     try:
@@ -1283,7 +1231,7 @@ def overlaps(obj: dict[str, Any], bm: Bookmark) -> bool:
     end = event_time(obj.get("end_time"))
     if end is None:
         end = time.time()  # still being tracked
-    return start <= bm.end + BOOKMARK_SLACK and end >= bm.start - BOOKMARK_SLACK
+    return start <= bm.end + FRIGATE_BOOKMARK_SLACK and end >= bm.start - FRIGATE_BOOKMARK_SLACK
 
 
 def store_key(entry_id: str) -> str:
@@ -1311,7 +1259,7 @@ class FrigateImageView(HomeAssistantView):
     """
 
     requires_auth = False
-    url = FRIGATE_IMAGE_URL + r"/{entry_id}/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.jpg"
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/{camera_id:\d+}/{frame:\d+}/{review_id:" + FRIGATE_ID_PATTERN + "}.jpg"
     name = "api:surveillance_station:frigate_image"
 
     def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
@@ -1334,13 +1282,11 @@ class FrigateImageView(HomeAssistantView):
                 _LOGGER.debug("Frigate snapshot for %s: %r", review_id, err)
                 found, failed = None, err
             if found is not None:
-                bridge.count_image(True)
+                bridge.frigate_image_sent()
                 body, content_type = found
                 # It may get better while the review goes on; a phone fetches it once.
                 return web.Response(body=body, content_type=content_type, headers={"Cache-Control": "private, max-age=60"})
-            bridge.count_image(False, failed)
-        elif bridge is not None and bridge.api is not None:
-            bridge.count_image(False, asked=False)
+            bridge.frigate_image_missing(failed)
         # No Frigate (unloaded, unreachable, failing) or no snapshot: SS's frame of the moment.
         # Counted (with why not) here: a notification without its image shows in the diagnostics.
         count = bridge.count_ss_image if bridge is not None and bridge.api is not None else lambda _err=None: None
@@ -1372,7 +1318,7 @@ class FrigateThumbnailView(HomeAssistantView):
     its thumbnail). Signed like the rest."""
 
     requires_auth = False
-    url = FRIGATE_IMAGE_URL + r"/{entry_id}/thumb/{camera_id:\d+}/{frame:\d+}/{review_id:[A-Za-z0-9][A-Za-z0-9._-]{0,63}}.jpg"
+    url = FRIGATE_IMAGE_URL + r"/{entry_id}/thumb/{camera_id:\d+}/{frame:\d+}/{review_id:" + FRIGATE_ID_PATTERN + "}.jpg"
     name = "api:surveillance_station:frigate_thumbnail"
 
     def __init__(self, hass: HomeAssistant, manager: VodManager) -> None:
@@ -1404,14 +1350,6 @@ class FrigateThumbnailView(HomeAssistantView):
         raise web.HTTPFound(self.manager.sign_thumbnail(entry_id, int(camera_id), int(frame)))
 
 
-# Set on a queued message that replaced its review's "new": it was seen new.
-_SEEN_NEW = "_seen_new"
-# Set on a message whose try failed: its bookmark may exist all the same.
-_MAYBE_MADE = "_maybe_made"
-_FAILED_AT = "_failed_at"  # when it first failed (epoch), for giving up after a day
-_RECEIVED_AT = "_received_at"  # when the message came (epoch): a replay of an old one is no news
-
-
 _TRANSIENT_CODES = frozenset({None, 100, 102, 103, 104, 106, 107, 119, 407})
 
 
@@ -1425,17 +1363,3 @@ def _transient(err: SSError) -> bool:
     only come again."""
     code = err.code
     return isinstance(err, (SSConnectionError, SSAuthError)) or code in _TRANSIENT_CODES
-
-
-def _compact(review: dict[str, Any]) -> dict[str, Any]:
-    """What handle() reads of a message, and our flags: kept, possibly on disk."""
-    after = review["after"]
-    data = after.get("data") if isinstance(after.get("data"), dict) else {}
-    return {
-        **{k: v for k, v in review.items() if k.startswith("_")},
-        "type": review.get("type"),
-        "after": {
-            **{k: after.get(k) for k in ("id", "camera", "start_time", "end_time", "severity")},
-            "data": {k: data.get(k) for k in ("objects", "zones", "thumb_time")},
-        },
-    }

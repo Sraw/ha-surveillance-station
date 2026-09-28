@@ -40,10 +40,10 @@ from .const import (
     CARD_FILENAME,
     CONF_FRIGATE,
     CONF_FRIGATE_CAMERAS,
+    CONF_FRIGATE_LINK,
     CONF_FRIGATE_OBJECTS,
     CONF_FRIGATE_QUIET,
     CONF_FRIGATE_QUIET_KINDS,
-    CONF_FRIGATE_LINK,
     CONF_FRIGATE_TOPIC,
     CONF_FRIGATE_URL,
     CONF_VERIFY_SSL,
@@ -56,13 +56,12 @@ from .const import (
 )
 from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, FrigateThumbnailView, store_key as frigate_store_key
 from .frigate_api import FrigateAPI
+from .manager import DATA_MANAGER, VodManager
 from .views import (
-    DATA_MANAGER,
     LargeImageView,
     LiveStreamView,
     ThumbnailView,
     VodInitView,
-    VodManager,
     VodPlaylistView,
     VodSegmentView,
 )

@@ -18,7 +18,6 @@ boundaries are whole video seconds (4 minutes of wall time at 240x) anyway.
 
 from __future__ import annotations
 
-import asyncio
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ import math
 import os
 
 from .client import TimelapseRecording
-from .vod import Segment
+from .vod import Segment, boxes
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,8 +46,6 @@ SW_CRF = 26
 # A software transcode uses at most half the CPUs (decoding, scaling and
 # encoding each), leaving the rest to Home Assistant and whatever else runs.
 SW_THREADS = max(1, (getattr(os, "process_cpu_count", os.cpu_count)() or 2) // 2)
-# A GPU check that timed out is stopped with SIGTERM, then SIGKILL after this.
-CHECK_TERM_GRACE_SECONDS = 5
 CODECS = ("hevc", "h264")
 
 
@@ -200,26 +197,9 @@ def broken_frames(frames: list[tuple[int, ...]]) -> list[int]:
     ]
 
 
-def _boxes(read: Callable[[int, int], bytes], start: int, end: int):
-    """(type, payload start, payload end) of the boxes in [start, end)."""
-    pos = start
-    while pos + 8 <= end:
-        head = read(pos, 16)
-        size, kind = int.from_bytes(head[:4], "big"), head[4:8].decode("latin-1")
-        hdr = 8
-        if size == 1:
-            size, hdr = int.from_bytes(head[8:16], "big"), 16
-        elif size == 0:
-            size = end - pos
-        if size < hdr or pos + size > end:
-            raise ValueError("bad box")
-        yield kind, pos + hdr, pos + size
-        pos += size
-
-
 def _child(read, box: tuple[int, int], path: str) -> tuple[int, int]:
     for name in path.split("/"):
-        box = next(((a, b) for kind, a, b in _boxes(read, *box) if kind == name), None)
+        box = next(((a, b) for kind, _, a, b in boxes(read, *box) if kind == name), None)
         if box is None:
             raise ValueError(f"no {name}")
     return box
@@ -235,7 +215,7 @@ def _table(read, box: tuple[int, int], head: int, count: int, width: int) -> lis
 
 def _slice_types(read: Callable[[int, int], bytes], size: int) -> list[tuple[int, ...]] | None:
     moov = _child(read, (0, size), "moov")
-    for kind, a, b in _boxes(read, *moov):
+    for kind, _, a, b in boxes(read, *moov):
         if kind != "trak":
             continue
         hdlr = _child(read, (a, b), "mdia/hdlr")
@@ -246,7 +226,7 @@ def _slice_types(read: Callable[[int, int], bytes], size: int) -> list[tuple[int
         return None
     # The sample entry (hvc1/hev1): 78 bytes of VisualSampleEntry, then hvcC.
     stsd = _child(read, stbl, "stsd")
-    kind, ea, eb = next(_boxes(read, stsd[0] + 8, stsd[1]), ("", 0, 0))
+    kind, _, ea, eb = next(boxes(read, stsd[0] + 8, stsd[1]), ("", 0, 0, 0))
     if kind not in ("hvc1", "hev1"):
         return None
     hvcc = _child(read, (ea + 78, eb), "hvcC")
@@ -345,49 +325,3 @@ def ffmpeg_transcode_args(
         "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont+skip_trailer",
         "-f", "mp4", "pipe:1",
     ]
-
-
-async def hardware_transcode_available(ffmpeg: str, timeout: float = 20) -> bool | None:
-    """Whether this ffmpeg can encode H.265 on an Intel GPU (QSV) here.
-
-    None: couldn't tell (the check timed out, e.g. while another process
-    was loading the GPU); worth asking again later.
-    """
-    args = [
-        ffmpeg, "-hide_banner", "-loglevel", "error",
-        "-init_hw_device", "qsv=hw", "-filter_hw_device", "hw",
-        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=0.5",
-        "-vf", "hwupload=extra_hw_frames=16,format=qsv",
-        "-c:v", "hevc_qsv", "-f", "null", "-",
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-    except OSError:
-        return False
-    try:
-        async with asyncio.timeout(timeout):
-            return await proc.wait() == 0
-    except TimeoutError:
-        # SIGTERM first: SIGKILLing QSV sessions mid-way hung an iGPU (see
-        # segment.fetch_timelapse_segment), and a check times out when it's busy.
-        await _stop_check(proc)
-        return None
-    except BaseException:
-        # Its caller gone (an unload, HA stopping): not left running for the
-        # loop's teardown to SIGKILL.
-        await asyncio.shield(_stop_check(proc))
-        raise
-
-
-async def _stop_check(proc: asyncio.subprocess.Process) -> None:
-    try:
-        proc.terminate()
-        async with asyncio.timeout(CHECK_TERM_GRACE_SECONDS):
-            await proc.wait()
-    except TimeoutError:
-        proc.kill()
-        await proc.wait()
-    except ProcessLookupError:
-        pass

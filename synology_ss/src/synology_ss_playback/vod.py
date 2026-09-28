@@ -13,10 +13,10 @@ Surveillance Station on demand and remux it to fragmented MP4 (see
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-import math
-import struct
 from datetime import datetime, timezone
+import math
 
 SEGMENT_SECONDS = 10
 # The recording that is still being written can be cut up to "now", but the
@@ -203,23 +203,39 @@ def render_playlist(segments: list[Segment], live: bool = False, event: bool = F
     return "\n".join(lines) + "\n"
 
 
-def iter_boxes(data: bytes):
-    """Yield (type, memoryview) for each top-level ISO BMFF box (views: no copies)."""
-    data = memoryview(data)
-    i = 0
-    n = len(data)
-    while i + 8 <= n:
-        size, typ = struct.unpack(">I4s", data[i : i + 8])
+def boxes(read: Callable[[int, int], bytes], start: int, end: int) -> Iterator[tuple[str, int, int, int]]:
+    """(type, start, payload start, end) of each ISO BMFF box in [start, end).
+
+    ``read(offset, n)`` reads the data. A box that doesn't fit raises ValueError.
+    """
+    pos = start
+    while pos + 8 <= end:
+        head = read(pos, 16)
+        size, kind = int.from_bytes(head[:4], "big"), bytes(head[4:8]).decode("latin-1")
+        hdr = 8
         if size == 1:
-            if i + 16 > n:
-                break
-            size = struct.unpack(">Q", data[i + 8 : i + 16])[0]
+            if pos + 16 > end:
+                raise ValueError("bad box")
+            size, hdr = int.from_bytes(head[8:16], "big"), 16
         elif size == 0:
-            size = n - i
-        if size < 8 or i + size > n:
-            break
-        yield typ.decode("latin-1"), data[i : i + size]
-        i += size
+            size = end - pos
+        if size < hdr or pos + size > end:
+            raise ValueError("bad box")
+        yield kind, pos, pos + hdr, pos + size
+        pos += size
+
+
+def iter_boxes(data: bytes) -> Iterator[tuple[str, memoryview]]:
+    """Yield (type, memoryview) for each top-level ISO BMFF box (views: no copies).
+
+    A truncated box ends it.
+    """
+    view = memoryview(data)
+    try:
+        for kind, start, _, end in boxes(lambda offset, n: view[offset : offset + n], 0, len(view)):
+            yield kind, view[start:end]
+    except ValueError:
+        return
 
 
 def split_fmp4(data: bytes) -> tuple[bytes, bytes]:

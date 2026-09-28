@@ -28,13 +28,15 @@ import voluptuous as vol
 from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
+from .bookmarks import wanted_kinds
 from .const import (
     BOOKMARK_PAGE_MAX,
     CONF_TRANSCODER,
     DEFAULT_TRANSCODER,
-    FRIGATE_SEARCH_MAX,
     DOMAIN,
+    FRIGATE_SEARCH_MAX,
     LIVE_END_STALE_SECONDS,
+    LIVE_THRESHOLD_SECONDS,
     LIVE_URL,
     MAX_QUERY_WINDOW_SECONDS,
     VOD_MAX_WINDOW_SECONDS,
@@ -44,11 +46,9 @@ from .const import (
 from .errors import EntryNotLoaded, InvalidRequest, SessionNotFound
 from .frigate import DATA_FRIGATE
 from .frigate_api import FrigateAPIError
+from .manager import DATA_MANAGER, VodManager
 from .search import search
-from .views import DATA_MANAGER, VodManager, VodSession
-
-# A window whose end is at least this close to now becomes a live session.
-LIVE_THRESHOLD_SECONDS = 60
+from .segments import VodSession
 
 ERR_SS = "surveillance_station_error"
 ERR_FRIGATE = "frigate_error"
@@ -280,7 +280,7 @@ async def ws_bookmark_page(
         cams = msg.get("camera_ids")
         manager = _manager(hass)
         index = await manager.bookmark_index(entry_id, client)
-        wanted = {k.strip().casefold() for k in msg.get("kinds") or [] if k.strip()}
+        wanted = wanted_kinds(msg.get("kinds"))
         cursor = (msg["before"], msg["before_id"]) if "before" in msg else None
         page, total, more = index.page(cams, wanted, cursor, msg["limit"])
         # Frigate's bookmarks: Frigate's snapshot, as the notification's image.
@@ -452,24 +452,12 @@ def _camera_files(files: list[TimelapseRecording], camera_id: int) -> list[Timel
 
 def _days(files: list[TimelapseRecording], tz: ZoneInfo) -> list[dict[str, Any]]:
     """The NAS-local days one camera's files cover, newest first, with the stretches covered."""
-    stretches = sorted(covered(f) for f in files)
     days: dict[date, list[list[float]]] = {}
-    for lo, hi in stretches:
-        if hi - lo < 60:
+    for stretch_start, stretch_end in sorted(covered(f) for f in files):
+        if stretch_end - stretch_start < 60:
             continue
-        day = datetime.fromtimestamp(lo, tz).date()
-        while True:
-            start, end = _day_bounds(day, tz)
-            if start >= hi:
-                break
-            a, b = max(lo, start), min(hi, end)
-            if b > a:
-                spans = days.setdefault(day, [])
-                if spans and a <= spans[-1][1] + 60:
-                    spans[-1][1] = max(spans[-1][1], b)
-                else:
-                    spans.append([a, b])
-            day += timedelta(days=1)
+        for day, part_start, part_end in _split_at_midnights(stretch_start, stretch_end, tz):
+            _add_span(days.setdefault(day, []), part_start, part_end)
     out = []
     for day in sorted(days, reverse=True):
         start, end = _day_bounds(day, tz)
@@ -477,6 +465,28 @@ def _days(files: list[TimelapseRecording], tz: ZoneInfo) -> list[dict[str, Any]]
             continue  # minutes past midnight only: less than the whole video second a day starts on
         out.append({"date": day.isoformat(), "start": start, "end": end, "covered": days[day]})
     return out
+
+
+def _split_at_midnights(start: float, end: float, tz: ZoneInfo) -> list[tuple[date, float, float]]:
+    """[start, end) cut into its NAS-local days: (day, from, to) for each."""
+    parts = []
+    day = datetime.fromtimestamp(start, tz).date()
+    while True:
+        day_start, day_end = _day_bounds(day, tz)
+        if day_start >= end:
+            return parts
+        part_start, part_end = max(start, day_start), min(end, day_end)
+        if part_end > part_start:
+            parts.append((day, part_start, part_end))
+        day += timedelta(days=1)
+
+
+def _add_span(spans: list[list[float]], start: float, end: float) -> None:
+    """Add to a day's spans (given in order of start): joined to the last one if within a minute of it."""
+    if spans and start <= spans[-1][1] + 60:
+        spans[-1][1] = max(spans[-1][1], end)
+    else:
+        spans.append([start, end])
 
 
 @websocket_api.websocket_command(

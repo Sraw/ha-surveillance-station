@@ -14,7 +14,7 @@ from synology_ss_playback import Bookmark, Camera
 from custom_components.surveillance_station import frigate as frigate_mod, search as search_mod
 from custom_components.surveillance_station.frigate import DATA_FRIGATE, FrigateBridge
 from custom_components.surveillance_station.frigate_api import FrigateAPI
-from custom_components.surveillance_station.views import DATA_MANAGER
+from custom_components.surveillance_station.manager import DATA_MANAGER
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -201,7 +201,7 @@ async def test_empty_answer_asked_again(hass: HomeAssistant, bridge: FrigateBrid
     async def frigate(path, params=None):
         return next(answers) if "search" in path else {}
 
-    with patch.object(bridge.api, "json", frigate), patch.object(search_mod, "_EMPTY_RETRY_SECONDS", 0):
+    with patch.object(bridge.api, "json", frigate), patch.object(search_mod, "FRIGATE_SEARCH_EMPTY_RETRY_SECONDS", 0):
         msg = await ask(hass, hass_ws_client, query="car")
     assert [r["key"] for r in msg["result"]["results"]] == ["b21"]
 
@@ -252,7 +252,7 @@ async def test_search_time_limit(hass: HomeAssistant, bridge: FrigateBridge, has
     async def hang(*_args, **_kwargs):
         await asyncio.sleep(60)
 
-    with patch.object(search_mod, "SEARCH_TIMEOUT_SECONDS", 0.05), patch.object(bridge.api, "json", hang):
+    with patch.object(search_mod, "FRIGATE_SEARCH_TIMEOUT_SECONDS", 0.05), patch.object(bridge.api, "json", hang):
         msg = await ask(hass, hass_ws_client, query="car")
     assert msg["error"] == {"code": "frigate_error", "message": "search: no answer in time (Frigate or Surveillance Station)"}
 

@@ -18,7 +18,8 @@ from .const import FRIGATE_API_TIMEOUT
 
 # A review or tracked-object id ("1790406867.462609-6jc58g"); never "." or ".."
 # (a URL would take those as a path step).
-FRIGATE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+FRIGATE_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+FRIGATE_ID = re.compile(FRIGATE_ID_PATTERN)
 # Frigate's answers are small (JSON, a snapshot): a bigger one is something else.
 MAX_BODY_BYTES = 8 * 1024 * 1024
 

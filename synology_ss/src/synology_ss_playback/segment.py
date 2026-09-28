@@ -1,5 +1,6 @@
 """Fetch one planned segment (cut on the NAS, remuxed to fragmented MP4; a
-time-lapse one transcoded), or a single frame of a recording as a JPEG.
+time-lapse one transcoded), or a single frame of a recording as a JPEG; and
+check for a GPU to transcode on.
 
 ``Recording.Download`` returns a plain MP4 with the ``moov`` box at the end
 and no Range support, so ffmpeg needs it as a seekable file. The scratch file
@@ -340,6 +341,40 @@ async def drain_transcodes(timeout: float = REMUX_TIMEOUT_SECONDS + TERM_GRACE_S
     """
     if _JOBS:
         await asyncio.wait(list(_JOBS), timeout=timeout)
+
+
+async def hardware_transcode_available(ffmpeg: str, timeout: float = 20) -> bool | None:
+    """Whether this ffmpeg can encode H.265 on an Intel GPU (QSV) here.
+
+    None: couldn't tell (the check timed out, e.g. while another process
+    was loading the GPU); worth asking again later.
+    """
+    args = [
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-init_hw_device", "qsv=hw", "-filter_hw_device", "hw",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=0.5",
+        "-vf", "hwupload=extra_hw_frames=16,format=qsv",
+        "-c:v", "hevc_qsv", "-f", "null", "-",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+    except OSError:
+        return False
+    try:
+        async with asyncio.timeout(timeout):
+            return await proc.wait() == 0
+    except TimeoutError:
+        # SIGTERM first: SIGKILLing QSV sessions mid-way hung an iGPU (see
+        # fetch_timelapse_segment), and a check times out when it's busy.
+        await _stop(proc, gentle=True)
+        return None
+    except BaseException:
+        # Its caller gone (an unload, HA stopping): not left running for the
+        # loop's teardown to SIGKILL.
+        await asyncio.shield(_stop(proc, gentle=True))
+        raise
 
 
 async def fetch_snapshot(

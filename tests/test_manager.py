@@ -6,16 +6,25 @@ import logging
 import os
 from pathlib import Path
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from synology_ss_playback import Bookmark, RecordingInfo, Segment, SSConnectionError, SSError
 
-from custom_components.surveillance_station import views
-from custom_components.surveillance_station.const import DOMAIN
+from custom_components.surveillance_station import bookmarks, manager as manager_mod, segments, thumbnails, tokens
+from custom_components.surveillance_station.const import (
+    DOMAIN,
+    FRIGATE_ISSUE_AFTER_SECONDS,
+    LIVE_TOKEN_TTL_SECONDS,
+    MAX_PARALLEL_FETCHES,
+    THUMBNAIL_ENTRY_BYTES,
+    THUMBNAIL_MISS_SECONDS,
+)
+from custom_components.surveillance_station.manager import DATA_MANAGER, VodManager
+from custom_components.surveillance_station.segments import VodSession
 from custom_components.surveillance_station.thumbnail_store import ThumbnailStore
-from custom_components.surveillance_station.views import DATA_MANAGER, VodManager, VodSession
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
 
@@ -40,7 +49,7 @@ async def test_waiters_share_one_fetch(hass: HomeAssistant, setup_integration: M
         return b"i", b"m"
 
     fetch = AsyncMock(side_effect=slow)
-    with patch.object(views, "fetch_segment", fetch):
+    with patch.object(segments, "fetch_segment", fetch):
         a = asyncio.create_task(manager.fetch(session, session.segments[0]))
         b = asyncio.create_task(manager.fetch(session, session.segments[0]))
         await asyncio.sleep(0)
@@ -67,19 +76,19 @@ async def test_abandoned_queued_fetch_is_cancelled(
         await gate.wait()
         return b"i", b"m"
 
-    with patch.object(views, "fetch_segment", AsyncMock(side_effect=slow)):
+    with patch.object(segments, "fetch_segment", AsyncMock(side_effect=slow)):
         # Fill every download slot, then queue one more.
-        busy = [asyncio.create_task(manager.fetch(session, s)) for s in session.segments[: views.MAX_PARALLEL_FETCHES]]
+        busy = [asyncio.create_task(manager.fetch(session, s)) for s in session.segments[:MAX_PARALLEL_FETCHES]]
         queued = asyncio.create_task(manager.fetch(session, session.segments[-1]))
         await asyncio.sleep(0.01)
-        assert manager.stats()["fetches_in_flight"] == views.MAX_PARALLEL_FETCHES + 1
+        assert manager.stats()["fetches_in_flight"] == MAX_PARALLEL_FETCHES + 1
         queued.cancel()
         await asyncio.sleep(0.01)
-        assert manager.stats()["fetches_in_flight"] == views.MAX_PARALLEL_FETCHES
+        assert manager.stats()["fetches_in_flight"] == MAX_PARALLEL_FETCHES
         gate.set()
         await asyncio.gather(*busy)
     assert session.segments[-1].index not in started
-    assert manager.stats()["cached_segments"] == views.MAX_PARALLEL_FETCHES
+    assert manager.stats()["cached_segments"] == MAX_PARALLEL_FETCHES
 
 
 async def test_abandoned_download_finishes_into_the_cache(
@@ -97,7 +106,7 @@ async def test_abandoned_download_finishes_into_the_cache(
         return b"i", b"m"
 
     fetch = AsyncMock(side_effect=slow)
-    with patch.object(views, "fetch_segment", fetch):
+    with patch.object(segments, "fetch_segment", fetch):
         req = asyncio.create_task(manager.fetch(session, session.segments[0]))
         await started.wait()
         req.cancel()
@@ -112,10 +121,10 @@ async def test_abandoned_download_finishes_into_the_cache(
 
 
 async def test_segment_cache_is_bounded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
-    manager = hass.data[DATA_MANAGER]
     session = _session(setup_integration)
     fetch = AsyncMock(return_value=(b"", b"x" * 400))
-    with patch.object(views, "SEGMENT_CACHE_BYTES", 1000), patch.object(views, "fetch_segment", fetch):
+    with patch.object(segments, "SEGMENT_CACHE_BYTES", 1000), patch.object(segments, "fetch_segment", fetch):
+        manager = VodManager(hass)
         for seg in session.segments[:4]:
             await manager.fetch(session, seg)
         assert manager.stats()["cached_segments"] == 2
@@ -133,7 +142,7 @@ async def test_failed_fetch_is_not_remembered(hass: HomeAssistant, setup_integra
     manager = hass.data[DATA_MANAGER]
     session = _session(setup_integration)
     fetch = AsyncMock(side_effect=[SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None), (b"i", b"m")])
-    with patch.object(views, "fetch_segment", fetch):
+    with patch.object(segments, "fetch_segment", fetch):
         with pytest.raises(SSConnectionError):
             await manager.fetch(session, session.segments[0])
         assert await manager.fetch(session, session.segments[0]) == (b"i", b"m")
@@ -142,11 +151,11 @@ async def test_failed_fetch_is_not_remembered(hass: HomeAssistant, setup_integra
 
 async def test_thumbnail_cache_is_bounded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     """By bytes, counting a fixed cost per entry, so misses (b"") count too."""
-    manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    per = views.THUMBNAIL_ENTRY_BYTES
+    per = THUMBNAIL_ENTRY_BYTES
     snap = AsyncMock(side_effect=[b"j" * 400, None, b"j" * 400, None, None, None])
-    with patch.object(views, "THUMBNAIL_CACHE_BYTES", 400 + 3 * per), patch.object(views, "fetch_snapshot", snap):
+    with patch.object(thumbnails, "THUMBNAIL_CACHE_BYTES", 400 + 3 * per), patch.object(thumbnails, "fetch_snapshot", snap):
+        manager = VodManager(hass)
         for i in range(6):
             await manager.thumbnail(entry_id, 6, T0 + i)
     assert manager.stats()["cached_thumbnails"] == 3
@@ -163,13 +172,13 @@ async def test_same_thumbnail_made_once(hass: HomeAssistant, setup_integration: 
         return b"j" * 400
 
     snap = AsyncMock(side_effect=slow)
-    with patch.object(views, "fetch_snapshot", snap):
+    with patch.object(thumbnails, "fetch_snapshot", snap):
         both = asyncio.gather(manager.thumbnail(entry_id, 6, T0), manager.thumbnail(entry_id, 6, T0))
         await asyncio.sleep(0.01)
         gate.set()
         assert await both == [b"j" * 400] * 2
     assert snap.await_count == 1
-    assert manager.stats()["cached_thumbnail_bytes"] == 400 + views.THUMBNAIL_ENTRY_BYTES
+    assert manager.stats()["cached_thumbnail_bytes"] == 400 + THUMBNAIL_ENTRY_BYTES
 
 
 async def test_abandoned_thumbnail_is_cancelled(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -183,7 +192,7 @@ async def test_abandoned_thumbnail_is_cancelled(hass: HomeAssistant, setup_integ
             cancelled.set()
             raise
 
-    with patch.object(views, "fetch_snapshot", AsyncMock(side_effect=slow)):
+    with patch.object(thumbnails, "fetch_snapshot", AsyncMock(side_effect=slow)):
         req = asyncio.create_task(manager.thumbnail(setup_integration.entry_id, 6, T0))
         await asyncio.sleep(0.01)
         req.cancel()
@@ -196,12 +205,12 @@ async def test_thumbnail_miss_expires(hass: HomeAssistant, setup_integration: Mo
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
     snap = AsyncMock(side_effect=[None, b"j"])
-    now = views.time.monotonic()
-    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic") as clock:
+    now = time.monotonic()
+    with patch.object(thumbnails, "fetch_snapshot", snap), patch.object(thumbnails, "_monotonic") as clock:
         clock.return_value = now
         assert await manager.thumbnail(entry_id, 6, T0) is None
         assert await manager.thumbnail(entry_id, 6, T0) is None
-        clock.return_value = now + views.THUMBNAIL_MISS_SECONDS + 1
+        clock.return_value = now + THUMBNAIL_MISS_SECONDS + 1
         assert await manager.thumbnail(entry_id, 6, T0) == b"j"
     assert snap.await_count == 2
 
@@ -248,7 +257,7 @@ async def test_bookmarks_kept_for_a_minute(
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
     now = [100.0]
-    with patch.object(views, "_monotonic", lambda: now[0]):
+    with patch.object(bookmarks, "_monotonic", lambda: now[0]):
         await manager.bookmarks(entry_id, mock_client)
         now[0] += 30
         await manager.bookmarks(entry_id, mock_client)
@@ -263,13 +272,13 @@ async def test_bookmarks_indexed_off_the_loop(
 ) -> None:
     """Tens of thousands of bookmarks take a while to index: never on HA's event loop."""
     threads: list[threading.Thread] = []
-    real = views.BookmarkIndex
+    real = bookmarks.BookmarkIndex
 
     def index(found):
         threads.append(threading.current_thread())
         return real(found)
 
-    with patch.object(views, "BookmarkIndex", index):
+    with patch.object(bookmarks, "BookmarkIndex", index):
         await hass.data[DATA_MANAGER].bookmarks(setup_integration.entry_id, mock_client)
     assert threads and threads[0] is not threading.main_thread()
 
@@ -282,9 +291,9 @@ async def test_lasting_outage_is_a_repairs_issue(hass: HomeAssistant, setup_inte
     issue_id = f"ss_unreachable_{entry_id}"
     down = SSConnectionError("SYNO.SurveillanceStation.Camera", "List", None)
     now = [1000.0]
-    with patch.object(views, "_monotonic", lambda: now[0]):
+    with patch.object(manager_mod, "_monotonic", lambda: now[0]):
         manager.track(entry_id, down)
-        now[0] += views.FRIGATE_ISSUE_AFTER_SECONDS - 1
+        now[0] += FRIGATE_ISSUE_AFTER_SECONDS - 1
         manager.track(entry_id, down)
         assert registry.async_get_issue(DOMAIN, issue_id) is None
         now[0] += 1
@@ -295,7 +304,7 @@ async def test_lasting_outage_is_a_repairs_issue(hass: HomeAssistant, setup_inte
         manager.track(entry_id, None)
         assert registry.async_get_issue(DOMAIN, issue_id) is None
         manager.track(entry_id, down)
-        now[0] += views.FRIGATE_ISSUE_AFTER_SECONDS
+        now[0] += FRIGATE_ISSUE_AFTER_SECONDS
         manager.track(entry_id, down)
         assert registry.async_get_issue(DOMAIN, issue_id) is not None
     assert await hass.config_entries.async_unload(entry_id)
@@ -307,13 +316,13 @@ async def test_unreachable_logged_once(
 ) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    caplog.set_level(logging.INFO, logger=views.__name__)
+    caplog.set_level(logging.INFO, logger=manager_mod.__name__)
     down = AsyncMock(side_effect=SSConnectionError("SYNO.SurveillanceStation.Recording", "Download", None))
-    with patch.object(views, "fetch_snapshot", down):
+    with patch.object(thumbnails, "fetch_snapshot", down):
         for i in range(3):
             with pytest.raises(SSConnectionError):
                 await manager.thumbnail(entry_id, 6, T0 + i)
-    with patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j")):
+    with patch.object(thumbnails, "fetch_snapshot", AsyncMock(return_value=b"j")):
         await manager.thumbnail(entry_id, 6, T0 + 10)
         await manager.thumbnail(entry_id, 6, T0 + 11)
     assert caplog.text.count("is unreachable") == 1
@@ -329,7 +338,7 @@ async def test_unload_answers_waiting_requests(hass: HomeAssistant, setup_integr
         await asyncio.Event().wait()
 
     mock_client.list_bookmarks.side_effect = hang
-    with patch.object(views, "fetch_snapshot", AsyncMock(side_effect=hang)):
+    with patch.object(thumbnails, "fetch_snapshot", AsyncMock(side_effect=hang)):
         waiting = [
             asyncio.create_task(manager.bookmarks(entry_id, mock_client)),
             asyncio.create_task(manager.thumbnail(entry_id, 6, T0)),
@@ -348,7 +357,7 @@ async def test_thumbnails_outlive_a_restart(
     entry_id = setup_integration.entry_id
     url = manager.sign_thumbnail(entry_id, 6, T0)
     snap = AsyncMock(side_effect=[b"j" * 400, None])
-    with patch.object(views, "fetch_snapshot", snap):
+    with patch.object(thumbnails, "fetch_snapshot", snap):
         assert await manager.thumbnail(entry_id, 6, T0) == b"j" * 400
         assert await manager.thumbnail(entry_id, 6, T0 + 1) is None
     await manager.disk.settle()
@@ -359,7 +368,7 @@ async def test_thumbnails_outlive_a_restart(
     await again.async_load()
     assert again.stats()["disk_thumbnails"] == 1
     assert again.sign_thumbnail(entry_id, 6, T0) == url  # the browser's copy stays good
-    with patch.object(views, "fetch_snapshot", AsyncMock(side_effect=AssertionError)):
+    with patch.object(thumbnails, "fetch_snapshot", AsyncMock(side_effect=AssertionError)):
         assert await again.thumbnail(entry_id, 6, T0) == b"j" * 400
 
 
@@ -401,7 +410,7 @@ async def test_removing_the_entry_deletes_its_thumbnails(
 ) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    with patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j")):
+    with patch.object(thumbnails, "fetch_snapshot", AsyncMock(return_value=b"j")):
         await manager.thumbnail(entry_id, 6, T0)
     await manager.disk.settle()  # the write runs in the background
     assert (thumbnail_dir / entry_id).is_dir()
@@ -425,7 +434,7 @@ async def test_thumbnail_kept_even_if_nobody_waits_any_more(
         real_write(path, data)
 
     with (
-        patch.object(views, "fetch_snapshot", AsyncMock(return_value=b"j" * 400)),
+        patch.object(thumbnails, "fetch_snapshot", AsyncMock(return_value=b"j" * 400)),
         patch("custom_components.surveillance_station.thumbnail_store._write", slow_write),
     ):
         req = asyncio.create_task(manager.thumbnail(entry_id, 6, T0))
@@ -495,8 +504,8 @@ async def test_thumbnail_when_recorded(hass: HomeAssistant, setup_integration: M
     mock_client.recordings = AsyncMock(side_effect=[SSConnectionError("x", "List", None), *written])
     snap = AsyncMock(return_value=b"jpg")
     with (
-        patch.object(views, "fetch_snapshot", snap),
-        patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
+        patch.object(thumbnails, "fetch_snapshot", snap),
+        patch.object(thumbnails, "THUMBNAIL_POLL_SECONDS", 0),
     ):
         assert await manager.thumbnail_when_recorded(entry_id, 6, T0 + 10, 20) == b"jpg"
     assert mock_client.recordings.await_count == 3
@@ -511,8 +520,8 @@ async def test_thumbnail_when_recorded_gives_up(hass: HomeAssistant, setup_integ
     )
     clock = iter(range(0, 1000, 3))
     with (
-        patch.object(views, "THUMBNAIL_POLL_SECONDS", 0),
-        patch.object(views, "_monotonic", lambda: next(clock)),
+        patch.object(thumbnails, "THUMBNAIL_POLL_SECONDS", 0),
+        patch.object(thumbnails, "_monotonic", lambda: next(clock)),
     ):
         assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
     assert 3 <= mock_client.recordings.await_count <= 8
@@ -532,7 +541,7 @@ async def test_thumbnail_when_not_recording(
     moment late), not after the whole wait (a notification isn't held for it)."""
     mock_client.recordings = AsyncMock(return_value=recordings)
     clock = iter(range(0, 1000, 2))
-    with patch.object(views, "THUMBNAIL_POLL_SECONDS", 0), patch.object(views, "_monotonic", lambda: next(clock)):
+    with patch.object(thumbnails, "THUMBNAIL_POLL_SECONDS", 0), patch.object(thumbnails, "_monotonic", lambda: next(clock)):
         assert await hass.data[DATA_MANAGER].thumbnail_when_recorded(setup_integration.entry_id, 6, T0, 20) is None
     assert 3 <= mock_client.recordings.await_count <= 5  # 8 s of 2 s polls, not 20
 
@@ -542,13 +551,13 @@ async def test_recent_miss_is_asked_again_soon(hass: HomeAssistant, setup_integr
     manager = hass.data[DATA_MANAGER]
     snap = AsyncMock(side_effect=[None, b"jpg", None, b"jpg"])
     now = [100.0]
-    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic", lambda: now[0]), patch.object(
-        views.time, "time", return_value=T0 + 10
+    with patch.object(thumbnails, "fetch_snapshot", snap), patch.object(thumbnails, "_monotonic", lambda: now[0]), patch.object(
+        time, "time", return_value=T0 + 10
     ):
         assert await manager.thumbnail(setup_integration.entry_id, 6, T0) is None
         now[0] += 6
         assert await manager.thumbnail(setup_integration.entry_id, 6, T0) == b"jpg"
-    with patch.object(views, "fetch_snapshot", snap), patch.object(views, "_monotonic", lambda: now[0]):
+    with patch.object(thumbnails, "fetch_snapshot", snap), patch.object(thumbnails, "_monotonic", lambda: now[0]):
         assert await manager.thumbnail(setup_integration.entry_id, 6, T0 - 3600) is None  # long past
         now[0] += 6
         assert await manager.thumbnail(setup_integration.entry_id, 6, T0 - 3600) is None  # still the miss
@@ -570,7 +579,7 @@ async def test_large_image(
         return b"L" if width == 1280 else b"s"
 
     http = await hass_client_no_auth()
-    with patch.object(views, "fetch_snapshot", snap):
+    with patch.object(thumbnails, "fetch_snapshot", snap):
         assert await (await http.get(large)).read() == b"L"
         assert await (await http.get(small)).read() == b"s"
         # The small URL's signature doesn't open the large image.
@@ -614,9 +623,9 @@ async def test_drop_entry_forgets_its_live_tokens(hass: HomeAssistant, setup_int
 async def test_expired_live_tokens_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    with patch.object(views.time, "time", return_value=1_000_000.0):
+    with patch.object(time, "time", return_value=1_000_000.0):
         old = manager.create_live_token(entry_id, 6)
-    with patch.object(views.time, "time", return_value=1_000_000.0 + views.LIVE_TOKEN_TTL_SECONDS + 1):
+    with patch.object(time, "time", return_value=1_000_000.0 + LIVE_TOKEN_TTL_SECONDS + 1):
         new = manager.create_live_token(entry_id, 7)
         assert manager.stats()["live_tokens"] == 1
         assert manager.take_live_token(old) is None
@@ -627,11 +636,11 @@ async def test_live_tokens_are_bounded(hass: HomeAssistant, setup_integration: M
     """Unused tokens asked for faster than they expire: the oldest go."""
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    with patch.object(views, "LIVE_TOKENS_MAX", 3):
-        tokens = [manager.create_live_token(entry_id, i) for i in range(5)]
+    with patch.object(tokens, "LIVE_TOKENS_MAX", 3):
+        made = [manager.create_live_token(entry_id, i) for i in range(5)]
     assert manager.stats()["live_tokens"] == 3
-    assert [manager.take_live_token(t) for t in tokens[:2]] == [None, None]
-    assert manager.take_live_token(tokens[-1]) == (entry_id, 4, None)
+    assert [manager.take_live_token(t) for t in made[:2]] == [None, None]
+    assert manager.take_live_token(made[-1]) == (entry_id, 4, None)
 
 
 async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -639,7 +648,7 @@ async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_i
     old = _session(setup_integration)
     old.expires = T0  # long expired
     old_token = manager.create_session(old)
-    with patch.object(views.time, "time", return_value=T0 + 10):
+    with patch.object(time, "time", return_value=T0 + 10):
         manager.create_session(_session(setup_integration))
     assert manager.get_session(old_token) is None
     assert manager.stats()["sessions"] == 1
@@ -647,7 +656,7 @@ async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_i
 
 async def test_sessions_are_bounded_by_count(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views, "VOD_MAX_SESSIONS", 2), patch.object(views.time, "time", return_value=T0):
+    with patch.object(manager_mod, "VOD_MAX_SESSIONS", 2), patch.object(time, "time", return_value=T0):
         first = manager.create_session(_session(setup_integration))
         manager.create_session(_session(setup_integration))
         manager.create_session(_session(setup_integration))  # evicts the first (LRU)
@@ -670,7 +679,7 @@ async def test_extend_appends_segments_recorded_since_the_last_plan(
         RecordingInfo(id=100, camera_id=6, start=T0, end=T0 + 40, mount_id=1, live=True, hevc=True)
     ]
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views.time, "time", return_value=T0 + 35):
+    with patch.object(time, "time", return_value=T0 + 35):
         await manager.extend(session)
     assert session.planned_end > T0 + 20
     assert len(session.segments) > 2
@@ -685,7 +694,7 @@ async def test_extend_stops_growing_at_max_end(
         RecordingInfo(id=100, camera_id=6, start=T0, end=T0 + 40, mount_id=1, live=True, hevc=True)
     ]
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views.time, "time", return_value=T0 + 3600):
+    with patch.object(time, "time", return_value=T0 + 3600):
         await manager.extend(session)
     assert session.planned_end == T0 + 30
     assert session.live is False
@@ -699,7 +708,7 @@ async def test_extend_does_nothing_before_the_next_grid_line(
 ) -> None:
     session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views.time, "time", return_value=T0 + 21):  # live_edge still <= planned_end
+    with patch.object(time, "time", return_value=T0 + 21):  # live_edge still <= planned_end
         await manager.extend(session)
     assert session.planned_end == T0 + 20
     mock_client.recordings.assert_not_awaited()
@@ -711,7 +720,7 @@ async def test_extend_does_nothing_if_the_entry_is_not_loaded(
     session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
     session.entry_id = "not-a-real-entry-id"
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views.time, "time", return_value=T0 + 35):
+    with patch.object(time, "time", return_value=T0 + 35):
         await manager.extend(session)  # no exception, nothing changes
     assert session.planned_end == T0 + 20
 
@@ -719,11 +728,11 @@ async def test_extend_does_nothing_if_the_entry_is_not_loaded(
 async def test_extend_leaves_the_playlist_unchanged_when_ss_is_unreachable(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger=views.__name__)
+    caplog.set_level(logging.DEBUG, logger=manager_mod.__name__)
     session = _live_session(setup_integration, planned_end=T0 + 20, max_end=T0 + 3600)
     mock_client.recordings.side_effect = SSConnectionError("SYNO.SurveillanceStation.Event", "List", None)
     manager = hass.data[DATA_MANAGER]
-    with patch.object(views.time, "time", return_value=T0 + 35):
+    with patch.object(time, "time", return_value=T0 + 35):
         await manager.extend(session)
     assert session.planned_end == T0 + 20
     assert "not extended" in caplog.text
@@ -738,7 +747,7 @@ async def test_set_frame_is_a_noop_when_the_moment_is_unchanged(
 ) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    with patch.object(views, "BOOKMARK_FRAMES_MAX", 2):
+    with patch.object(manager_mod, "BOOKMARK_FRAMES_MAX", 2):
         manager.set_frame(entry_id, 1, 100)
         manager.set_frame(entry_id, 2, 200)
         manager.set_frame(entry_id, 1, 100)  # same ts as already stored: not re-recorded
@@ -751,7 +760,7 @@ async def test_set_frame_is_a_noop_when_the_moment_is_unchanged(
 async def test_set_frame_evicts_the_oldest_past_the_cap(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    with patch.object(views, "BOOKMARK_FRAMES_MAX", 2):
+    with patch.object(manager_mod, "BOOKMARK_FRAMES_MAX", 2):
         manager.set_frame(entry_id, 1, 10)
         manager.set_frame(entry_id, 2, 20)
         manager.set_frame(entry_id, 3, 30)  # evicts bookmark 1 (the oldest)
@@ -781,13 +790,13 @@ async def test_image_url_is_the_same_all_day(hass: HomeAssistant, setup_integrat
     midnight = datetime(2026, 9, 22, tzinfo=UTC).timestamp()
     urls = []
     for t in (midnight, midnight + 86399.9, midnight + 86400):
-        with patch.object(views.time, "time", return_value=t):
+        with patch.object(time, "time", return_value=t):
             urls.append(manager.sign_thumbnail(entry_id, 6, T0))
     assert urls[0] == urls[1] != urls[2]
     for url in urls:
         path, query = url.split("?")
         exp, sig = (part.split("=")[1] for part in query.split("&"))
-        with patch.object(views.time, "time", return_value=midnight + 86400):
+        with patch.object(time, "time", return_value=midnight + 86400):
             assert manager.check_thumbnail(path, exp, sig)
 
 

@@ -35,14 +35,14 @@ viewer's choice is remembered in the browser and wins over the options.
 - **Grid or one camera**: the square / grid button in the controls switches
   between the two. In the grid (2 side by side, 3-4 in 2x2, more in 3
   columns) the camera chips add or remove a camera (tinted = shown, a ring
-  in the camera's colour = the master; the last one stays). With one camera
+  in the camera's colour = the leader; the last one stays). With one camera
   the chips switch which one, and the grid keeps its cameras for when it
   comes back. Double-tapping a grid cell shows that camera alone. Each camera
   has a colour, used for its chip, its cell label, its timeline pins and its
   event rows. The mode, the grid's cameras and the camera watched are
   remembered per browser (`localStorage`) and win over `view` / `cameras` /
   `camera`.
-- **Master**: tap a cell. It has the sound and the clock, and the others
+- **Leader**: tap a cell. It has the sound and the clock, and the others
   follow its wall-clock time (see *Grid* below). A camera with no recording
   at that time holds under a "No recording" veil. Seek / skip / Live apply to
   all cameras.
@@ -63,7 +63,7 @@ viewer's choice is remembered in the browser and wins over the options.
 - **Fullscreen**: the stage (video + a slim auto-hiding control bar) goes
   fullscreen and asks for landscape (`screen.orientation.lock`; honoured on
   Android / the companion app, ignored where the browser doesn't allow it).
-  On an iPhone, which has no element fullscreen, the master's own video player
+  On an iPhone, which has no element fullscreen, the leader's own video player
   goes fullscreen instead.
 - **Zoom**: pinch or double-tap (single view) zooms up to 8x, drag pans,
   double-tap resets; the mouse wheel zooms in fullscreen. At 1x vertical
@@ -89,7 +89,7 @@ are merged in by time (an event can be bookmarked after a later one), events
 deleted in SS go away, and after more than a page of new ones, or 12 h, it
 starts over. Rows are kept across refreshes, so thumbnails aren't reloaded.
 Tapping one
-makes that camera the master and plays from 3 s before it; events under the
+makes that camera the leader and plays from 3 s before it; events under the
 playhead are highlighted. SS's own motion detections are not exposed by any
 documented API (in continuous mode every `Event` is a recording file), so
 bookmarks are the event source.
@@ -154,15 +154,15 @@ through MSE (`ManagedMediaSource` on iOS 17.1+).
   last ~20 s, and whatever arrived ahead) is instant; any other goes over the open socket (`time=`,
   about 0.5 s). A jump or tap lands on that keyframe, up to a GOP (~1 s here)
   before the time asked for.
-- **Grid**: every camera has its own stream; the others follow the master's
+- **Grid**: every camera has its own stream; the others follow the leader's
   wall-clock time. SS never sends faster than asked, so a follower that is
   behind can't catch up by playing faster: it asks for 1 s (times the speed)
-  past the master's time and holds its first frame until the master gets
+  past the leader's time and holds its first frame until the leader gets
   there (landing behind anyway, it asks again with twice the lead). A few
   tenths off are made up by ±20 % speed; a camera with nothing recorded holds
-  its next footage behind a "No recording" veil until the master reaches it.
+  its next footage behind a "No recording" veil until the leader reaches it.
   Measured on a 4-camera grid: in step to ~0.15 s, 1-2 s after a jump.
-- **Sound**, when unmuted, comes from the master only (live, or recordings at
+- **Sound**, when unmuted, comes from the leader only (live, or recordings at
   1x), through its own `<audio>` kept on the video's wall-clock time (a video
   that waited for audio would stall on every burst).
 

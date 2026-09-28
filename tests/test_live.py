@@ -10,7 +10,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
 from synology_ss_playback import SSConnectionError
 
-from custom_components.surveillance_station.views import DATA_MANAGER
+from custom_components.surveillance_station.manager import DATA_MANAGER
 from homeassistant.core import HomeAssistant
 
 

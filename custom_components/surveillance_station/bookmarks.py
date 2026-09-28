@@ -1,28 +1,41 @@
-"""The bookmark list, indexed once per fetch for the event list.
+"""The bookmark list, fetched once for everyone and indexed once per fetch.
 
-SS hands out every bookmark in one list (see VodManager.bookmarks), and the
-event list pages through it 30 at a time, filtered by camera and kind. With
-tens of thousands of bookmarks, splitting every name into kinds and scanning
-for the cursor on each page would stall HA's event loop; the index does that
-work once, off the loop, and a page is then a bisect per list.
+SS hands out every bookmark in one list, and the event list pages through it
+30 at a time, filtered by camera and kind. With tens of thousands of
+bookmarks, splitting every name into kinds and scanning for the cursor on
+each page would stall HA's event loop; the index does that work once, off
+the loop, and a page is then a bisect per list.
 """
 
 from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
+from collections.abc import Iterable
 import heapq
 from itertools import islice
+import time
 from typing import Any
 
-from synology_ss_playback import Bookmark
+from synology_ss_playback import Bookmark, SSError, SurveillanceStationClient
 
-from .const import KIND_CHIPS_MAX
+from homeassistant.core import HomeAssistant
+
+from .const import BOOKMARK_CACHE_SECONDS, BOOKMARK_ERROR_SECONDS, KIND_CHIPS_MAX
+from .shared import SharedJobs
+
+# Patchable in tests (time.monotonic itself is the event loop's clock).
+_monotonic = time.monotonic
 
 
 def name_kinds(name: str) -> list[str]:
     """What a bookmark's name says was seen: "Person, Car" is Person and Car."""
     return [k.strip() for k in name.split(",") if k.strip()]
+
+
+def wanted_kinds(kinds: Iterable[str] | None) -> set[str]:
+    """The kinds asked for, as the index compares them: " Person " is person."""
+    return {k.strip().casefold() for k in kinds or [] if k.strip()}
 
 
 class _Run:
@@ -96,3 +109,47 @@ class BookmarkIndex:
         common = sorted((kc for kc in counts.items() if kc[1] > 1), key=lambda kc: (-kc[1], kc[0]))
         # Each kind as it is mostly written.
         return [[max(spellings[k].items(), key=lambda s: s[1])[0], n] for k, n in common[:KIND_CHIPS_MAX]]
+
+
+class BookmarkCache:
+    """Every entry's bookmark list, at most BOOKMARK_CACHE_SECONDS old.
+
+    One fetch per entry at a time, whose result (or error) every request
+    waiting meanwhile shares: a NAS that hangs costs one timeout, not one
+    per request queued behind it.
+    """
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self.hass = hass
+        # entry_id -> (fetched at, every bookmark newest first (indexed), or the error).
+        self._lists: dict[str, tuple[float, BookmarkIndex | SSError]] = {}
+        self._jobs: SharedJobs[str, BookmarkIndex] = SharedJobs(hass, "bookmarks")
+
+    async def index(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
+        if (hit := self._lists.get(entry_id)) is not None:
+            at, found = hit
+            if isinstance(found, SSError):
+                if _monotonic() - at < BOOKMARK_ERROR_SECONDS:
+                    raise found.with_traceback(None)
+            elif _monotonic() - at < BOOKMARK_CACHE_SECONDS:
+                return found
+        return await self._jobs.run(entry_id, lambda: self._load(entry_id, client), "surveillance_station bookmarks")
+
+    async def _load(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
+        try:
+            cameras = await client.cameras()
+            found = await client.list_bookmarks([c.id for c in cameras])
+            # Tens of thousands of bookmarks take a while: not on the loop.
+            index = await self.hass.async_add_executor_job(BookmarkIndex, found)
+        except SSError as err:
+            self._lists[entry_id] = (_monotonic(), err)
+            raise
+        self._lists[entry_id] = (_monotonic(), index)
+        return index
+
+    def forget(self, entry_id: str) -> None:
+        self._lists.pop(entry_id, None)
+
+    def drop_entry(self, entry_id: str) -> None:
+        self._lists.pop(entry_id, None)
+        self._jobs.drop(lambda key: key == entry_id)

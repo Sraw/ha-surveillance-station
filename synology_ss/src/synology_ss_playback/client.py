@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -94,10 +94,14 @@ RECORDINGS_CACHE_ENTRIES = 64  # lists kept at most (the oldest go first)
 # A freshly opened live socket that sends nothing at all (SS wedged) within
 # this long is given up on rather than held forever.
 LIVE_CONNECT_TIMEOUT_SECONDS = 15
+# A refused live stream has its session checked (and renewed if that was
+# it) at most this often (see open_live).
+LIVE_RELOGIN_SECONDS = 60
 
 
 # What a malformed list entry raises while being read.
 _BAD_ITEM = (KeyError, TypeError, ValueError, AttributeError, OverflowError)
+_DOWNLOAD = ("SYNO.SurveillanceStation.Recording", "Download")
 
 # Patchable in tests (time.monotonic itself is the event loop's clock).
 _monotonic = time.monotonic
@@ -126,10 +130,6 @@ def _is_hevc(codec: Any) -> bool:
     return str(codec or "").upper() in ("H265", "HEVC")
 
 
-# A refused live stream has its session checked (and renewed if that was
-# it) at most this often (see open_live).
-LIVE_RELOGIN_SECONDS = 60
-
 class SSError(Exception):
     """A Surveillance Station API call failed."""
 
@@ -146,6 +146,26 @@ class SSAuthError(SSError):
 
 class SSConnectionError(SSError):
     """Surveillance Station could not be reached."""
+
+
+class _Refused(Exception):
+    """SS answered a call with an error: its code, and the error as SS sent it."""
+
+    def __init__(self, code: Any, detail: Any) -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
+def _refusal(body: bytes) -> _Refused:
+    """The error in a JSON reply (no code if it can't be read)."""
+    try:
+        err = json.loads(body)
+    except (ValueError, RecursionError):
+        err = {}
+    if not isinstance(err, dict):
+        err = {}
+    return _Refused(_error_code(err), err.get("error"))
 
 
 @dataclass(frozen=True)
@@ -431,28 +451,55 @@ class SurveillanceStationClient:
         self, api: str, method: str, version: int, decode_in_thread: bool = False, **params: Any
     ) -> dict[str, Any]:
         """entry.cgi call with one transparent re-login on session errors."""
-        for attempt in (1, 2):
-            if self._sid is None:
-                await self.login(stale_sid=None)
-            sid = self._sid
+        async def attempt(sid: str | None) -> dict[str, Any]:
             data = await self._raw_json(
                 "entry.cgi",
                 {"api": api, "method": method, "version": version, "_sid": sid, **params},
                 decode_in_thread=decode_in_thread,
             )
-            if data.get("success"):
-                result = data.get("data") or {}
-                if not isinstance(result, dict):
-                    raise SSError(api, method, None, "unexpected reply")
-                return result
-            code = _error_code(data)
-            if attempt == 1 and self._is_session_error(code, api, method, sid):
+            if not data.get("success"):
+                raise _Refused(_error_code(data), data.get("error"))
+            result = data.get("data") or {}
+            if not isinstance(result, dict):
+                raise SSError(api, method, None, "unexpected reply")
+            return result
+
+        return await self._with_session(api, method, attempt)
+
+    async def _with_session[T](self, api: str, method: str, attempt: Callable[[str | None], Awaitable[T]]) -> T:
+        """attempt(sid) with a session: logged in first if there is none, and
+        once again after a session error (attempt raises _Refused for SS's errors)."""
+        for retry in (False, True):
+            if self._sid is None:
+                await self.login(stale_sid=None)
+            sid = self._sid
+            try:
+                return await attempt(sid)
+            except _Refused as refused:
+                code, detail = refused.code, refused.detail
+            if not retry and self._is_session_error(code, api, method, sid):
                 _LOGGER.debug("Session error %s on %s.%s, logging in again", code, api, method)
                 await self.login(stale_sid=sid)
                 continue
             self._note_refusal(code, api, method, sid)
-            raise SSError(api, method, code, data.get("error"))
+            raise SSError(api, method, code, detail)
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _paged(
+        self, api: str, method: str, version: int, offset_key: str, limit: int, **params: Any
+    ) -> list[dict[str, Any]]:
+        """The ``events`` of every page of a list call, ``limit`` at a time."""
+        items: list[dict[str, Any]] = []
+        while True:
+            data = await self._call(api, method, version, **params, **{offset_key: len(items)}, limit=limit)
+            page = _items(data, "events")
+            items += page
+            try:
+                total = int(data.get("total", 0))
+            except _BAD_ITEM:
+                total = 0
+            if not page or len(items) >= total:
+                return items
 
     def _is_session_error(self, code: Any, api: str, method: str, sid: str | None) -> bool:
         """Whether SS's error code for this call means: log in again and retry."""
@@ -574,40 +621,29 @@ class SurveillanceStationClient:
 
     async def _list_recordings(self, camera_id: int, start: int, end: int) -> list[RecordingInfo]:
         out: list[RecordingInfo] = []
-        offset = 0
-        while True:
-            data = await self._call(
-                "SYNO.SurveillanceStation.Event", "List", 5,
-                cameraIds=str(camera_id), fromTime=int(start) - RECORDING_LOOKBACK_SECONDS,
-                toTime=int(end), offset=offset, limit=200,
-            )
-            events = _items(data, "events")
-            for e in events:
-                try:
-                    if e.get("deleted") or e.get("markAsDel"):
-                        continue
-                    if int(e["stopTime"]) < start and not e.get("recording"):
-                        continue
-                    out.append(
-                        RecordingInfo(
-                            id=int(e["id"]),
-                            camera_id=int(e["cameraId"]),
-                            start=int(e["startTime"]),
-                            end=int(e["stopTime"]),
-                            mount_id=int(e.get("mountId") or 0),
-                            live=bool(e.get("recording")),
-                            hevc=_is_hevc(e.get("videoCodec")),
-                        )
-                    )
-                except _BAD_ITEM:
-                    _LOGGER.debug("Skipping a recording SS lists as %r", e)
-            offset += len(events)
+        events = await self._paged(
+            "SYNO.SurveillanceStation.Event", "List", 5, "offset", 200,
+            cameraIds=str(camera_id), fromTime=int(start) - RECORDING_LOOKBACK_SECONDS, toTime=int(end),
+        )
+        for e in events:
             try:
-                total = int(data.get("total", 0))
+                if e.get("deleted") or e.get("markAsDel"):
+                    continue
+                if int(e["stopTime"]) < start and not e.get("recording"):
+                    continue
+                out.append(
+                    RecordingInfo(
+                        id=int(e["id"]),
+                        camera_id=int(e["cameraId"]),
+                        start=int(e["startTime"]),
+                        end=int(e["stopTime"]),
+                        mount_id=int(e.get("mountId") or 0),
+                        live=bool(e.get("recording")),
+                        hevc=_is_hevc(e.get("videoCodec")),
+                    )
+                )
             except _BAD_ITEM:
-                total = 0
-            if not events or offset >= total:
-                break
+                _LOGGER.debug("Skipping a recording SS lists as %r", e)
         out.sort(key=lambda r: r.start)
         return out
 
@@ -620,43 +656,32 @@ class SurveillanceStationClient:
         file per day of its task's retention.
         """
         out: list[TimelapseRecording] = []
-        offset = 0
-        while True:
-            data = await self._call(
-                "SYNO.SurveillanceStation.TimeLapse.Recording", "List", 1,
-                lapseId=-1, start=offset, limit=TIMELAPSE_PAGE,
-            )
-            files = _items(data, "events")
-            for e in files:
-                try:
-                    if e.get("markAsDel"):
-                        continue
-                    frames = int(e["frameCount"])
-                    if frames <= 0:
-                        continue
-                    out.append(
-                        TimelapseRecording(
-                            id=int(e["id"]),
-                            camera_id=int(e["cameraId"]),
-                            task_id=int(e.get("taskId") or 0),
-                            start=int(e["startTime"]),
-                            span=int(e["rangeMinute"]) * 60,
-                            frames=frames,
-                            width=int(e.get("imgWidth") or 0),
-                            height=int(e.get("imgHeight") or 0),
-                            hevc=_is_hevc(e.get("video_type")),
-                            live=bool(e.get("recording")),
-                        )
-                    )
-                except _BAD_ITEM:
-                    _LOGGER.debug("Skipping a time-lapse file SS lists as %r", e)
-            offset += len(files)
+        files = await self._paged(
+            "SYNO.SurveillanceStation.TimeLapse.Recording", "List", 1, "start", TIMELAPSE_PAGE, lapseId=-1
+        )
+        for e in files:
             try:
-                total = int(data.get("total", 0))
+                if e.get("markAsDel"):
+                    continue
+                frames = int(e["frameCount"])
+                if frames <= 0:
+                    continue
+                out.append(
+                    TimelapseRecording(
+                        id=int(e["id"]),
+                        camera_id=int(e["cameraId"]),
+                        task_id=int(e.get("taskId") or 0),
+                        start=int(e["startTime"]),
+                        span=int(e["rangeMinute"]) * 60,
+                        frames=frames,
+                        width=int(e.get("imgWidth") or 0),
+                        height=int(e.get("imgHeight") or 0),
+                        hevc=_is_hevc(e.get("video_type")),
+                        live=bool(e.get("recording")),
+                    )
+                )
             except _BAD_ITEM:
-                total = 0
-            if not files or offset >= total:
-                break
+                _LOGGER.debug("Skipping a time-lapse file SS lists as %r", e)
         out.sort(key=lambda r: r.start)
         return out
 
@@ -742,35 +767,14 @@ class SurveillanceStationClient:
 
         ``timelapse``: the id is a time-lapse file's (offsets in its video time).
         """
-        for attempt in (1, 2):
-            if self._sid is None:
-                await self.login(stale_sid=None)
-            sid = self._sid
-            params = {
-                "api": "SYNO.SurveillanceStation.Recording", "method": "Download", "version": 6,
-                "id": recording_id, "mountId": mount_id,
-                "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
-                "_sid": sid,
-            }
-            if timelapse:
-                params["recEvtType"] = REC_EVT_TIMELAPSE
+        async def attempt(sid: str | None) -> bytes:
+            params = _download_params(sid, recording_id, mount_id, offset_ms, duration_ms, timelapse)
             body, ctype = await self._request("entry.cgi", params, False, 60)
             if "json" not in ctype and not body.startswith(b"{"):
                 return body
-            try:
-                err = json.loads(body)
-            except (ValueError, RecursionError):
-                err = {}
-            if not isinstance(err, dict):
-                err = {}
-            code = _error_code(err)
-            api, method = "SYNO.SurveillanceStation.Recording", "Download"
-            if attempt == 1 and self._is_session_error(code, api, method, sid):
-                await self.login(stale_sid=sid)
-                continue
-            self._note_refusal(code, api, method, sid)
-            raise SSError(api, method, code, err.get("error"))
-        raise AssertionError("unreachable")  # pragma: no cover
+            raise _refusal(body)
+
+        return await self._with_session(*_DOWNLOAD, attempt)
 
     async def download_to(
         self,
@@ -787,19 +791,10 @@ class SurveillanceStationClient:
         For cuts too big to hold twice in memory: a second of daytime
         time-lapse video is ~30 MB.
         """
-        api, method = "SYNO.SurveillanceStation.Recording", "Download"
-        for attempt in (1, 2):
-            if self._sid is None:
-                await self.login(stale_sid=None)
-            sid = self._sid
-            params: dict[str, Any] = {
-                "api": api, "method": method, "version": 6,
-                "id": recording_id, "mountId": mount_id,
-                "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
-                "_sid": sid,
-            }
-            if timelapse:
-                params["recEvtType"] = REC_EVT_TIMELAPSE
+        api, method = _DOWNLOAD
+
+        async def attempt(sid: str | None) -> int:
+            params = _download_params(sid, recording_id, mount_id, offset_ms, duration_ms, timelapse)
             try:
                 async with self._session.get(
                     f"{self._base}/entry.cgi", params=params, timeout=aiohttp.ClientTimeout(total=timeout)
@@ -821,19 +816,24 @@ class SurveillanceStationClient:
                         return written
             except (aiohttp.ClientError, TimeoutError) as err:
                 raise SSConnectionError(api, method, None, type(err).__name__) from None
-            try:
-                err = json.loads(body)
-            except (ValueError, RecursionError):
-                err = {}
-            if not isinstance(err, dict):
-                err = {}
-            code = _error_code(err)
-            if attempt == 1 and self._is_session_error(code, api, method, sid):
-                await self.login(stale_sid=sid)
-                continue
-            self._note_refusal(code, api, method, sid)
-            raise SSError(api, method, code, err.get("error"))
-        raise AssertionError("unreachable")  # pragma: no cover
+            raise _refusal(body)
+
+        return await self._with_session(api, method, attempt)
+
+
+def _download_params(
+    sid: str | None, recording_id: int, mount_id: int, offset_ms: int, duration_ms: int, timelapse: bool
+) -> dict[str, Any]:
+    api, method = _DOWNLOAD
+    params: dict[str, Any] = {
+        "api": api, "method": method, "version": 6,
+        "id": recording_id, "mountId": mount_id,
+        "offsetTimeMs": max(0, int(offset_ms)), "playTimeMs": max(1, int(duration_ms)),
+        "_sid": sid,
+    }
+    if timelapse:
+        params["recEvtType"] = REC_EVT_TIMELAPSE
+    return params
 
 
 def _write_all(fd: int, data: bytes) -> int:

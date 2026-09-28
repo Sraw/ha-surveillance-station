@@ -13,15 +13,15 @@ from pytest_homeassistant_custom_component.typing import ClientSessionGenerator,
 from synology_ss_playback import SSConnectionError, SSError, TimelapseRecording, TranscodeSpec
 
 from custom_components.surveillance_station.const import CONF_TRANSCODER
-from custom_components.surveillance_station.views import DATA_MANAGER
+from custom_components.surveillance_station.manager import DATA_MANAGER
 from homeassistant.core import HomeAssistant
 
 from .conftest import T0
 
 TZ = ZoneInfo("US/Pacific")
 MID = int(datetime(2026, 9, 22, tzinfo=TZ).timestamp())  # midnight of 2026-09-22, NAS time
-FETCH = "custom_components.surveillance_station.views.fetch_timelapse_segment"
-HW_CHECK = "custom_components.surveillance_station.views.hardware_transcode_available"
+FETCH = "custom_components.surveillance_station.segments.fetch_timelapse_segment"
+HW_CHECK = "custom_components.surveillance_station.manager.hardware_transcode_available"
 
 
 def _file(**kw) -> TimelapseRecording:
@@ -276,7 +276,7 @@ async def test_segment_failures(
 
 async def test_superseded_tokens_are_bounded(hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse) -> None:
     from custom_components.surveillance_station.const import VOD_MAX_SESSIONS
-    from custom_components.surveillance_station.views import VodSession
+    from custom_components.surveillance_station.segments import VodSession
 
     manager = hass.data[DATA_MANAGER]
     for _ in range(VOD_MAX_SESSIONS + 5):

@@ -9,7 +9,7 @@ const recs = await ev((c) => c._ws({ type: "surveillance_station/recordings", ca
 const starts = recs.recordings.map((r) => r.start).sort((a, b) => a - b);
 const B = starts[starts.length - 3]; // a file boundary
 console.log("boundary at", new Date(B * 1000).toISOString(), "files", starts.length);
-const wall = () => ev((c) => c._master.wall());
+const wall = () => ev((c) => c._leader.wall());
 // A jump lands on the keyframe before the time (a GOP, ~1 s here), after up to ~1 s over the socket.
 async function step(label, fn, arg, secs = 3, expect = null) {
   const t0 = Date.now();
@@ -17,7 +17,7 @@ async function step(label, fn, arg, secs = 3, expect = null) {
   let landed = null;
   for (let i = 0; i < secs * 4; i++) {
     await sleep(250);
-    const s = await ev((c) => ({ loading: c._master.loading, w: c._master.wall(), p: c._master.video.paused }));
+    const s = await ev((c) => ({ loading: c._leader.loading, w: c._leader.wall(), p: c._leader.video.paused }));
     if (landed == null && !s.loading && !s.p) landed = (Date.now() - t0) / 1000;
   }
   const w = await wall();
@@ -58,7 +58,7 @@ const w1 = await wall();
 await sleep(14000);
 const wp = await wall();
 console.log("paused 15s:", await snap(ev, wp));
-const held = await ev((c) => ({ paused: c._master.video.paused, ss: !!c._master.feed?.ssPaused }));
+const held = await ev((c) => ({ paused: c._leader.video.paused, ss: !!c._leader.feed?.ssPaused }));
 check(held.paused && Math.abs(wp - w1) < 0.3, "paused: the picture holds");
 check(held.ss, "paused: SS told to pause (flow control)");
 await ev((c) => c.shadowRoot.querySelector('[data-act="play"]').click());

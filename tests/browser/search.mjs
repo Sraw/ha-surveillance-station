@@ -66,7 +66,7 @@ for (let i = 0; i < 20 && (await ev((c) => c._search?.loading)); i++) await slee
 const first = await ev((c) => c._search.items[0]);
 await ev((c) => c.shadowRoot.querySelector(".ev-items .ev").click());
 await sleep(5000);
-const at = await ev((c) => ({ cam: c._master.cameraId, wall: c._master.wall() }));
+const at = await ev((c) => ({ cam: c._leader.cameraId, wall: c._leader.wall() }));
 console.log("played:", at.cam, "at", (at.wall - first.start).toFixed(1), "s from the result's start");
 check(at.cam === first.camera_id && Math.abs(at.wall - first.start) < 8, "result plays its camera near its time");
 const lit = await ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items .ev.on")].map((b) => b.dataset.sr));

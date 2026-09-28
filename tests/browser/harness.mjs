@@ -31,7 +31,7 @@ export async function open({ w = 1400, h = 900, mobile = false, path = process.e
 export const snap = (ev, ref) => ev((c, ref) => [...c._players.values()].map((p) => {
   const v = p.video, f = p.feed, q = v.getVideoPlaybackQuality?.();
   const ahead = f?.track?.sink ? (f.track.sink.end() - v.currentTime).toFixed(2) : "-";
-  return `${c._master === p ? "*" : " "}${p.cameraId}:${(p.wall() - ref).toFixed(2)}${v.paused ? "P" : ">"} r${v.playbackRate} f${q?.totalVideoFrames ?? "?"}/${q?.droppedVideoFrames ?? "?"} ${v.videoWidth}x${v.videoHeight} a${ahead}${f?.ssPaused ? " ssP" : ""}${f?.live ? " L" : ""}${p.loading ? " ld" : ""}${p.veilKind ? " [" + p.veilKind + ":" + p.veil.textContent.trim().replace(/\s+/g, " ").slice(0, 40) + "]" : ""}`;
+  return `${c._leader === p ? "*" : " "}${p.cameraId}:${(p.wall() - ref).toFixed(2)}${v.paused ? "P" : ">"} r${v.playbackRate} f${q?.totalVideoFrames ?? "?"}/${q?.droppedVideoFrames ?? "?"} ${v.videoWidth}x${v.videoHeight} a${ahead}${f?.ssPaused ? " ssP" : ""}${f?.live ? " L" : ""}${p.loading ? " ld" : ""}${p.veilKind ? " [" + p.veilKind + ":" + p.veil.textContent.trim().replace(/\s+/g, " ").slice(0, 40) + "]" : ""}`;
 }).join("  "), ref);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // A scenario's checks: one "ok" / "FAIL" line each; done() prints the verdict

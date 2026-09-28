@@ -14,7 +14,7 @@ from homeassistant.core import HomeAssistant
 from . import SurveillanceStationConfigEntry
 from .const import CONF_FRIGATE_LINK, CONF_FRIGATE_URL
 from .frigate import DATA_FRIGATE
-from .views import DATA_MANAGER
+from .manager import DATA_MANAGER
 
 # Diagnostics end up in bug reports: no credentials, nor names or addresses of the NAS, Frigate or a dashboard.
 TO_REDACT = {

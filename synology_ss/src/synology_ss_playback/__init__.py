@@ -18,6 +18,7 @@ from .segment import (
     fetch_segment,
     fetch_snapshot,
     fetch_timelapse_segment,
+    hardware_transcode_available,
     recordings_from,
     remove_stale_temp_files,
 )
@@ -27,7 +28,6 @@ from .timelapse import (
     TranscodeSpec,
     broken_frames,
     covered,
-    hardware_transcode_available,
     output_size,
     plan_day,
     slice_types,

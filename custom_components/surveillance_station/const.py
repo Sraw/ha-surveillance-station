@@ -16,6 +16,8 @@ VOD_SESSION_TTL_SECONDS = 4 * 3600
 VOD_MAX_SESSIONS = 64
 # Longest window one playlist may cover (the card asks for much less).
 VOD_MAX_WINDOW_SECONDS = 24 * 3600
+# A window whose end is at least this close to now becomes a live session.
+LIVE_THRESHOLD_SECONDS = 60
 # Remuxed segments kept in memory, by size: a 10 s segment is 3.5-6.5 MB for
 # these 4K H.265 streams, so this holds ~20 of them (a few per camera in a grid).
 SEGMENT_CACHE_BYTES = 96 * 1024 * 1024
@@ -69,6 +71,8 @@ RECORDING_GAP_SECONDS = 60
 # ...but only after this long: an SS recording on motion may start (or be
 # listed) a few seconds after Frigate saw the object.
 NOT_RECORDING_GRACE_SECONDS = 8
+# How often thumbnail_when_recorded asks SS whether the moment is written yet.
+THUMBNAIL_POLL_SECONDS = 2
 # "Nothing recorded then" is re-checked after this long (a moment less than
 # RECORDING_GAP_SECONDS ago: after THUMBNAIL_RECENT_MISS_SECONDS).
 THUMBNAIL_RECENT_MISS_SECONDS = 5
@@ -139,6 +143,18 @@ FRIGATE_IMAGE_URL = "/api/surveillance_station/frigate_image"
 # at most this many shown (one per review).
 FRIGATE_SEARCH_ASK = 100
 FRIGATE_SEARCH_MAX = 50
+# The whole search (Frigate's answers and the SS camera list) within this.
+FRIGATE_SEARCH_TIMEOUT_SECONDS = 15
+# Frigate (0.18) may answer a search that ran into another client's with
+# nothing: an empty answer is asked once more, this much later.
+FRIGATE_SEARCH_EMPTY_RETRY_SECONDS = 0.5
+# A Frigate object is a bookmark's when their times overlap, give or take
+# this (a review, and so its bookmark, starts when an object qualifies,
+# which is after the object itself was first seen).
+FRIGATE_BOOKMARK_SLACK = 2
+# A bookmark's objects by time: looked for back this far (one can have
+# started long before its review: a car parked for hours, then moving).
+FRIGATE_BOOKMARK_LOOKBACK = 3600
 # Kinds offered to filter the event list by, at most.
 KIND_CHIPS_MAX = 8
 FRIGATE_TRACKED_MAX = 256  # reviews in progress remembered

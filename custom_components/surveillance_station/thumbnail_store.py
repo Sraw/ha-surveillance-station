@@ -10,7 +10,6 @@ file that went missing underneath is just a miss.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 import logging
 import os
 import re
@@ -19,6 +18,8 @@ import tempfile
 import time
 
 from homeassistant.core import HomeAssistant
+
+from .shared import ByteLRU
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,9 +40,7 @@ class ThumbnailStore:
     def __init__(self, hass: HomeAssistant, root: str, max_bytes: int) -> None:
         self.hass = hass
         self.root = root
-        self.max_bytes = max_bytes
-        self._index: OrderedDict[ThumbKey, int] = OrderedDict()  # -> size, least recently used first
-        self.bytes = 0
+        self._index: ByteLRU[ThumbKey, int] = ByteLRU(max_bytes, lambda size: size)  # -> size, least recently used first
         self._writing: dict[ThumbKey, asyncio.Future[None]] = {}
         self._jobs: set[asyncio.Future[None]] = set()  # every file job still running
         self._dropped: set[str] = set()  # removed entries: nothing more is written for them
@@ -49,6 +48,10 @@ class ThumbnailStore:
 
     def __len__(self) -> int:
         return len(self._index)
+
+    @property
+    def bytes(self) -> int:
+        return self._index.bytes
 
     def _job(self, fn, *args) -> asyncio.Future[None]:
         fut = self.hass.async_add_executor_job(fn, *args)
@@ -70,11 +73,11 @@ class ThumbnailStore:
     async def load(self) -> None:
         """Index what's on disk (oldest use first) and trim it to the cap."""
         found = await self.hass.async_add_executor_job(self._scan)
+        evicted = []
         for key, size, _ in sorted(found, key=lambda f: f[2]):
             if key not in self._index:
-                self._index[key] = size
-                self.bytes += size
-        self._evict()
+                evicted += self._index.put(key, size)
+        self._remove(evicted)
 
     def _scan(self) -> list[tuple[ThumbKey, int, float]]:
         found: list[tuple[ThumbKey, int, float]] = []
@@ -116,28 +119,26 @@ class ThumbnailStore:
         # Still being written: the caller has it in memory anyway.
         if key not in self._index or key in self._writing or (path := self._path(key)) is None:
             return None
-        self._index.move_to_end(key)
+        self._index.get(key)  # now the most recently used
         data = await self.hass.async_add_executor_job(_read, path)
         if data is None and key not in self._writing:
-            self._forget(key)
+            self._index.pop(key)
         return data
 
     def put(self, key: ThumbKey, data: bytes) -> None:
         """Keep a JPEG; the write goes on in the background."""
         if key[0] in self._dropped or key in self._writing or (path := self._path(key)) is None:
             return
-        self._forget(key)
-        self._index[key] = len(data)
-        self.bytes += len(data)
+        evicted = self._index.put(key, len(data))
         fut = self._job(_write, path, data)
         self._writing[key] = fut
         fut.add_done_callback(lambda f: self._written(key, path, f))
-        self._evict()
+        self._remove(evicted)
 
     def _written(self, key: ThumbKey, path: str, fut: asyncio.Future[None]) -> None:
         del self._writing[key]
         if (err := None if fut.cancelled() else fut.exception()) is not None:
-            self._forget(key)
+            self._index.pop(key)
             if time.monotonic() - self._warned_at > WARN_INTERVAL:
                 self._warned_at = time.monotonic()
                 _LOGGER.warning("Can't keep thumbnails in %s: %s", self.root, err)
@@ -148,26 +149,17 @@ class ThumbnailStore:
     async def drop_entry(self, entry_id: str) -> None:
         """Delete a removed entry's thumbnails (after any write still going on)."""
         self._dropped.add(entry_id)
-        for key in [k for k in self._index if k[0] == entry_id]:
-            self._forget(key)
+        self._index.pop_where(lambda key: key[0] == entry_id)
         await self.settle()
         if _SAFE_ID.fullmatch(entry_id):
             await self.hass.async_add_executor_job(
                 lambda: shutil.rmtree(os.path.join(self.root, entry_id), ignore_errors=True)
             )
 
-    def _forget(self, key: ThumbKey) -> None:
-        if (size := self._index.pop(key, None)) is not None:
-            self.bytes -= size
-
-    def _evict(self) -> None:
-        paths = []
-        while self.bytes > self.max_bytes and len(self._index) > 1:
-            key, size = self._index.popitem(last=False)
-            self.bytes -= size
-            # One being written is removed once it lands (_written).
-            if key not in self._writing and (path := self._path(key)) is not None:
-                paths.append(path)
+    def _remove(self, evicted: list[tuple[ThumbKey, int]]) -> None:
+        """Delete the files of what the index let go."""
+        # One being written is removed once it lands (_written).
+        paths = [path for key, _ in evicted if key not in self._writing and (path := self._path(key)) is not None]
         if paths:
             self._job(_unlink, paths)
 

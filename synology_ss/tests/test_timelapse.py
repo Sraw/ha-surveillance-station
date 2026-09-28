@@ -598,7 +598,7 @@ async def test_hardware_check_ignoring_sigterm_is_killed() -> None:
 
     proc.wait = AsyncMock(side_effect=wait)
     proc.terminate = MagicMock()
-    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch.object(tl, "CHECK_TERM_GRACE_SECONDS", 0.01):
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch.object(seg_mod, "TERM_GRACE_SECONDS", 0.01):
         assert await hardware_transcode_available("ffmpeg", timeout=0.01) is None
     proc.terminate.assert_called_once()
     proc.kill.assert_called_once()
