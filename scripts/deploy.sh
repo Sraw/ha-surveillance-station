@@ -5,8 +5,8 @@
 # 1. The integration is copied to <config>/custom_components/.
 # 2. The synology_ss_playback library is installed into <config>/deps, the
 #    user site HA puts on sys.path when it isn't in a venv (the official
-#    container). It is not on PyPI yet, so HA can't install it itself; there it
-#    survives image updates. After an HA update that moves to a newer Python,
+#    container), from this checkout rather than PyPI, so an unreleased change
+#    to the library can be tried; there it survives image updates. After an HA update that moves to a newer Python,
 #    run this again (the integration then fails to load with a requirement
 #    error until you do).
 #
