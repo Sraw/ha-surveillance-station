@@ -167,8 +167,36 @@ class Playlist(unittest.TestCase):
         self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", closed)
         self.assertTrue(closed.rstrip().endswith("#EXT-X-ENDLIST"))
 
+    def test_live_playlist_keeps_its_target_and_type_as_it_grows(self):
+        """RFC 8216: neither may change. A folded sliver makes a segment 11 s."""
+        rec = Recording(id=1, start=0.0, end=100.0)
+        early = vod.render_playlist(vod.plan_segments([rec], 0.0, 30.0, NOW), live=True)
+        folded = vod.plan_segments([rec], 9.6, 30.0, NOW)
+        self.assertAlmostEqual(folded[0].duration, 10.4)
+        later = vod.render_playlist(folded, live=True)
+        ended = vod.render_playlist(folded, event=True)
+        for text in (early, later, ended):
+            self.assertIn("#EXT-X-TARGETDURATION:11\n", text)
+            self.assertIn("#EXT-X-PLAYLIST-TYPE:EVENT", text)
+        self.assertNotIn("#EXT-X-ENDLIST", later)
+        self.assertTrue(ended.rstrip().endswith("#EXT-X-ENDLIST"))
+
 
 class Boxes(unittest.TestCase):
+    def test_split_fmp4_copies_each_box_once(self):
+        """A segment is several MB, four fetched at a time: one copy into its part."""
+        import tracemalloc
+
+        data = box("ftyp") + box("moov", b"x" * 20) + box("moof", b"m") + box("mdat", b"d" * 8_000_000)
+        tracemalloc.start()
+        try:
+            init, media = vod.split_fmp4(data)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(init) + len(media), len(data))
+        self.assertLess(peak, 1.5 * len(data))
+
     def test_split_fmp4(self):
         data = box("ftyp", b"iso5") + box("moov", b"x" * 20) + box("moof", b"m") + box("mdat", b"d" * 5) + box("mfra")
         init, media = vod.split_fmp4(data)
@@ -219,6 +247,21 @@ class LocalTime(unittest.TestCase):
         # Values seen from SS 9.3 (NAS in US/Pacific) for the same bookmark.
         self.assertEqual(_local_ts("2026-09-24T16:40:58", ZoneInfo("US/Pacific")), 1790293258)
         self.assertEqual(_local_ts("2026-01-15T08:00:00", ZoneInfo("US/Pacific")), 1768492800)
+
+    def test_the_hour_repeated_when_dst_ends_is_read_as_the_first(self):
+        from zoneinfo import ZoneInfo
+        from synology_ss_playback.client import _local_ts
+
+        # 01:30 on 2026-11-01 in Los Angeles happens twice: 08:30Z (PDT), then 09:30Z (PST).
+        self.assertEqual(_local_ts("2026-11-01T01:30:00", ZoneInfo("America/Los_Angeles")), 1793521800)
+
+
+class PlanObjects(unittest.TestCase):
+    def test_no_per_instance_dict(self):
+        """A 24 h plan is 8,640 Segments."""
+        seg = vod.plan_segments([Recording(id=1, start=0.0, end=20.0)], 0.0, 20.0, NOW)[0]
+        for obj in (seg, Recording(id=1, start=0.0, end=1.0), vod.Run(0.0, 0.0, 1.0)):
+            self.assertFalse(hasattr(obj, "__dict__"), type(obj).__name__)
 
 
 if __name__ == "__main__":

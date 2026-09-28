@@ -24,8 +24,10 @@
   of each frame (under a millisecond). If any frame isn't whole, it
   re-muxes the cut without that frame (`noise=drop`), and the frame before
   stays on screen for a 30th of a second. The re-muxed cut must hold
-  exactly the frames that were kept, or it doesn't reach the GPU. After
-  this change, 166 consecutive segments of that camera ran without a hang.
+  exactly the frames that were kept, or it doesn't reach the GPU; a cut
+  whose frames can't be read fails its segment rather than reach the GPU
+  unchecked. After this change, 166 consecutive segments of that camera ran
+  without a hang.
 - Time-lapse throughput is bounded by the NAS: a second of daytime 4K
   time-lapse is ~30 MB, the gigabit link carries ~110 MB/s from a finished
   file, and SS reads the file it is still writing at only ~50 MB/s. Today's
@@ -67,8 +69,9 @@
   them (`cameras:`); each cell is its camera's full-quality stream from the
   NAS through HA, and HA relays at most 16 at once (all viewers together).
   Mind the viewing device's decoders and HA's network with more.
-- The card lists all bookmarks every 15 s while open (SS's time filter for
-  them doesn't work): with tens of thousands of bookmarks that gets slow.
+- HA lists all bookmarks from SS in one go, at most once a minute (SS's time
+  filter for them doesn't work): with tens of thousands of bookmarks, each
+  listing takes a while.
 - The card's layout choices (cameras, grid, span) are remembered per
   browser, shared by all cards in it.
 - One Frigate instance per NAS (one MQTT topic prefix per entry).

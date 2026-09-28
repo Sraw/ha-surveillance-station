@@ -239,15 +239,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
         except Exception:  # noqa: BLE001 - never a failed unload for it
             _LOGGER.warning("Could not save the Frigate bridge's state", exc_info=True)
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
-    await entry.runtime_data.logout()
+    # Closed rather than logged out: a handler still running can't log it in
+    # again (a DSM session nobody would end).
+    try:
+        await entry.runtime_data.close()
+    except Exception:  # noqa: BLE001 - never a failed unload for it
+        _LOGGER.debug("Closing the Surveillance Station client failed", exc_info=True)
     return True
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> None:
-    """Delete the entry's stored thumbnails; take the card's Lovelace resource away with the last entry."""
+    """Delete the entry's stored thumbnails and frames; take the card's Lovelace resource away with the last entry."""
     if (manager := hass.data.get(DATA_MANAGER)) is not None:
         await manager.disk.drop_entry(entry.entry_id)
         await manager.disk_large.drop_entry(entry.entry_id)
+        await manager.forget_frames(entry.entry_id)
     await Store(hass, 1, frigate_store_key(entry.entry_id)).async_remove()
     if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
         return

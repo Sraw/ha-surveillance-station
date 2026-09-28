@@ -1,5 +1,6 @@
-// Real-HEVC harness: Chrome + VA-API in the hevc-chrome container. The card
-// is served from the repo (mounted at /card), everything else is live HA.
+// Real-HEVC harness: Chrome + VA-API in the hevc-chrome container. The cards
+// and ss-common.js are served from the repo (mounted at /card), everything
+// else is live HA.
 import { chromium } from "playwright";
 import fs from "fs";
 export const base = process.env.HA_URL; // run.sh requires it
@@ -12,7 +13,7 @@ export async function open({ w = 1400, h = 900, mobile = false, path = process.e
   const page = await ctx.newPage();
   page.on("pageerror", (e) => console.log("[pageerror]", e.message));
   page.on("console", (m) => (m.type() === "error" || m.text().startsWith("[t]")) && console.log("[console]", m.text()));
-  await page.route(/\/surveillance_station_static\/(ss-time(?:line|lapse)-card\.js)/, (r) =>
+  await page.route(/\/surveillance_station_static\/(ss-[a-z-]+\.js)/, (r) =>
     r.fulfill({ status: 200, contentType: "text/javascript",
       body: fs.readFileSync("/card/" + new URL(r.request().url()).pathname.split("/").pop()) }));
   await page.addInitScript(([t, b, prefs]) => {
@@ -33,3 +34,15 @@ export const snap = (ev, ref) => ev((c, ref) => [...c._players.values()].map((p)
   return `${c._master === p ? "*" : " "}${p.cameraId}:${(p.wall() - ref).toFixed(2)}${v.paused ? "P" : ">"} r${v.playbackRate} f${q?.totalVideoFrames ?? "?"}/${q?.droppedVideoFrames ?? "?"} ${v.videoWidth}x${v.videoHeight} a${ahead}${f?.ssPaused ? " ssP" : ""}${f?.live ? " L" : ""}${p.loading ? " ld" : ""}${p.veilKind ? " [" + p.veilKind + ":" + p.veil.textContent.trim().replace(/\s+/g, " ").slice(0, 40) + "]" : ""}`;
 }).join("  "), ref);
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// A scenario's checks: one "ok" / "FAIL" line each; done() prints the verdict
+// and exits 1 if any failed.
+export function checks() {
+  const fail = [];
+  const check = (ok, what) => { console.log(ok ? "ok  " : "FAIL", what); if (!ok) fail.push(what); return ok; };
+  const done = async (browser) => {
+    console.log(fail.length ? `FAILED: ${fail.join("; ")}` : "PASS");
+    await browser?.close();
+    process.exit(fail.length ? 1 : 0);
+  };
+  return { check, done };
+}

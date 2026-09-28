@@ -1,11 +1,13 @@
 """SS Info: an incomplete answer is an SSError (retryable), not a KeyError."""
 
+import threading
 from unittest.mock import AsyncMock, MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from synology_ss_playback import SSError, SurveillanceStationClient
+from synology_ss_playback import client as client_mod
 
 
 def _client(answer):
@@ -40,3 +42,19 @@ async def test_missing_time_zone_is_not_cached() -> None:
     assert await client._timezone() == ZoneInfo("America/Los_Angeles")
     assert await client._timezone() == ZoneInfo("America/Los_Angeles")
     assert client._call.await_count == 2
+
+
+@pytest.mark.parametrize("zone", ["America/Los_Angeles", "Not/AZone", None])
+async def test_time_zone_is_loaded_off_the_event_loop(monkeypatch: pytest.MonkeyPatch, zone: str | None) -> None:
+    """A zone's first load reads tzdata from disk: HA flags that on its loop."""
+    loaded_on = []
+
+    def load(key: str) -> ZoneInfo:
+        loaded_on.append(threading.get_ident())
+        return ZoneInfo(key)
+
+    monkeypatch.setattr(client_mod, "ZoneInfo", load)
+    client = _client({"serial": 1, "timezoneTZDB": zone})
+    await client.info()
+    await client.timezone()
+    assert loaded_on and threading.get_ident() not in loaded_on

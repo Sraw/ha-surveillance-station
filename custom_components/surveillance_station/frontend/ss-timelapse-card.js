@@ -18,14 +18,15 @@
  */
 
 const TL_TAG = "ss-timelapse-card";
-const TL_MSE = window.MediaSource ?? window.ManagedMediaSource;
+// What this card shares with the timeline card, at the version this card was
+// loaded with (the timeline card's, see ss-common.js).
+const {
+  MSE: TL_MSE, BLANK_POSTER: TL_BLANK_POSTER, prefsFor, labelAttrs, setLabel, sliderKey, veilHtml, VEIL_CSS, setVeil, codecOf,
+} = await import(new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href);
 const AHEAD = 18; // seconds of video fetched ahead of the playhead
 const BEHIND = 30; // seconds of played video kept (a short step back is instant)
 const PARALLEL = 3; // segments fetched at once (the server transcodes as many)
 const HEVC_PROBE = 'video/mp4; codecs="hvc1.1.6.L93.B0"';
-// As the timeline card's: without a poster, Android WebView (the HA app)
-// paints a big grey play button over a video with no frame yet.
-const TL_BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 const TL_LOADING_DELAY_MS = 400; // a quick load shows no veil at all
 // Timeline zoom: how much of the day the scrub bar shows (wall seconds).
 const TL_SPANS = [[86400, "24h"], [6 * 3600, "6h"], [3600, "1h"], [900, "15m"]];
@@ -34,45 +35,7 @@ const TL_SKIPS = [-30, -10, 10, 30];
 const TL_TICK_STEPS = [300, 900, 1800, 3600, 3 * 3600, 6 * 3600];
 const TL_FOLLOW_PAUSE_MS = 15_000; // after a manual pan, the view doesn't follow the playhead
 
-function tlPrefs(key, value) {
-  try {
-    if (value === undefined) return JSON.parse(localStorage.getItem(`ss-timelapse:${key}`));
-    localStorage.setItem(`ss-timelapse:${key}`, JSON.stringify(value));
-  } catch (e) {
-    return null;
-  }
-  return null;
-}
-
-function tlFindBox(buf, tag) {
-  const t = [...tag].map((c) => c.charCodeAt(0));
-  for (let i = 4; i + 4 <= buf.length; i++)
-    if (buf[i] === t[0] && buf[i + 1] === t[1] && buf[i + 2] === t[2] && buf[i + 3] === t[3]) return i;
-  return -1;
-}
-
-/** RFC 6381 codec string of an init segment (hvcC / avcC). */
-function tlCodecOf(moov) {
-  const hex = (n) => n.toString(16).toUpperCase();
-  let i = tlFindBox(moov, "hvcC");
-  if (i > 0) {
-    const c = moov.subarray(i + 4);
-    const space = ["", "A", "B", "C"][c[1] >> 6];
-    const tier = c[1] & 0x20 ? "H" : "L";
-    const compat = ((c[2] << 24) | (c[3] << 16) | (c[4] << 8) | c[5]) >>> 0;
-    let rev = 0; // the flags are written bit-reversed
-    for (let k = 0; k < 32; k++) rev = (rev << 1) | ((compat >>> k) & 1);
-    const cons = [...c.subarray(6, 12)];
-    while (cons.length && !cons.at(-1)) cons.pop();
-    return ["hvc1", `${space}${c[1] & 0x1f}`, hex(rev >>> 0), `${tier}${c[12]}`, ...cons.map(hex)].join(".");
-  }
-  i = tlFindBox(moov, "avcC");
-  if (i > 0) {
-    const c = moov.subarray(i + 4);
-    return "avc1." + [c[1], c[2], c[3]].map((x) => x.toString(16).padStart(2, "0")).join("");
-  }
-  return null;
-}
+const tlPrefs = prefsFor("ss-timelapse:");
 
 /**
  * Plays one session's segments through MSE: keeps AHEAD seconds fetched past
@@ -185,9 +148,16 @@ class SegmentFeed {
     const sb = this.sb;
     if (sb.updating) await new Promise((r) => sb.addEventListener("updateend", r, { once: true }));
     sb.appendBuffer(data);
+    // Whichever comes, the other listener goes too: one per segment would pile up on the buffer.
     await new Promise((resolve, reject) => {
-      sb.addEventListener("updateend", resolve, { once: true });
-      sb.addEventListener("error", reject, { once: true });
+      const done = (e) => {
+        sb.removeEventListener("updateend", done);
+        sb.removeEventListener("error", done);
+        if (e.type === "error") reject(e);
+        else resolve();
+      };
+      sb.addEventListener("updateend", done);
+      sb.addEventListener("error", done);
     });
   }
 
@@ -251,7 +221,12 @@ class SegmentFeed {
         let init = null;
         if (map.size !== this.sizeDone) {
           this.initAbort = new AbortController();
-          init = await this.get(`${this.base}init/${map.index}.mp4`, this.initAbort.signal);
+          try {
+            init = await this.get(`${this.base}init/${map.index}.mp4`, this.initAbort.signal);
+          } catch (e) {
+            if (gen !== this.gen || this.closed) continue; // aborted by a seek, as a segment's fetch is below
+            throw e;
+          }
           if (gen !== this.gen || this.closed) continue;
         }
         let media;
@@ -270,7 +245,7 @@ class SegmentFeed {
         if (gen !== this.gen || this.closed) continue;
         if (init) {
           if (!this.sb) {
-            const codec = tlCodecOf(init);
+            const codec = codecOf(init);
             const mime = `video/mp4; codecs="${codec}"`;
             if (!codec || !TL_MSE.isTypeSupported(mime))
               throw Object.assign(new Error(`this browser can't play ${codec}`), { codec });
@@ -312,21 +287,8 @@ const TL_STYLE = `
   video { width: 100%; height: 100%; display: block; object-fit: contain; }
   .clock { position: absolute; left: 8px; top: 8px; color: #fff; background: rgba(0,0,0,.45);
     padding: 2px 8px; border-radius: 4px; font-size: 14px; font-variant-numeric: tabular-nums; pointer-events: none; }
-  /* The veil, as the timeline card's: spinner (loading) or icon, a line, a sub-line. */
-  .veil { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center;
-    justify-content: center; gap: 10px; padding: 16px; text-align: center; color: #fff;
-    background: rgba(0,0,0,.3); backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
-    opacity: 1; visibility: visible; transition: opacity .25s, visibility 0s; }
-  .veil.off { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s, visibility 0s .25s; }
-  .spin { width: 44px; height: 44px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25);
-    border-top-color: #fff; animation: tl-spin .9s linear infinite; }
-  @keyframes tl-spin { to { transform: rotate(360deg); } }
-  .veil ha-icon { --mdc-icon-size: 42px; opacity: .9; }
-  .veil.error ha-icon { color: #ff8a80; }
-  .vtext { font-size: 16px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,.6); max-width: 90%; }
-  .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
-  .vsub:empty { display: none; }
-  .veil:not(.loading) .spin, .veil.loading ha-icon { display: none; }
+  /* The veil, shared with the timeline card: spinner (loading) or icon, a line, a sub-line. */
+  ${VEIL_CSS}
   .controls { display: flex; align-items: center; gap: 2px; padding: 6px 8px 0; }
   .spacer { flex: 1; }
   .range { flex: 1; min-width: 0; font-size: 12px; color: var(--secondary-text-color); white-space: nowrap;
@@ -344,6 +306,7 @@ const TL_STYLE = `
     .spans button { padding: 4px 7px; }
   }
   .scrub { position: relative; flex: 1; height: 34px; cursor: pointer; touch-action: none; }
+  .scrub:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; border-radius: 5px; }
   .track { position: absolute; left: 0; right: 0; top: 6px; height: 10px; border-radius: 5px;
     background: color-mix(in srgb, var(--secondary-text-color) 18%, transparent); overflow: hidden; }
   .cov { position: absolute; top: 0; bottom: 0; background: color-mix(in srgb, var(--primary-color) 45%, transparent); }
@@ -364,7 +327,7 @@ class SSTimelapseCard extends HTMLElement {
     this._session = null;
     this._feed = null;
     this._seq = 0;
-    const span = Number(tlPrefs("span"));
+    const span = Number(tlPrefs.get("span", null));
     this._span = TL_SPANS.some(([v]) => v === span) ? span : TL_SPANS[0][0];
     this._view = null; // {start, end}: the part of the day the scrub bar shows
     this._followPausedUntil = 0;
@@ -440,7 +403,7 @@ class SSTimelapseCard extends HTMLElement {
       this._message("No time-lapse tasks in Surveillance Station", "empty");
       return;
     }
-    const want = this._config.camera ?? tlPrefs("camera");
+    const want = this._config.camera ?? tlPrefs.get("camera", null);
     const cam = cams.find((c) => String(c.id) === String(want) || c.name === want) ?? cams[0];
     this._renderCameras();
     this._selectCamera(cam.id);
@@ -452,26 +415,26 @@ class SSTimelapseCard extends HTMLElement {
       <ha-card>
         <div class="bar"><div class="scroll cams"></div></div>
         <div class="bar">
-          <button class="icon prev" title="Previous day"><ha-icon icon="mdi:chevron-left"></ha-icon></button>
+          <button class="icon prev" ${labelAttrs("Previous day")}><ha-icon icon="mdi:chevron-left"></ha-icon></button>
           <div class="scroll days"></div>
-          <button class="icon next" title="Next day"><ha-icon icon="mdi:chevron-right"></ha-icon></button>
+          <button class="icon next" ${labelAttrs("Next day")}><ha-icon icon="mdi:chevron-right"></ha-icon></button>
         </div>
         <div class="stage">
           <video muted playsinline disablepictureinpicture poster="${TL_BLANK_POSTER}"></video>
           <div class="clock"></div>
-          <div class="veil off"><div class="spin"></div><ha-icon></ha-icon><div class="vtext"></div><div class="vsub"></div></div>
+          ${veilHtml()}
         </div>
         <div class="controls">
-          <button class="icon play" title="Play"><ha-icon icon="mdi:play"></ha-icon></button>
-          ${TL_SKIPS.map((d) => `<button class="icon skip${Math.abs(d) >= 30 ? " wide" : ""}" data-skip="${d}" title="${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s"><ha-icon icon="mdi:${d < 0 ? "rewind" : "fast-forward"}-${Math.abs(d)}"></ha-icon></button>`).join("")}
+          <button class="icon play" ${labelAttrs("Play")}><ha-icon icon="mdi:play"></ha-icon></button>
+          ${TL_SKIPS.map((d) => `<button class="icon skip${Math.abs(d) >= 30 ? " wide" : ""}" data-skip="${d}" ${labelAttrs(`${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s`)}><ha-icon icon="mdi:${d < 0 ? "rewind" : "fast-forward"}-${Math.abs(d)}"></ha-icon></button>`).join("")}
           <span class="range"></span><span class="spacer" hidden></span>
           <div class="spans">${TL_SPANS.map(([v, l]) => `<button data-span="${v}">${l}</button>`).join("")}</div>
-          <button class="icon full" title="Full screen"><ha-icon icon="mdi:fullscreen"></ha-icon></button>
+          <button class="icon full" ${labelAttrs("Fullscreen")}><ha-icon icon="mdi:fullscreen"></ha-icon></button>
         </div>
         <div class="tlrow">
-          <button class="icon pan" data-pan="-1" title="Earlier"><ha-icon icon="mdi:chevron-left"></ha-icon></button>
-          <div class="scrub"><div class="track"></div><div class="head"></div><div class="ticks"></div></div>
-          <button class="icon pan" data-pan="1" title="Later"><ha-icon icon="mdi:chevron-right"></ha-icon></button>
+          <button class="icon pan" data-pan="-1" ${labelAttrs("Earlier")}><ha-icon icon="mdi:chevron-left"></ha-icon></button>
+          <div class="scrub" role="slider" tabindex="0" aria-label="Timeline"><div class="track"></div><div class="head"></div><div class="ticks"></div></div>
+          <button class="icon pan" data-pan="1" ${labelAttrs("Later")}><ha-icon icon="mdi:chevron-right"></ha-icon></button>
         </div>
       </ha-card>`;
     const $ = (s) => this.shadowRoot.querySelector(s);
@@ -522,6 +485,7 @@ class SSTimelapseCard extends HTMLElement {
     v.addEventListener("ended", () => this._syncPlay());
     v.addEventListener("error", () => this._feedFailed(v.error));
     this._scrub.addEventListener("pointerdown", (e) => this._scrubStart(e));
+    this._scrub.addEventListener("keydown", (e) => this._scrubKey(e));
     this._stage = $(".stage");
     this._card = $("ha-card");
     // Ticks are as dense as the bar's width allows.
@@ -553,16 +517,7 @@ class SSTimelapseCard extends HTMLElement {
     if (!this._veil) return;
     clearTimeout(this._veilTimer);
     this._want = text ? { kind } : null;
-    const show = () => {
-      const v = this._veil;
-      v.classList.toggle("off", !text);
-      if (!text) return;
-      v.classList.remove("loading", "empty", "error");
-      v.classList.add(kind);
-      v.querySelector("ha-icon").setAttribute("icon", kind === "error" ? "mdi:alert-circle-outline" : "mdi:video-off-outline");
-      v.querySelector(".vtext").textContent = kind === "loading" ? `${text}…` : text;
-      v.querySelector(".vsub").textContent = sub;
-    };
+    const show = () => setVeil(this._veil, text, kind, sub);
     if (text && kind === "loading" && this._veil.classList.contains("off")) this._veilTimer = setTimeout(show, TL_LOADING_DELAY_MS);
     else show();
   }
@@ -590,8 +545,12 @@ class SSTimelapseCard extends HTMLElement {
 
   _selectCamera(id) {
     this._cameraId = id;
-    tlPrefs("camera", id);
-    for (const b of this.shadowRoot.querySelectorAll(".cams button")) b.classList.toggle("on", Number(b.dataset.id) === id);
+    tlPrefs.set("camera", id);
+    for (const b of this.shadowRoot.querySelectorAll(".cams button")) {
+      const on = Number(b.dataset.id) === id;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
+    }
     const days = this._camera()?.days ?? [];
     const box = this.shadowRoot.querySelector(".days");
     box.innerHTML = "";
@@ -621,6 +580,7 @@ class SSTimelapseCard extends HTMLElement {
   }
 
   _closeFeed() {
+    this._endScrubKeys();
     this._feed?.close();
     const v = this._video;
     if (!this._feed && v?.getAttribute("src")) {
@@ -647,6 +607,7 @@ class SSTimelapseCard extends HTMLElement {
     for (const b of this.shadowRoot.querySelectorAll(".days button")) {
       const on = b.dataset.date === date;
       b.classList.toggle("on", on);
+      b.setAttribute("aria-pressed", String(on));
       if (on) b.scrollIntoView({ block: "nearest", inline: "nearest" });
     }
     this._day = days[i];
@@ -677,13 +638,15 @@ class SSTimelapseCard extends HTMLElement {
     this._session = session;
     this._titleSkips();
     const v = this._video;
+    // HA's own address, as the timeline card's stream: on HA Cast the page comes from elsewhere.
+    const url = this._hass.hassUrl(session.url);
     if (TL_MSE) {
-      this._feed = new SegmentFeed(v, session, {
+      this._feed = new SegmentFeed(v, { ...session, url }, {
         onError: (e) => this._feedFailed(e),
         onWaiting: () => this._stall("Loading"),
       });
     } else {
-      v.src = session.url;
+      v.src = url;
     }
     const start = at === null ? 0 : this._mediaAt(at);
     if (start > 0) this._seek(start);
@@ -712,7 +675,7 @@ class SSTimelapseCard extends HTMLElement {
       return;
     }
     // H.265 the browser said it plays, but not this stream's profile/level: H.264 then.
-    if (e?.codec?.startsWith("hvc1") && this._session.codec === "hevc") {
+    if (/^(hvc1|hev1)/.test(e?.codec ?? "") && this._session.codec === "hevc") {
       this._selectDay(this._date, wall, true, "h264");
       return;
     }
@@ -730,7 +693,7 @@ class SSTimelapseCard extends HTMLElement {
   _syncPlay() {
     const paused = this._video.paused;
     this._playBtn.querySelector("ha-icon").setAttribute("icon", paused ? "mdi:play" : "mdi:pause");
-    this._playBtn.title = paused ? "Play" : "Pause";
+    setLabel(this._playBtn, paused ? "Play" : "Pause");
   }
 
   /** Wall time at media time m (the run holding it; past a run's end, its end). */
@@ -769,6 +732,8 @@ class SSTimelapseCard extends HTMLElement {
       const span = this._span >= TL_SPANS[0][0] ? d.end - d.start : Math.min(this._span, d.end - d.start);
       const start = Math.max(d.start, Math.min(center - span / 2, d.end - span));
       this._view = { start, end: start + span };
+      this._scrub?.setAttribute("aria-valuemin", String(Math.floor(start)));
+      this._scrub?.setAttribute("aria-valuemax", String(Math.ceil(start + span)));
     }
     this._drawCoverage();
     if (paint) this._paint();
@@ -776,7 +741,7 @@ class SSTimelapseCard extends HTMLElement {
 
   _zoom(span) {
     this._span = span;
-    tlPrefs("span", span);
+    tlPrefs.set("span", span);
     this._markSpan();
     this._followPausedUntil = 0;
     const w = this._session ? this._wallAt(this._seekTarget ?? this._video.currentTime) : null;
@@ -825,7 +790,7 @@ class SSTimelapseCard extends HTMLElement {
       const d = Number(b.dataset.skip);
       const real = Math.abs(d) * rate;
       const approx = real >= 3600 ? `${+(real / 3600).toFixed(1)} h` : `${Math.round(real / 60)} min`;
-      b.title = `${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s${rate ? ` (≈${approx} of real time)` : ""}`;
+      setLabel(b, `${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s${rate ? ` (≈${approx} of real time)` : ""}`);
     }
   }
 
@@ -913,11 +878,51 @@ class SSTimelapseCard extends HTMLElement {
     const f = this._frac(w);
     this._headEl.style.display = f < 0 || f > 1 ? "none" : "";
     this._headEl.style.left = `${f * 100}%`;
-    this._clock.textContent = this._fmt(w, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const text = this._fmt(w, { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    this._clock.textContent = text;
+    // The scrub bar as a slider: its value within the view, and what the clock says.
+    const view = this._view;
+    if (view && this._scrub.getAttribute("aria-valuetext") !== text) {
+      this._scrub.setAttribute("aria-valuenow", String(Math.round(Math.min(Math.max(w, view.start), view.end))));
+      this._scrub.setAttribute("aria-valuetext", text);
+    }
+  }
+
+  /**
+   * The scrub bar from the keyboard: see sliderKey (arrows 1 % of the view,
+   * Page Up / Down 10 %, Home / End its ends). As while dragging, the head
+   * goes there at once and the seek follows once the keys stop, so a held key
+   * doesn't start a fetch (a transcode) per repeat.
+   */
+  _scrubKey(e) {
+    if (!this._session || !this._day || !this._view) return;
+    const { start, end } = this._view;
+    const from = this._keyWall ?? this._wallAt(this._seekTarget ?? this._video.currentTime);
+    const w = sliderKey(e.key, from, { min: start, max: end, step: (end - start) / 100 });
+    if (w == null) return;
+    e.preventDefault();
+    this._keyWall = w;
+    this._dragging = true;
+    this._paint(w);
+    clearTimeout(this._keyTimer);
+    this._keyTimer = setTimeout(() => {
+      this._keyWall = null;
+      this._dragging = false;
+      if (this._session) this._seek(this._mediaAt(w));
+    }, 400);
+  }
+
+  /** Keys still waiting to seek don't, once a drag or another day takes over. */
+  _endScrubKeys() {
+    if (this._keyWall == null) return;
+    clearTimeout(this._keyTimer);
+    this._keyWall = null;
+    this._dragging = false;
   }
 
   _scrubStart(e) {
     if (!this._session || !this._day || !this._view) return;
+    this._endScrubKeys();
     const rect = this._scrub.getBoundingClientRect();
     const { start, end } = this._view;
     const wallAt = (x) => start + Math.min(1, Math.max(0, (x - rect.left) / rect.width)) * (end - start);

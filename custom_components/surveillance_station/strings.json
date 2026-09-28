@@ -11,6 +11,11 @@
           "verify_ssl": "Verify SSL certificate",
           "username": "Username",
           "password": "Password"
+        },
+        "data_description": {
+          "port": "5001 for HTTPS, 5000 for HTTP (DSM's defaults).",
+          "ssl": "Without it, the DSM password and session id cross the network unencrypted.",
+          "verify_ssl": "Leave off for DSM's own self-signed certificate; turn on once DSM has a certificate Home Assistant trusts."
         }
       },
       "reauth_confirm": {
@@ -30,6 +35,11 @@
           "verify_ssl": "Verify SSL certificate",
           "username": "Username",
           "password": "Password"
+        },
+        "data_description": {
+          "port": "5001 for HTTPS, 5000 for HTTP (DSM's defaults).",
+          "ssl": "Without it, the DSM password and session id cross the network unencrypted.",
+          "verify_ssl": "Leave off for DSM's own self-signed certificate; turn on once DSM has a certificate Home Assistant trusts."
         }
       }
     },
@@ -95,6 +105,10 @@
     }
   },
   "issues": {
+    "ss_unreachable": {
+      "title": "Surveillance Station is unreachable",
+      "description": "{name} has not answered Home Assistant for over 10 minutes, so playback, thumbnails and bookmarks don't work. Last error: {error}. Check that the NAS is on and Surveillance Station running, and that Home Assistant can reach it; this clears by itself once it answers again."
+    },
     "frigate_mqtt": {
       "title": "Frigate detections: MQTT is not available",
       "description": "Home Assistant's MQTT integration has not been available for over 10 minutes, so Frigate reviews on `{topic}/reviews` are not being turned into Surveillance Station bookmarks or notifications. Check the MQTT integration and its broker; this clears by itself once MQTT is back."

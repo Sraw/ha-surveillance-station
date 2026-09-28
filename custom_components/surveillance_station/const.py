@@ -3,7 +3,8 @@
 DOMAIN = "surveillance_station"
 
 CONF_VERIFY_SSL = "verify_ssl"
-DEFAULT_PORT = 5000
+# DSM's HTTPS port (5000 is its HTTP one).
+DEFAULT_PORT = 5001
 
 # Where the bundled Lovelace card is served from.
 STATIC_URL = "/surveillance_station_static"
@@ -38,6 +39,9 @@ TIMELAPSE_LIST_SECONDS = 60
 LIVE_URL = "/api/surveillance_station/live"
 # A live-stream token must be used (the socket opened) within this long.
 LIVE_TOKEN_TTL_SECONDS = 30
+# Unused live-stream tokens kept at most (the oldest go first): a few for
+# every stream HA may relay.
+LIVE_TOKENS_MAX = 64
 # A live relay whose browser sent nothing (the card keeps alive every 10 s)
 # for this long is closed.
 LIVE_IDLE_SECONDS = 90
@@ -77,8 +81,9 @@ THUMBNAIL_URL_TTL_HOURS = 24
 # Largest page of the event list.
 BOOKMARK_PAGE_MAX = 100
 # SS returns all bookmarks in one list; the card's timeline, event list and
-# its scrolling all read one cached copy, this fresh.
-BOOKMARK_CACHE_SECONDS = 15
+# its scrolling all read one cached copy, this fresh. Bookmarks HA makes or
+# changes itself are listed afresh at once.
+BOOKMARK_CACHE_SECONDS = 60
 # A failed bookmark fetch is answered from memory this long.
 BOOKMARK_ERROR_SECONDS = 5
 # Longest time range the timeline may ask for (the card's widest span is 7 d).
@@ -119,6 +124,8 @@ FRIGATE_SNAPSHOT_TRIES = 3
 FRIGATE_THUMB_HEIGHT = 180
 # Thumbnails built from Frigate at once (an event list page asks for 30).
 FRIGATE_THUMB_PARALLEL = 4
+# Those of reviews that are over, kept in memory, by size (~10-20 KB each).
+FRIGATE_THUMB_CACHE_BYTES = 8 * 1024 * 1024
 # Frigate's API answers a request within this.
 FRIGATE_API_TIMEOUT = 10
 # A notification's image: Frigate's snapshot within this (all its requests

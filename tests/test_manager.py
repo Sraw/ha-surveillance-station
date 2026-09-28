@@ -1,9 +1,11 @@
 """VodManager's bounds: the fetch queue, the segment and thumbnail caches."""
 
 import asyncio
+from datetime import UTC, datetime
 import logging
 import os
 from pathlib import Path
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,9 +13,11 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from synology_ss_playback import Bookmark, RecordingInfo, Segment, SSConnectionError, SSError
 
 from custom_components.surveillance_station import views
+from custom_components.surveillance_station.const import DOMAIN
 from custom_components.surveillance_station.thumbnail_store import ThumbnailStore
 from custom_components.surveillance_station.views import DATA_MANAGER, VodManager, VodSession
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 
 from .conftest import T0
 
@@ -78,6 +82,35 @@ async def test_abandoned_queued_fetch_is_cancelled(
     assert manager.stats()["cached_segments"] == views.MAX_PARALLEL_FETCHES
 
 
+async def test_abandoned_download_finishes_into_the_cache(
+    hass: HomeAssistant, setup_integration: MockConfigEntry
+) -> None:
+    """Left by everyone once it reached the NAS: it finishes all the same, and the next request finds it."""
+    manager = hass.data[DATA_MANAGER]
+    session = _session(setup_integration)
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow(client, seg, ffmpeg):
+        started.set()
+        await gate.wait()
+        return b"i", b"m"
+
+    fetch = AsyncMock(side_effect=slow)
+    with patch.object(views, "fetch_segment", fetch):
+        req = asyncio.create_task(manager.fetch(session, session.segments[0]))
+        await started.wait()
+        req.cancel()
+        await asyncio.sleep(0.01)
+        assert manager.stats()["fetches_in_flight"] == 1
+        gate.set()
+        while manager.stats()["fetches_in_flight"]:
+            await asyncio.sleep(0.01)
+        assert await manager.fetch(session, session.segments[0]) == (b"i", b"m")
+    assert fetch.await_count == 1
+    assert manager.stats()["cached_segments"] == 1
+
+
 async def test_segment_cache_is_bounded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     manager = hass.data[DATA_MANAGER]
     session = _session(setup_integration)
@@ -125,7 +158,7 @@ async def test_same_thumbnail_made_once(hass: HomeAssistant, setup_integration: 
     entry_id = setup_integration.entry_id
     gate = asyncio.Event()
 
-    async def slow(*args):
+    async def slow(*args, **kwargs):
         await gate.wait()
         return b"j" * 400
 
@@ -143,7 +176,7 @@ async def test_abandoned_thumbnail_is_cancelled(hass: HomeAssistant, setup_integ
     manager = hass.data[DATA_MANAGER]
     cancelled = asyncio.Event()
 
-    async def slow(*args):
+    async def slow(*args, **kwargs):
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -173,6 +206,18 @@ async def test_thumbnail_miss_expires(hass: HomeAssistant, setup_integration: Mo
     assert snap.await_count == 2
 
 
+async def test_thumbnail_when_recorded_lists_recordings_once(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    """The recording that was found written is the one cut: SS lists recordings once, not again for the snapshot."""
+    manager = hass.data[DATA_MANAGER]
+    mock_client.download = AsyncMock(return_value=b"mp4")
+    with patch("synology_ss_playback.segment._run_ffmpeg", AsyncMock(return_value=b"jpg")):
+        assert await manager.thumbnail_when_recorded(setup_integration.entry_id, 6, T0 + 100, 5) == b"jpg"
+    assert mock_client.recordings.await_count == 1
+    assert mock_client.download.await_args.args[:3] == (100, 1, 100_000)  # recording 100, 100 s in
+
+
 async def test_bookmark_fetch_shared_and_error_remembered(
     hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
 ) -> None:
@@ -194,6 +239,67 @@ async def test_bookmark_fetch_shared_and_error_remembered(
     with pytest.raises(SSConnectionError):
         await manager.bookmarks(entry_id, mock_client)
     assert mock_client.list_bookmarks.await_count == 1
+
+
+async def test_bookmarks_kept_for_a_minute(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
+) -> None:
+    """The card asks every 5 s while live: the whole list comes from SS once a minute."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    now = [100.0]
+    with patch.object(views, "_monotonic", lambda: now[0]):
+        await manager.bookmarks(entry_id, mock_client)
+        now[0] += 30
+        await manager.bookmarks(entry_id, mock_client)
+        assert mock_client.list_bookmarks.await_count == 1
+        now[0] += 31
+        assert [b.id for b in await manager.bookmarks(entry_id, mock_client)] == [3, 2, 1]
+    assert mock_client.list_bookmarks.await_count == 2
+
+
+async def test_bookmarks_indexed_off_the_loop(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client
+) -> None:
+    """Tens of thousands of bookmarks take a while to index: never on HA's event loop."""
+    threads: list[threading.Thread] = []
+    real = views.BookmarkIndex
+
+    def index(found):
+        threads.append(threading.current_thread())
+        return real(found)
+
+    with patch.object(views, "BookmarkIndex", index):
+        await hass.data[DATA_MANAGER].bookmarks(setup_integration.entry_id, mock_client)
+    assert threads and threads[0] is not threading.main_thread()
+
+
+async def test_lasting_outage_is_a_repairs_issue(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """Unreachable when asked, and still 10 minutes later: an issue, gone once SS answers (or the entry is unloaded)."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    registry = ir.async_get(hass)
+    issue_id = f"ss_unreachable_{entry_id}"
+    down = SSConnectionError("SYNO.SurveillanceStation.Camera", "List", None)
+    now = [1000.0]
+    with patch.object(views, "_monotonic", lambda: now[0]):
+        manager.track(entry_id, down)
+        now[0] += views.FRIGATE_ISSUE_AFTER_SECONDS - 1
+        manager.track(entry_id, down)
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
+        now[0] += 1
+        manager.track(entry_id, down)
+        issue = registry.async_get_issue(DOMAIN, issue_id)
+        assert issue is not None and issue.translation_key == "ss_unreachable"
+        assert issue.translation_placeholders["name"] == setup_integration.title
+        manager.track(entry_id, None)
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
+        manager.track(entry_id, down)
+        now[0] += views.FRIGATE_ISSUE_AFTER_SECONDS
+        manager.track(entry_id, down)
+        assert registry.async_get_issue(DOMAIN, issue_id) is not None
+    assert await hass.config_entries.async_unload(entry_id)
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
 async def test_unreachable_logged_once(
@@ -219,7 +325,7 @@ async def test_unload_answers_waiting_requests(hass: HomeAssistant, setup_integr
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
 
-    async def hang(*args):
+    async def hang(*args, **kwargs):
         await asyncio.Event().wait()
 
     mock_client.list_bookmarks.side_effect = hang
@@ -354,11 +460,18 @@ async def test_evicted_while_written_is_removed(hass: HomeAssistant, tmp_path: P
 
 
 async def test_bad_stored_key_is_replaced(hass: HomeAssistant, hass_storage: dict) -> None:
+    """A stored key that isn't one of ours: a new one, kept (the next start signs the same URLs)."""
     hass_storage["surveillance_station.thumbnail_key"] = {"version": 1, "key": "surveillance_station.thumbnail_key", "data": {"key": ""}}
     manager = VodManager(hass)
     await manager.async_load()
-    assert len(manager._thumb_key) == 32
     await hass.async_block_till_done()
+    url = manager.sign_thumbnail("E", 6, T0)
+    path, query = url.split("?")
+    exp, sig = (part.split("=")[1] for part in query.split("&"))
+    assert manager.check_thumbnail(path, exp, sig)
+    again = VodManager(hass)
+    await again.async_load()
+    assert again.sign_thumbnail("E", 6, T0) == url
 
 
 async def test_dropping_an_entry_waits_for_its_writes(hass: HomeAssistant, tmp_path: Path) -> None:
@@ -452,7 +565,7 @@ async def test_large_image(
     assert large.split("?")[0].endswith(f"/6/{T0}-large.jpg")
     widths = []
 
-    async def snap(client, camera_id, ts, ffmpeg, width):
+    async def snap(client, camera_id, ts, ffmpeg, width, recording=None):
         widths.append(width)
         return b"L" if width == 1280 else b"s"
 
@@ -492,10 +605,10 @@ async def test_fetch_fails_when_the_entry_is_not_loaded(hass: HomeAssistant, set
 async def test_drop_entry_forgets_its_live_tokens(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    manager.create_live_token(entry_id, 6)
-    assert manager._live_tokens
+    token = manager.create_live_token(entry_id, 6)
     manager.drop_entry(entry_id)
-    assert not manager._live_tokens
+    assert manager.take_live_token(token) is None
+    assert manager.stats()["live_tokens"] == 0
 
 
 async def test_expired_live_tokens_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -504,9 +617,21 @@ async def test_expired_live_tokens_are_swept_on_create(hass: HomeAssistant, setu
     with patch.object(views.time, "time", return_value=1_000_000.0):
         old = manager.create_live_token(entry_id, 6)
     with patch.object(views.time, "time", return_value=1_000_000.0 + views.LIVE_TOKEN_TTL_SECONDS + 1):
-        manager.create_live_token(entry_id, 7)
-    assert old not in manager._live_tokens
-    assert len(manager._live_tokens) == 1
+        new = manager.create_live_token(entry_id, 7)
+        assert manager.stats()["live_tokens"] == 1
+        assert manager.take_live_token(old) is None
+        assert manager.take_live_token(new) == (entry_id, 7, None)
+
+
+async def test_live_tokens_are_bounded(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """Unused tokens asked for faster than they expire: the oldest go."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    with patch.object(views, "LIVE_TOKENS_MAX", 3):
+        tokens = [manager.create_live_token(entry_id, i) for i in range(5)]
+    assert manager.stats()["live_tokens"] == 3
+    assert [manager.take_live_token(t) for t in tokens[:2]] == [None, None]
+    assert manager.take_live_token(tokens[-1]) == (entry_id, 4, None)
 
 
 async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -517,7 +642,7 @@ async def test_expired_sessions_are_swept_on_create(hass: HomeAssistant, setup_i
     with patch.object(views.time, "time", return_value=T0 + 10):
         manager.create_session(_session(setup_integration))
     assert manager.get_session(old_token) is None
-    assert old_token not in manager._sessions
+    assert manager.stats()["sessions"] == 1
 
 
 async def test_sessions_are_bounded_by_count(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -564,6 +689,9 @@ async def test_extend_stops_growing_at_max_end(
         await manager.extend(session)
     assert session.planned_end == T0 + 30
     assert session.live is False
+    # Still the EVENT playlist players have been re-fetching, now ended.
+    assert "#EXT-X-PLAYLIST-TYPE:EVENT" in session.playlist
+    assert session.playlist.endswith("#EXT-X-ENDLIST\n")
 
 
 async def test_extend_does_nothing_before_the_next_grid_line(
@@ -610,11 +738,14 @@ async def test_set_frame_is_a_noop_when_the_moment_is_unchanged(
 ) -> None:
     manager = hass.data[DATA_MANAGER]
     entry_id = setup_integration.entry_id
-    manager.set_frame(entry_id, 1, 100)
-    manager.set_frame(entry_id, 2, 200)  # moved to the end
-    manager.set_frame(entry_id, 1, 100)  # same ts as already stored: not re-recorded
-    assert list(manager._frames)[-1] == f"{entry_id}/2"  # bookmark 1 wasn't moved back to the end
-    assert manager.frame(entry_id, _bookmark(1)) == 100
+    with patch.object(views, "BOOKMARK_FRAMES_MAX", 2):
+        manager.set_frame(entry_id, 1, 100)
+        manager.set_frame(entry_id, 2, 200)
+        manager.set_frame(entry_id, 1, 100)  # same ts as already stored: not re-recorded
+        assert manager.frame(entry_id, _bookmark(1)) == 100
+        manager.set_frame(entry_id, 3, 300)  # evicts the oldest: still bookmark 1 (not moved back to the end)
+    assert manager.frame(entry_id, _bookmark(1, start=5)) == 6
+    assert manager.frame(entry_id, _bookmark(2)) == 200
 
 
 async def test_set_frame_evicts_the_oldest_past_the_cap(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -626,3 +757,45 @@ async def test_set_frame_evicts_the_oldest_past_the_cap(hass: HomeAssistant, set
         manager.set_frame(entry_id, 3, 30)  # evicts bookmark 1 (the oldest)
     assert manager.frame(entry_id, _bookmark(1, start=5)) == 6  # fallen back to start + 1
     assert manager.frame(entry_id, _bookmark(3)) == 30
+
+
+async def test_removing_the_entry_forgets_its_frames(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """A removed entry's bookmark frames go, also from what the next start reads; another entry's stay."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    manager.set_frame(entry_id, 1, T0 + 7)
+    manager.set_frame("other-entry", 1, T0 + 9)
+    await hass.config_entries.async_remove(entry_id)
+    await hass.async_block_till_done()
+    assert manager.frame(entry_id, _bookmark(1, start=T0)) == T0 + 1
+    again = VodManager(hass)
+    await again.async_load()
+    assert again.frame(entry_id, _bookmark(1, start=T0)) == T0 + 1
+    assert again.frame("other-entry", _bookmark(1, start=T0)) == T0 + 9
+
+
+async def test_image_url_is_the_same_all_day(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """One URL per frame from 00:00 to 23:59:59 UTC (the browser's cached copy stays good), a new one the next day."""
+    manager = hass.data[DATA_MANAGER]
+    entry_id = setup_integration.entry_id
+    midnight = datetime(2026, 9, 22, tzinfo=UTC).timestamp()
+    urls = []
+    for t in (midnight, midnight + 86399.9, midnight + 86400):
+        with patch.object(views.time, "time", return_value=t):
+            urls.append(manager.sign_thumbnail(entry_id, 6, T0))
+    assert urls[0] == urls[1] != urls[2]
+    for url in urls:
+        path, query = url.split("?")
+        exp, sig = (part.split("=")[1] for part in query.split("&"))
+        with patch.object(views.time, "time", return_value=midnight + 86400):
+            assert manager.check_thumbnail(path, exp, sig)
+
+
+async def test_overlong_expiry_is_a_404(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_client_no_auth
+) -> None:
+    """An exp longer than int() reads (4300 digits) is refused like any bad signature, not a 500."""
+    manager = hass.data[DATA_MANAGER]
+    path = manager.sign_thumbnail(setup_integration.entry_id, 6, T0).split("?")[0]
+    http = await hass_client_no_auth()
+    assert (await http.get(f"{path}?exp={'9' * 5000}&sig=00")).status == 404

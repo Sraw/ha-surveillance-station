@@ -36,7 +36,13 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.18.0";
+const CARD_VERSION = "0.19.0";
+// What this card shares with the time-lapse card, loaded as that card is:
+// with this card's version, so a release never runs against a stale cached copy.
+const {
+  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, sliderKey, kindTest, veilHtml, VEIL_CSS, setVeil,
+  ticksOf, readStreamMsg, findBox, codecOf, audioCodecOf,
+} = await import(new URL(`./ss-common.js?v=${CARD_VERSION}`, import.meta.url).href);
 // After giving up on a stream, it is tried again this often while visible.
 const STREAM_RETRY_MS = 60000;
 // Cameras a grid opens on when the card names none: each is a full-quality
@@ -67,10 +73,6 @@ const LIVE_GROW_MAX = REFRESH_MS / 1000 + 15;
 const LIVE_RECS_MS = 5_000;
 const LIVE_RECS_SPAN = 3600;
 const FOLLOW_PAUSE_MS = 15_000; // after a manual pan, don't snap the view back
-// A transparent poster: without one, Android WebView (the HA app) paints its
-// default poster, a big grey play arrow, over a video with no frame yet, so
-// it flashed on every jump to a bookmark or new window.
-const BLANK_POSTER = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 const THUMB_RETRY_MS = 30_000;
 const EVENT_PAGE = 30; // events per page of the list; more load as it scrolls
 // A Frigate bookmark's comment names its review, as the integration writes (and reads) it.
@@ -115,11 +117,6 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 const isLiveTime = (t) => t >= nowS() - 2;
 // Past the newest recording: that means live.
 const liveIfRecent = (t) => (t >= nowS() - LIVE_LAG ? nowS() : t);
-// MSE for the real-time stream: iOS Safari (17.1+) only has ManagedMediaSource.
-// Without either, live falls back to the newest recordings (HLS, ~20 s behind).
-const MSE = window.MediaSource ?? window.ManagedMediaSource;
-const esc = (s) =>
-  String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const errText = (e) => e?.message ?? e?.code ?? String(e);
 /** Merge [start, end] intervals into their sorted union. */
 const unionOf = (spans) => {
@@ -132,25 +129,8 @@ const unionOf = (spans) => {
   return out;
 };
 
-// Per-viewer preferences. Storage can be unavailable (private mode, WebView
-// settings); the card then just uses its config.
-const prefs = {
-  get(key, fallback) {
-    try {
-      const v = localStorage.getItem(`ss-timeline-card.${key}`);
-      return v == null ? fallback : JSON.parse(v);
-    } catch (e) {
-      return fallback;
-    }
-  },
-  set(key, value) {
-    try {
-      localStorage.setItem(`ss-timeline-card.${key}`, JSON.stringify(value));
-    } catch (e) {
-      /* not persisted */
-    }
-  },
-};
+// Per-viewer preferences.
+const prefs = prefsFor("ss-timeline-card.");
 
 // 12 or 24 h, as the user's HA profile says (hass.locale.time_format:
 // "12", "24", "language" or "system").
@@ -184,29 +164,6 @@ function fmtDate(t) {
 function fmtDay(t) {
   return new Date(t * 1000).toLocaleDateString([], { month: "short", day: "numeric" });
 }
-/**
- * Tick times in [start, end], every `step` seconds on the local clock: hour
- * and day steps are counted in local time, so they stay on whole hours and
- * midnights across a DST change (a day is then 23 or 25 hours).
- */
-function ticksOf(start, end, step) {
-  const out = [];
-  if (step < 3600) {
-    // Sub-hour steps divide an hour, and zone offsets are whole quarter hours.
-    const tzo = new Date(start * 1000).getTimezoneOffset() * 60;
-    for (let t = Math.ceil((start - tzo) / step) * step + tzo; t <= end; t += step) out.push(t);
-    return out;
-  }
-  const d = new Date(start * 1000);
-  d.setMinutes(0, 0, 0);
-  const hours = step / 3600;
-  if (step >= 86400) d.setHours(0);
-  else d.setHours(Math.floor(d.getHours() / hours) * hours);
-  const next = () => (step >= 86400 ? d.setDate(d.getDate() + step / 86400) : d.setHours(d.getHours() + hours));
-  while (d.getTime() / 1000 < start) next();
-  for (; d.getTime() / 1000 <= end; next()) out.push(d.getTime() / 1000);
-  return out;
-}
 function fmtDur(s) {
   s = Math.max(0, Math.round(s));
   if (s < 60) return `${s}s`;
@@ -225,28 +182,8 @@ function hevcSupport() {
   );
 }
 
-const VEIL_HTML = `
-  <div class="veil off">
-    <div class="spin"></div>
-    <ha-icon></ha-icon>
-    <div class="vtext"></div>
-    <div class="vsub"></div>
-    <button data-act="retry">Retry</button>
-  </div>`;
-
-/**
- * Show a veil: kind "loading" (spinner), "empty" (nothing to show here) or
- * "error" (with Retry). Empty text hides it.
- */
-function setVeil(veil, text, kind = "loading", sub = "") {
-  veil.classList.toggle("off", !text);
-  if (!text) return;
-  veil.classList.remove("loading", "empty", "error");
-  veil.classList.add(kind);
-  veil.querySelector("ha-icon").setAttribute("icon", kind === "error" ? "mdi:alert-circle-outline" : "mdi:video-off-outline");
-  veil.querySelector(".vtext").textContent = kind === "loading" ? `${text}…` : text;
-  veil.querySelector(".vsub").textContent = sub;
-}
+// The veil over a cell or the stage (see setVeil); every one can retry.
+const VEIL_HTML = veilHtml(true);
 
 const STYLE = `
   :host { display: block; }
@@ -343,21 +280,7 @@ const STYLE = `
   .still { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000;
     opacity: 0; transition: opacity .2s; pointer-events: none; }
   .still.show { opacity: 1; }
-  .veil { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; align-items: center;
-    justify-content: center; gap: 10px; padding: 16px; text-align: center; color: #fff;
-    background: rgba(0,0,0,.3); backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
-    opacity: 1; visibility: visible; transition: opacity .25s, visibility 0s; }
-  .veil.off { opacity: 0; visibility: hidden; pointer-events: none; transition: opacity .25s, visibility 0s .25s; }
-  .spin { width: 44px; height: 44px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25);
-    border-top-color: #fff; animation: ss-spin .9s linear infinite; }
-  @keyframes ss-spin { to { transform: rotate(360deg); } }
-  .veil ha-icon { --mdc-icon-size: 42px; opacity: .9; }
-  .veil.error ha-icon { color: #ff8a80; }
-  .vtext { font-size: 16px; font-weight: 500; text-shadow: 0 1px 4px rgba(0,0,0,.6); max-width: 90%; }
-  .vsub { font-size: 13px; opacity: .85; font-variant-numeric: tabular-nums; text-shadow: 0 1px 3px rgba(0,0,0,.6); }
-  .vsub:empty { display: none; }
-  .veil button { color: #fff; border-color: rgba(255,255,255,.5); }
-  .veil:not(.loading) .spin, .veil.loading ha-icon, .veil:not(.error) button { display: none; }
+  ${VEIL_CSS}
   .stage.grid .veil { gap: 6px; padding: 8px; }
   .stage.grid .spin { width: 28px; height: 28px; }
   .stage.grid .veil ha-icon { --mdc-icon-size: 28px; }
@@ -413,19 +336,20 @@ const STYLE = `
   .tlbar button.icon { width: 30px; min-width: 30px; height: 30px; }
   .track { position: relative; height: 52px; margin: 4px 12px 10px; touch-action: none; cursor: pointer;
     background: var(--secondary-background-color); border-radius: 6px; user-select: none; }
-  .bars { position: absolute; inset: 0; overflow: hidden; border-radius: 6px; }
+  .bars, .pins { position: absolute; inset: 0; overflow: hidden; border-radius: 6px; }
+  .bars:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
   .rec { position: absolute; top: 20px; height: 12px; background: color-mix(in srgb, var(--primary-color) 45%, transparent); }
   @supports not (background: color-mix(in srgb, red 50%, blue)) { .rec { background: var(--primary-color); opacity: .45; } }
   .tick { position: absolute; bottom: 0; height: 6px; border-left: 1px solid var(--divider-color); }
   .tick span { position: absolute; bottom: 6px; left: 3px; font-size: 10px; color: var(--secondary-text-color); white-space: nowrap; }
   .nowm { position: absolute; top: 0; bottom: 0; border-left: 2px dashed var(--error-color, #db4437); }
   /* Bookmarks: a pin per event in its camera's colour, with a finger-sized hit area. */
-  .bm { position: absolute; top: 3px; height: 14px; min-width: 4px; border-radius: 3px; background: var(--cam);
-    box-shadow: 0 0 0 1px var(--secondary-background-color); z-index: 1; }
+  .bm { position: absolute; top: 3px; height: 14px; min-width: 4px; min-height: 0; padding: 0; border: none;
+    border-radius: 3px; background: var(--cam); box-shadow: 0 0 0 1px var(--secondary-background-color); z-index: 1; }
   .bm::before { content: ""; position: absolute; left: -9px; right: -9px; top: -3px; bottom: -12px; }
   /* Pins closer than a finger: exact hit areas, so taps between them still seek. */
   .track.dense .bm::before { left: -1px; right: -1px; bottom: 0; }
-  .bm:hover { filter: brightness(1.2); }
+  .bm:hover { background: var(--cam); filter: brightness(1.2); }
   .ph { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--primary-text-color); pointer-events: none; z-index: 2; }
   .ph::before { content: ""; position: absolute; top: 0; left: -5px; border: 6px solid transparent; border-top-color: var(--primary-text-color); }
   .hover { position: absolute; top: -26px; transform: translateX(-50%); padding: 1px 6px; border-radius: 4px; z-index: 3;
@@ -641,83 +565,6 @@ const PACE_SETTLE_MS = 1500; // after a change of speed, by when frames come at 
 // master's time exactly would leave it behind, and SS never sends faster than
 // the speed asked for, so behind can't be caught up.
 const FOLLOW_LEAD = 1;
-
-/** Parse one SS stream message: 4-byte header end, query-string header, payload. */
-function readStreamMsg(buf) {
-  const b = new Uint8Array(buf);
-  if (b.length <= 4) return null;
-  const end = ((b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]) >>> 0;
-  const head = {};
-  for (const pair of String.fromCharCode(...b.subarray(4, end)).split("&")) {
-    const i = pair.indexOf("=");
-    if (i > 0) head[pair.slice(0, i)] = pair.slice(i + 1);
-  }
-  return { head, data: b.subarray(end) };
-}
-
-function findBox(buf, tag) {
-  const t = [...tag].map((c) => c.charCodeAt(0));
-  for (let i = 4; i + 4 <= buf.length; i++)
-    if (buf[i] === t[0] && buf[i + 1] === t[1] && buf[i + 2] === t[2] && buf[i + 3] === t[3]) return i;
-  return -1;
-}
-
-/** RFC 6381 codec string from an init segment (moov with hvcC / avcC), or null. */
-function codecOf(moov) {
-  const find = (tag) => findBox(moov, tag);
-  const hex = (n) => n.toString(16).toUpperCase();
-  let i = find("hvcC");
-  if (i > 0) {
-    const c = moov.subarray(i + 4);
-    const space = ["", "A", "B", "C"][c[1] >> 6];
-    const tier = c[1] & 0x20 ? "H" : "L";
-    const profile = c[1] & 0x1f;
-    let compat = ((c[2] << 24) | (c[3] << 16) | (c[4] << 8) | c[5]) >>> 0;
-    let rev = 0; // the flags are written bit-reversed
-    for (let k = 0; k < 32; k++) rev = (rev << 1) | ((compat >>> k) & 1);
-    const cons = [...c.subarray(6, 12)];
-    while (cons.length && !cons.at(-1)) cons.pop();
-    const fourcc = find("hev1") > 0 ? "hev1" : "hvc1";
-    return [fourcc, `${space}${profile}`, hex(rev >>> 0), `${tier}${c[12]}`, ...cons.map(hex)].join(".");
-  }
-  i = find("avcC");
-  if (i > 0) {
-    const c = moov.subarray(i + 4);
-    return "avc1." + [c[1], c[2], c[3]].map((x) => x.toString(16).padStart(2, "0")).join("");
-  }
-  return null;
-}
-
-/** RFC 6381 codec string of an audio init segment's sample entry (AAC's object type from its esds). */
-function audioCodecOf(moov) {
-  const i = findBox(moov, "stsd");
-  if (i < 0) return "mp4a.40.2";
-  const entry = String.fromCharCode(...moov.subarray(i + 16, i + 20));
-  const named = { Opus: "opus", fLaC: "flac", "ac-3": "ac-3", "ec-3": "ec-3", ".mp3": "mp3", ulaw: "ulaw", alaw: "alaw" };
-  if (named[entry]) return named[entry];
-  if (entry !== "mp4a") return entry.trim();
-  // esds: ES_Descriptor (3) > DecoderConfigDescriptor (4): object type, then
-  // DecoderSpecificInfo (5): AAC's audio object type in its first 5 bits.
-  const e = findBox(moov, "esds");
-  if (e < 0) return "mp4a.40.2";
-  let k = e + 8; // past "esds" and version/flags
-  const descriptor = (tag) => {
-    while (k < moov.length && moov[k] !== tag) k++;
-    k++;
-    while (k < moov.length && moov[k] & 0x80) k++; // the length's continuation bytes
-    return ++k < moov.length;
-  };
-  if (!descriptor(0x03)) return "mp4a.40.2";
-  k += 3; // ES_ID, flags
-  if (!descriptor(0x04)) return "mp4a.40.2";
-  const oti = moov[k];
-  if (oti !== 0x40) return `mp4a.${oti.toString(16).padStart(2, "0")}`;
-  k += 13; // object type, stream type, buffer size, bitrates
-  if (!descriptor(0x05)) return "mp4a.40.2";
-  let aot = moov[k] >> 3;
-  if (aot === 31) aot = 32 + (((moov[k] & 7) << 3) | (moov[k + 1] >> 5)); // the escape: 6 more bits
-  return `mp4a.40.${aot || 2}`;
-}
 
 /**
  * One MediaSource + SourceBuffer fed fragment by fragment.
@@ -1123,7 +970,8 @@ class StreamFeed {
     // (frames are at most ~0.15 s of footage apart, times the speed).
     const run = this.run || (last != null && Math.abs(wall - last) > Math.max(1, 0.5 * this.speed));
     this.run = false;
-    this.track.sink.push(data.slice(), { wall, key, run, gen: this.gen });
+    // The view itself, no copy: appendBuffer takes one, and every message has a buffer of its own.
+    this.track.sink.push(data, { wall, key, run, gen: this.gen });
   }
 
   /** A codec string and MIME type the browser takes for this moov, relabelling hev1 as hvc1 if that's what it takes. */
@@ -1312,7 +1160,7 @@ class StreamFeed {
     const sink = a.track.sink;
     if (sink.queue.length >= QUEUE_MAX) sink.dropQueued();
     const last = a.track.map.at(-1);
-    sink.push(data.slice(), { wall, run: !last || Math.abs(wall - last[2]) > 3 });
+    sink.push(data, { wall, run: !last || Math.abs(wall - last[2]) > 3 });
   }
 
   /** Put the sound where the video is (when it has sound for that time). */
@@ -1529,6 +1377,8 @@ class Player {
       this.feed.close();
       this.feed = null;
     }
+    this.windowEvents?.abort();
+    this.windowEvents = null;
     this.mediaReady = false;
     const v = this.video;
     v.pause();
@@ -1668,7 +1518,10 @@ class Player {
       this.setStatus("This browser can't play this video", "error");
       return;
     }
-    v.src = res.url;
+    v.src = card._hass.hassUrl(res.url); // absolute, as the stream's (HA Cast)
+    // This window's listeners go with it (destroyMedia): an error one that
+    // never fired would otherwise stay on the element for every window after.
+    const { signal } = (this.windowEvents = new AbortController());
     v.addEventListener(
       "loadedmetadata",
       () => {
@@ -1676,12 +1529,12 @@ class Player {
         v.currentTime = start;
         if (this.autoplay) v.play().catch(() => {});
       },
-      { once: true }
+      { once: true, signal }
     );
     v.addEventListener(
       "error",
       () => seq === this.seq && this.session === res && this.setStatus("Playback error", "error", this.subline(this.wall())),
-      { once: true }
+      { once: true, signal }
     );
     // A live playlist grows, and may gain a gap: keep the wall-clock mapping
     // up to date with it.
@@ -2180,6 +2033,7 @@ class SSTimelineCard extends HTMLElement {
     window.removeEventListener("location-changed", this._onLocation);
     document.removeEventListener("pointerdown", this._onDocDown);
     this._resizeObs?.disconnect();
+    this._endTrackKeys();
     this._hass?.connection?.removeEventListener?.("ready", this._onReconnect);
     // Whatever state it was in (loading, a gap), pick up there on return.
     if (this._master) {
@@ -2301,15 +2155,18 @@ class SSTimelineCard extends HTMLElement {
     const root = this.shadowRoot;
     const icon = (i) => `<ha-icon icon="${i}"></ha-icon>`;
     const skip = (d, i, cls = "") =>
-      `<button class="icon ${cls}" data-skip="${d}" title="${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s">${icon(i)}</button>`;
+      `<button class="icon ${cls}" data-skip="${d}" ${labelAttrs(`${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s`)}>${icon(i)}</button>`;
+    // Before the cameras are known: the grid (see _buildPlayers).
+    const solo = labelAttrs("One camera (the chips switch it)");
+    const events = prefs.get("events", true);
     root.innerHTML = `
       <style>${STYLE}</style>
       <ha-card>
-        <div class="layout${prefs.get("events", true) ? "" : " noside"}">
+        <div class="layout${events ? "" : " noside"}">
           <div class="main">
             <div class="head">
               <div class="cams"></div>
-              <button class="evtoggle" data-act="events" title="Events">${icon("mdi:bookmark-multiple-outline")}<span class="badge evcount"></span></button>
+              <button class="evtoggle" data-act="events" ${labelAttrs("Events")} aria-pressed="${events}">${icon("mdi:bookmark-multiple-outline")}<span class="badge evcount"></span></button>
             </div>
             <div class="stagebox">
               <div class="stage single nocam">
@@ -2317,48 +2174,49 @@ class SSTimelineCard extends HTMLElement {
                 <div class="livetag" hidden>LIVE</div>
                 <div class="stage-msg">${VEIL_HTML}</div>
                 <div class="fsbar">
-                  <button class="icon" data-act="play" title="Play / pause">${icon("mdi:play")}</button>
+                  <button class="icon" data-act="play" ${labelAttrs("Play")}>${icon("mdi:play")}</button>
                   ${skip(-30, "mdi:rewind-30")}${skip(-10, "mdi:rewind-10")}${skip(10, "mdi:fast-forward-10")}${skip(30, "mdi:fast-forward-30")}
                   <span class="fsclock"></span>
-                  <button class="icon" data-act="solo">${icon("mdi:view-grid-outline")}</button>
-                  <button class="icon" data-act="fs" title="Exit fullscreen">${icon("mdi:fullscreen-exit")}</button>
+                  <button class="icon" data-act="solo" ${solo}>${icon("mdi:view-grid-outline")}</button>
+                  <button class="icon" data-act="fs" ${labelAttrs("Exit fullscreen")}>${icon("mdi:fullscreen-exit")}</button>
                 </div>
               </div>
             </div>
             <div class="warn"></div>
             <div class="controls">
-              <button class="icon" data-act="play" title="Play / pause">${icon("mdi:play")}</button>
+              <button class="icon" data-act="play" ${labelAttrs("Play")}>${icon("mdi:play")}</button>
               ${skip(-30, "mdi:rewind-30", "wide")}${skip(-10, "mdi:rewind-10")}${skip(10, "mdi:fast-forward-10")}${skip(30, "mdi:fast-forward-30", "wide")}
-              <select class="speed" title="Playback speed">
+              <select class="speed" ${labelAttrs("Playback speed")}>
                 ${SPEEDS.map((v) => `<option value="${v}">${v}×</option>`).join("")}
               </select>
-              <button class="live" data-act="live" title="Watch live">${icon("mdi:access-point")}<span class="txt">Live</span></button>
+              <button class="live" data-act="live" ${labelAttrs("Watch live")}>${icon("mdi:access-point")}<span class="txt">Live</span></button>
               <span class="spacer"></span>
               <span class="jumpwrap">
-                <button class="icon" data-act="jump" title="Go to a date and time">${icon("mdi:calendar-clock")}</button>
+                <button class="icon" data-act="jump" ${labelAttrs("Go to a date and time")}>${icon("mdi:calendar-clock")}</button>
                 <span class="jump" hidden>
-                  <input type="datetime-local" step="1" class="when" />
+                  <input type="datetime-local" step="1" class="when" aria-label="Date and time" />
                   <button data-act="go">Go</button>
                 </span>
               </span>
-              <button class="icon" data-act="solo">${icon("mdi:view-grid-outline")}</button>
+              <button class="icon" data-act="solo" ${solo}>${icon("mdi:view-grid-outline")}</button>
               <span class="showwrap">
-                <button class="icon" data-act="shows" title="What's shown on the video">${icon("mdi:eye-outline")}</button>
+                <button class="icon" data-act="shows" ${labelAttrs("What's shown on the video")}>${icon("mdi:eye-outline")}</button>
                 <span class="jump shows" hidden>
                   ${SHOWS.map(([k, label]) => `<button data-show="${k}" aria-pressed="true">${icon("mdi:checkbox-marked")}<span>${label}</span></button>`).join("")}
                 </span>
               </span>
-              <button class="icon" data-act="mute" title="Sound">${icon("mdi:volume-off")}</button>
-              <button class="icon" data-act="fs" title="Fullscreen">${icon("mdi:fullscreen")}</button>
+              <button class="icon" data-act="mute" ${labelAttrs("Sound")} aria-pressed="false">${icon("mdi:volume-off")}</button>
+              <button class="icon" data-act="fs" ${labelAttrs("Fullscreen")}>${icon("mdi:fullscreen")}</button>
             </div>
             <div class="tlbar">
-              <button class="icon" data-act="pan-back" title="Earlier">${icon("mdi:chevron-left")}</button>
+              <button class="icon" data-act="pan-back" ${labelAttrs("Earlier")}>${icon("mdi:chevron-left")}</button>
               <div class="range"></div>
               <div class="spans">${SPANS.map(([v, l]) => `<button data-span="${v}">${l}</button>`).join("")}</div>
-              <button class="icon" data-act="pan-fwd" title="Later">${icon("mdi:chevron-right")}</button>
+              <button class="icon" data-act="pan-fwd" ${labelAttrs("Later")}>${icon("mdi:chevron-right")}</button>
             </div>
             <div class="track">
-              <div class="bars"></div>
+              <div class="bars" role="slider" tabindex="0" aria-label="Timeline"></div>
+              <div class="pins"></div>
               <div class="ph"></div>
               <div class="hover" hidden></div>
             </div>
@@ -2367,12 +2225,12 @@ class SSTimelineCard extends HTMLElement {
             <div class="ev-head">
               <span class="ev-title">Events</span><span class="badge evtotal"></span>
               <span class="spacer"></span>
-              <button class="icon" data-act="events" title="Hide events">${icon("mdi:close")}</button>
+              <button class="icon" data-act="events" ${labelAttrs("Hide events")}>${icon("mdi:close")}</button>
             </div>
             <div class="ev-tools">
               <form class="ev-search" hidden>${icon("mdi:magnify")}<input type="search" enterkeyhint="search" autocomplete="off"
                 placeholder="Search: white car, person with a box…" aria-label="Smart search (Frigate)" /></form>
-              <div class="ev-sq" hidden><span class="t"></span><button type="button" class="icon" data-act="search-close" title="Back to all events">${icon("mdi:close")}</button></div>
+              <div class="ev-sq" hidden><span class="t"></span><button type="button" class="icon" data-act="search-close" ${labelAttrs("Back to all events")}>${icon("mdi:close")}</button></div>
               <div class="ev-kinds" hidden></div>
             </div>
             <div class="ev-list"><div class="ev-items"></div><div class="ev-foot"></div></div>
@@ -2390,6 +2248,7 @@ class SSTimelineCard extends HTMLElement {
     this._stageVeil = $(".stage-msg .veil");
     this._track = $(".track");
     this._bars = $(".bars");
+    this._pins = $(".pins");
     this._ph = $(".ph");
     this._hover = $(".hover");
     this._rangeEl = $(".range");
@@ -2428,8 +2287,12 @@ class SSTimelineCard extends HTMLElement {
     this._stage.addEventListener("pointermove", (e) => e.pointerType === "mouse" && this._wakeFsBar());
 
     // Timeline: drag to scrub, release to seek; a tap on a bookmark pin opens that event.
+    // From the keyboard the bars are a slider (the pins sit in a layer of their
+    // own: a slider's content isn't offered to screen readers), and the pins are buttons.
     const tr = this._track;
+    this._bars.addEventListener("keydown", (e) => this._onTrackKey(e));
     tr.addEventListener("pointerdown", (e) => {
+      this._endTrackKeys();
       tr.setPointerCapture(e.pointerId);
       this._drag = true;
       this._down = { x: e.clientX, bm: e.target.closest("[data-bm]")?.dataset.bm };
@@ -2494,8 +2357,12 @@ class SSTimelineCard extends HTMLElement {
   }
 
   _camColor(id) {
-    const i = this._cameras.findIndex((c) => c.id === id);
-    return CAM_COLORS[(i < 0 ? 0 : i) % CAM_COLORS.length];
+    // Asked for every chip, cell, pin and event row: looked up, not searched for.
+    if (this._camColorsOf !== this._cameras) {
+      this._camColorsOf = this._cameras;
+      this._camColors = new Map(this._cameras.map((c, i) => [c.id, CAM_COLORS[i % CAM_COLORS.length]]));
+    }
+    return this._camColors.get(id) ?? CAM_COLORS[0];
   }
 
   _renderCameras() {
@@ -2552,7 +2419,7 @@ class SSTimelineCard extends HTMLElement {
     this._setMaster(this._cameraId);
     for (const b of this.shadowRoot.querySelectorAll('[data-act="solo"]')) {
       b.hidden = this._cameras.length < 2;
-      b.title = this._grid ? "One camera (the chips switch it)" : "Grid (the chips add and remove cameras)";
+      setLabel(b, this._grid ? "One camera (the chips switch it)" : "Grid (the chips add and remove cameras)");
       b.querySelector("ha-icon").setAttribute("icon", this._grid ? "mdi:square-outline" : "mdi:view-grid-outline");
     }
     return added;
@@ -2625,6 +2492,7 @@ class SSTimelineCard extends HTMLElement {
     if (this._shown.join() !== before.join()) {
       this._recs = [];
       this._bookmarks = [];
+      this._tlAnswer = null;
       this._loadTimeline();
       this._resetEvents();
     }
@@ -2725,8 +2593,9 @@ class SSTimelineCard extends HTMLElement {
 
   _syncPlayIcon() {
     const paused = !this._master?.intendsPlay();
-    for (const i of this.shadowRoot.querySelectorAll('[data-act="play"] ha-icon')) {
-      i.setAttribute("icon", paused ? "mdi:play" : "mdi:pause");
+    for (const b of this.shadowRoot.querySelectorAll('[data-act="play"]')) {
+      b.querySelector("ha-icon").setAttribute("icon", paused ? "mdi:play" : "mdi:pause");
+      setLabel(b, paused ? "Play" : "Pause");
     }
   }
 
@@ -2737,7 +2606,9 @@ class SSTimelineCard extends HTMLElement {
     button?.querySelector("ha-icon")?.setAttribute(
       "icon", unplayable && !muted ? "mdi:volume-variant-off" : muted ? "mdi:volume-off" : "mdi:volume-high"
     );
-    button?.setAttribute("title", unplayable ? `Sound: this browser can't play this camera's audio (${unplayable})` : "Sound");
+    if (!button) return;
+    setLabel(button, unplayable ? `Sound: this browser can't play this camera's audio (${unplayable})` : "Sound");
+    button.setAttribute("aria-pressed", String(!muted));
   }
 
   _applyShows() {
@@ -2824,6 +2695,7 @@ class SSTimelineCard extends HTMLElement {
     if (b.dataset.act === "events") {
       const open = this._layoutEl.classList.toggle("noside") === false;
       prefs.set("events", open);
+      this.shadowRoot.querySelector(".evtoggle").setAttribute("aria-pressed", String(open));
       this._fit();
       return;
     }
@@ -2893,6 +2765,12 @@ class SSTimelineCard extends HTMLElement {
     }
     if (b.dataset.ev) {
       const ev = this._evItems.find((x) => String(x.id) === b.dataset.ev);
+      if (ev) this._jumpToEvent(ev);
+      return;
+    }
+    // A bookmark pin from the keyboard (detail 0); a tap on one is the track's (see _render).
+    if (b.dataset.bm) {
+      const ev = e.detail === 0 && this._bookmarks.find((x) => String(x.id) === b.dataset.bm);
       if (ev) this._jumpToEvent(ev);
       return;
     }
@@ -2989,8 +2867,15 @@ class SSTimelineCard extends HTMLElement {
         ...shown.map((id) => this._ws({ type: "surveillance_station/recordings", camera_id: id, ...q })),
       ]);
       if (seq !== this._tlSeq) return;
-      this._recs = rs.flatMap((r) => r.recordings);
-      this._bookmarks = b.bookmarks;
+      const recs = rs.flatMap((r) => r.recordings);
+      // The same answer (the usual one every LIVE_RECS_MS while live) keeps the
+      // old arrays, so _drawTimeline sees there is nothing new to draw.
+      const answer = JSON.stringify([recs, b.bookmarks]);
+      if (answer !== this._tlAnswer) {
+        this._tlAnswer = answer;
+        this._recs = recs;
+        this._bookmarks = b.bookmarks;
+      }
     } catch (e) {
       // Keep the video usable; say it where the timeline is.
       if (seq === this._tlSeq) {
@@ -3009,11 +2894,42 @@ class SSTimelineCard extends HTMLElement {
     const { start, end } = this._view;
     const span = end - start;
     const now = nowS();
+    const px = Math.max(this._track.clientWidth, 1);
+    this._bars.setAttribute("aria-valuemin", String(Math.floor(start)));
+    this._bars.setAttribute("aria-valuemax", String(Math.ceil(end)));
+    // Bars, pins and ticks are drawn again only when something they show
+    // changed; now counts once it has moved a pixel (a recording in progress
+    // is drawn up to it, and so is the now mark).
+    const drawn = [start, end, px, this._recs, this._bookmarks, this._kindsKey(), this._cameras, hour12,
+      now > end ? null : Math.round(((now - start) / span) * px)];
+    if (!this._tlDrawn?.every((v, i) => v === drawn[i])) {
+      this._tlDrawn = drawn;
+      this._drawBars(start, end, now, px);
+    }
+
+    // Narrow cards get the dates only, as compact as possible ("Sep 18–25").
+    const a = new Date(start * 1000);
+    const z = new Date(end * 1000);
+    const short =
+      fmtDay(start) === fmtDay(end)
+        ? fmtDay(start)
+        : a.getMonth() === z.getMonth()
+          ? `${fmtDay(start)}–${z.getDate()}`
+          : `${fmtDay(start)}–${fmtDay(end)}`;
+    const range = `<span class="long">${fmtDay(start)} ${fmtTime(start, false)} – ${
+      fmtDay(end) === fmtDay(start) ? "" : fmtDay(end) + " "
+    }${fmtTime(end, false)}</span><span class="short">${short}</span>`;
+    if (range !== this._range) this._rangeEl.innerHTML = this._range = range;
+    this._paint(this._currentWall());
+  }
+
+  /** Ticks, recording bars, the now mark and the bookmark pins of the view. */
+  _drawBars(start, end, now, px) {
+    const span = end - start;
     const x = (t) => ((t - start) / span) * 100;
     let html = "";
 
     // Ticks as dense as their labels allow: ~48 px for a time, ~64 px for a date.
-    const px = Math.max(this._track.clientWidth, 1);
     const step =
       TICK_STEPS.find((v) => (v * px) / span >= (v >= 86400 ? 64 : 48)) ?? TICK_STEPS[TICK_STEPS.length - 1];
     for (const t of ticksOf(start, end, step)) {
@@ -3030,36 +2946,28 @@ class SSTimelineCard extends HTMLElement {
       const b = Math.min(x(e), 100);
       html += `<div class="rec" style="left:${a}%;width:${Math.max(b - a, 0.1)}%"></div>`;
     }
+    if (now >= start && now <= end) html += `<div class="nowm" style="left:${x(now)}%" title="Now"></div>`;
+    this._bars.innerHTML = html;
+
+    let pins = "";
     let prev = -Infinity;
     let dense = false;
+    const kindOk = kindTest(this._kinds);
     for (const bm of this._bookmarks) {
-      if (bm.end < start || bm.start > end || !this._kindOk(bm.name)) continue;
+      if (bm.end < start || bm.start > end || !kindOk(bm.name)) continue;
       const at = (x(bm.start) * px) / 100;
       if (at - prev < 20) dense = true;
       prev = at;
       const a = Math.max(x(bm.start), 0);
       const b = Math.min(x(Math.max(bm.end, bm.start)), 100);
       const tip = `${fmtTime(bm.start)} ${this._cameraName(bm.camera_id)}: ${bm.name}${bm.comment ? " — " + bm.comment : ""}`;
-      html += `<div class="bm" data-bm="${bm.id}" style="left:${a}%;width:${Math.max(b - a, 0)}%;--cam:${this._camColor(bm.camera_id)}" title="${esc(tip)}"></div>`;
+      pins += `<button type="button" class="bm" data-bm="${bm.id}" style="left:${a}%;width:${Math.max(b - a, 0)}%;--cam:${this._camColor(bm.camera_id)}" ${labelAttrs(tip)}></button>`;
     }
-    if (now >= start && now <= end) html += `<div class="nowm" style="left:${x(now)}%" title="Now"></div>`;
-    this._bars.innerHTML = html;
+    // A pin that has the keyboard's focus keeps it through the redraw.
+    const focused = this.shadowRoot.activeElement?.dataset?.bm;
+    this._pins.innerHTML = pins;
+    if (focused) this._pins.querySelector(`[data-bm="${focused}"]`)?.focus();
     this._track.classList.toggle("dense", dense);
-
-    // Narrow cards get the dates only, as compact as possible ("Sep 18–25").
-    const a = new Date(start * 1000);
-    const z = new Date(end * 1000);
-    const short =
-      fmtDay(start) === fmtDay(end)
-        ? fmtDay(start)
-        : a.getMonth() === z.getMonth()
-          ? `${fmtDay(start)}–${z.getDate()}`
-          : `${fmtDay(start)}–${fmtDay(end)}`;
-    const range = `<span class="long">${fmtDay(start)} ${fmtTime(start, false)} – ${
-      fmtDay(end) === fmtDay(start) ? "" : fmtDay(end) + " "
-    }${fmtTime(end, false)}</span><span class="short">${short}</span>`;
-    if (range !== this._range) this._rangeEl.innerHTML = this._range = range;
-    this._paint(this._currentWall());
   }
 
   _currentWall() {
@@ -3243,7 +3151,7 @@ class SSTimelineCard extends HTMLElement {
     // "Similar" is offered on Frigate's bookmarks when its search can be asked.
     const similar = (id, comment) =>
       this._searchable && id != null && FRIGATE_REF.test(comment ?? "")
-        ? `<button class="icon sim" data-similar="${id}" title="Find similar">${`<ha-icon icon="mdi:image-search-outline"></ha-icon>`}</button>`
+        ? `<button class="icon sim" data-similar="${id}" ${labelAttrs("Find similar")}>${`<ha-icon icon="mdi:image-search-outline"></ha-icon>`}</button>`
         : "";
     for (const e of s ? this._searchShown() : this._evItems) {
       const d = new Date(e.start * 1000).toDateString();
@@ -3254,7 +3162,8 @@ class SSTimelineCard extends HTMLElement {
         node(`d:${d}:${label}`, `<div class="ev-day">${label}</div>`);
       }
       const dur = e.end > e.start ? fmtDur(e.end - e.start) : "";
-      const thumb = e.thumbnail ? `<img loading="lazy" decoding="async" alt="" src="${esc(e.thumbnail)}">` : "";
+      // HA's own address, as for the stream: on HA Cast the page comes from elsewhere.
+      const thumb = e.thumbnail ? `<img loading="lazy" decoding="async" alt="" src="${esc(this._hass.hassUrl(e.thumbnail))}">` : "";
       const when = s ? `${d === today ? "Today" : d === yesterday ? "Yesterday" : fmtDate(e.start)} ${fmtTime(e.start)}` : fmtTime(e.start);
       const id = s ? e.bookmark_id : e.id;
       node(
@@ -3311,13 +3220,6 @@ class SSTimelineCard extends HTMLElement {
     return [...this._kinds].map((k) => k.toLowerCase()).sort().join();
   }
 
-  /** Whether a bookmark (by its name, "Person, Car") or a result (its kind) is of a kind chosen. */
-  _kindOk(name) {
-    if (!this._kinds.size) return true;
-    const want = new Set([...this._kinds].map((k) => k.toLowerCase()));
-    return String(name ?? "").split(",").some((k) => want.has(k.trim().toLowerCase()));
-  }
-
   _setKinds(kinds) {
     if (!Array.isArray(kinds)) return;
     const key = JSON.stringify(kinds);
@@ -3360,7 +3262,8 @@ class SSTimelineCard extends HTMLElement {
 
   _searchShown() {
     // As the list does, by the bookmark's name ("Person, Car" found by its car is a Person too).
-    return (this._search?.items ?? []).filter((r) => this._kindOk(r.name));
+    const kindOk = kindTest(this._kinds);
+    return (this._search?.items ?? []).filter((r) => kindOk(r.name));
   }
 
   /** Ask Frigate (through the integration): {query} or {bookmark_id} (similar to it). */
@@ -3426,6 +3329,44 @@ class SSTimelineCard extends HTMLElement {
     if (r.top < 0 || r.bottom > window.innerHeight) this._stage.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
+  /** The timeline slider's value (within the view) and what it says (the clock's text). */
+  _sliderAt(t, text) {
+    if (this._bars.getAttribute("aria-valuetext") === text) return;
+    const { start, end } = this._view;
+    this._bars.setAttribute("aria-valuenow", String(Math.round(clamp(t, start, end))));
+    this._bars.setAttribute("aria-valuetext", text);
+  }
+
+  /**
+   * The timeline from the keyboard: see sliderKey (arrows 1 % of the span,
+   * Page Up / Down 10 %, Home / End its ends). The playhead moves at once;
+   * the cameras go there once the keys stop, not on every repeat of a held one.
+   */
+  _onTrackKey(e) {
+    const m = this._master;
+    if (!m) return;
+    const { start, end } = this._view;
+    const from = this._keyAt ?? clamp(m.wall(), start, end);
+    const t = sliderKey(e.key, from, { min: start, max: end, step: (end - start) / 100 });
+    if (t == null) return;
+    e.preventDefault();
+    this._keyAt = null; // _paint shows t, then holds it there
+    this._paint(t);
+    this._keyAt = t;
+    clearTimeout(this._keyTimer);
+    this._keyTimer = setTimeout(() => {
+      this._keyAt = null;
+      const lead = this._master;
+      if (lead) this._seekAll(liveIfRecent(t), lead.intendsPlay());
+    }, 400);
+  }
+
+  /** A pointer on the timeline, or the card leaving: keys still waiting to seek don't. */
+  _endTrackKeys() {
+    clearTimeout(this._keyTimer);
+    this._keyAt = null;
+  }
+
   _timeAt(e) {
     const r = this._track.getBoundingClientRect();
     const f = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
@@ -3447,13 +3388,14 @@ class SSTimelineCard extends HTMLElement {
 
   /** Clock readout + playhead for wall time t. */
   _paint(t) {
-    if (!this._clock || this._drag) return;
+    if (!this._clock || this._drag || this._keyAt != null) return;
     const text = `${fmtDate(t)} · ${fmtTime(t)}`;
     this._clock.textContent = text;
     this._fsClock.textContent = fmtTime(t);
     const { start, end } = this._view;
     this._ph.style.display = t >= start && t <= end ? "" : "none";
     this._ph.style.left = `${((t - start) / (end - start)) * 100}%`;
+    this._sliderAt(t, text);
     const live = this._isLive(t);
     this._liveTag.hidden = !live;
     this.shadowRoot.querySelector(".controls .live")?.classList.toggle("on", live);

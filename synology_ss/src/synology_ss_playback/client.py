@@ -35,6 +35,7 @@ API notes (verified against SS 9.x, see the repo README):
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +52,10 @@ _LOGGER = logging.getLogger(__name__)
 
 # Error codes that mean "log in again and retry" (common DSM Web API codes).
 SESSION_ERRORS = {105, 106, 107, 119}
+# "No permission": also what a stale session can get, so it is retried once
+# like the others; returned again after a fresh login, it is the account's
+# missing permission, and that call isn't retried with a login again.
+PERMISSION_ERROR = 105
 # Not 407 ("IP blocked"): DSM's auto-block expires, the password is fine;
 # but no login is tried for BLOCKED_SECONDS after it.
 AUTH_FAILED_ERRORS = {400, 401, 402, 403, 404, 406, 408, 409, 410}
@@ -81,6 +86,11 @@ DOWNLOAD_ERROR_MAX = 64 * 1024  # of a JSON error reply read
 # SS splits continuous recordings into files of at most this length (the
 # per-camera setting tops out well below it).
 RECORDING_LOOKBACK_SECONDS = 4 * 3600
+# A camera's recording list is shared this long by identical lookups (the card
+# polls each camera every 5 s, per viewer, and thumbnails ask per frame):
+# short next to the ~10 s steps in which SS moves a live recording's end.
+RECORDINGS_CACHE_SECONDS = 2
+RECORDINGS_CACHE_ENTRIES = 64  # lists kept at most (the oldest go first)
 # A freshly opened live socket that sends nothing at all (SS wedged) within
 # this long is given up on rather than held forever.
 LIVE_CONNECT_TIMEOUT_SECONDS = 15
@@ -104,6 +114,11 @@ def _error_code(data: dict[str, Any]) -> Any:
     return error.get("code") if isinstance(error, dict) else None
 
 
+async def _zone(name: str) -> ZoneInfo:
+    """ZoneInfo(name) off the event loop: its first load reads tzdata from disk."""
+    return await asyncio.to_thread(ZoneInfo, name)
+
+
 def _is_hevc(codec: Any) -> bool:
     """SS reports videoCodec as an int (6 = H.265) or, in some calls, a name."""
     if isinstance(codec, int):
@@ -111,7 +126,8 @@ def _is_hevc(codec: Any) -> bool:
     return str(codec or "").upper() in ("H265", "HEVC")
 
 
-# A refused live stream re-logs in at most this often (see open_live).
+# A refused live stream has its session checked (and renewed if that was
+# it) at most this often (see open_live).
 LIVE_RELOGIN_SECONDS = 60
 
 class SSError(Exception):
@@ -218,6 +234,12 @@ class SurveillanceStationClient:
         self._blocked_until = -1.0
         self._tz: ZoneInfo | None = None
         self._live_relogin_at = -LIVE_RELOGIN_SECONDS
+        self._closed = False
+        # (api, method) -> the session that got PERMISSION_ERROR for it right
+        # after logging in again.
+        self._denied: dict[tuple[str, str], str] = {}
+        self._recording_lists: OrderedDict[tuple[int, float, float], tuple[float, list[RecordingInfo]]] = OrderedDict()
+        self._recording_jobs: dict[tuple[int, float, float], asyncio.Future[list[RecordingInfo]]] = {}
         # Called when a re-login is refused at runtime (password changed).
         self.on_auth_failed: Callable[[], None] | None = None
 
@@ -225,16 +247,26 @@ class SurveillanceStationClient:
         """Get a session unless another caller already replaced ``stale_sid``.
 
         Concurrent callers that all saw the same (missing or expired) sid end
-        up with one login between them.
+        up with one login between them. The replaced session is logged out:
+        it may still be valid (a camera SS won't stream, a 105), and DSM
+        keeps every session open until it times out.
         """
+        replaced = await self._login(stale_sid)
+        if replaced is not None:
+            await self._end_session(replaced)
+
+    async def _login(self, stale_sid: str | None) -> str | None:
+        """login(); returns the session it replaced, if any."""
         async with self._login_lock:
+            if self._closed:
+                raise SSError("SYNO.API.Auth", "login", None, "the client is closed")
             if self._auth_failed is not None and _monotonic() - self._auth_failed_at < AUTH_RETRY_SECONDS:
                 # Credentials were refused; retrying on every call would trip
                 # DSM's auto-block for this host within minutes. A successful
                 # reauth reloads the entry with a new client.
                 raise SSAuthError("SYNO.API.Auth", "login", self._auth_failed)
             if self._sid is not None and self._sid != stale_sid:
-                return
+                return None
             if _monotonic() < self._blocked_until:
                 raise SSError("SYNO.API.Auth", "login", BLOCKED_ERROR, "this host is blocked by DSM for now")
             # POST so the password never sits in a URL (URLs end up in
@@ -268,24 +300,37 @@ class SurveillanceStationClient:
             sid = result.get("sid") if isinstance(result, dict) else None
             if not isinstance(sid, str) or not sid:
                 raise SSError("SYNO.API.Auth", "login", None, "answer without a session")
+            if self._closed:
+                # Closed while this login was on its way: its session goes too.
+                await self._end_session(sid)
+                raise SSError("SYNO.API.Auth", "login", None, "the client is closed")
             self._auth_failed = None
-            self._sid = sid
+            replaced, self._sid = self._sid, sid
+            return replaced if replaced != sid else None
 
     async def logout(self) -> None:
         if self._sid is None:
             return
+        await self._end_session(self._sid)
+        self._sid = None
+
+    async def close(self) -> None:
+        """Log out for good: a later call raises SSError instead of logging in again."""
+        self._closed = True
+        await self.logout()
+
+    async def _end_session(self, sid: str) -> None:
         try:
             # Short: an unload (and so a reload) waits for it, and a NAS that
             # is gone would hold it for the full request timeout.
             await self._raw_json(
                 "auth.cgi",
                 {"api": "SYNO.API.Auth", "method": "logout", "version": 6,
-                 "session": "SurveillanceStation", "_sid": self._sid},
+                 "session": "SurveillanceStation", "_sid": sid},
                 timeout=5,
             )
         except SSError:
             pass
-        self._sid = None
 
     async def open_live(
         self, camera_id: int, heartbeat: float = 30, at: float | None = None
@@ -307,8 +352,8 @@ class SurveillanceStationClient:
         ``mdat`` per frame). The client sends ``keepAlive`` every 10 s.
 
         SS answers an unknown or expired sid by closing at once, so a close
-        before any data means: log in again and retry, once. The URL carries
-        the sid and never appears in errors.
+        before any data means: renew the session if it expired, and retry
+        once. The URL carries the sid and never appears in errors.
         """
         base = self._base.removesuffix("/webapi").replace("http", "ws", 1)
         for attempt in (1, 2):
@@ -337,13 +382,16 @@ class SurveillanceStationClient:
                 return ws, first
             await ws.close()
             # Closed before any data: an expired sid, or a camera SS won't
-            # stream (offline, disabled). Log in again at most once a minute,
-            # so a camera that stays refused doesn't mean a DSM login per try.
+            # stream (offline, disabled). A cheap call tells which, renewing
+            # an expired session, so a refused camera never replaces a valid
+            # one; at most once a minute, so it doesn't mean a call per try.
             now = _monotonic()
             if attempt == 2 or now - self._live_relogin_at < LIVE_RELOGIN_SECONDS:
                 break
             self._live_relogin_at = now
-            await self.login(stale_sid=sid)
+            await self._call("SYNO.SurveillanceStation.Info", "GetInfo", 8)
+            if self._sid == sid:
+                break
         raise SSError("ss_webstream_task", "connect", None, f"stream of camera {camera_id} refused")
 
     async def _request(self, path: str, params: dict[str, Any], post: bool, timeout: float) -> tuple[bytes, str]:
@@ -362,12 +410,14 @@ class SurveillanceStationClient:
             raise SSConnectionError(api, method, None, type(err).__name__) from None
 
     async def _raw_json(
-        self, path: str, params: dict[str, Any], post: bool = False, timeout: float = 30
+        self, path: str, params: dict[str, Any], post: bool = False, timeout: float = 30,
+        decode_in_thread: bool = False,
     ) -> dict[str, Any]:
         body, _ = await self._request(path, params, post, timeout)
         api, method = params.get("api", path), params.get("method", "")
         try:
-            data = json.loads(body)
+            # decode_in_thread: an answer large enough to hold the event loop.
+            data = await asyncio.to_thread(json.loads, body) if decode_in_thread else json.loads(body)
         except (ValueError, RecursionError):
             raise SSError(api, method, None, "non-JSON reply") from None
         # Anything but a JSON object (a list, null, a proxy's page) is an
@@ -377,7 +427,9 @@ class SurveillanceStationClient:
             raise SSError(api, method, None, "unexpected reply")
         return data
 
-    async def _call(self, api: str, method: str, version: int, **params: Any) -> dict[str, Any]:
+    async def _call(
+        self, api: str, method: str, version: int, decode_in_thread: bool = False, **params: Any
+    ) -> dict[str, Any]:
         """entry.cgi call with one transparent re-login on session errors."""
         for attempt in (1, 2):
             if self._sid is None:
@@ -386,6 +438,7 @@ class SurveillanceStationClient:
             data = await self._raw_json(
                 "entry.cgi",
                 {"api": api, "method": method, "version": version, "_sid": sid, **params},
+                decode_in_thread=decode_in_thread,
             )
             if data.get("success"):
                 result = data.get("data") or {}
@@ -393,12 +446,26 @@ class SurveillanceStationClient:
                     raise SSError(api, method, None, "unexpected reply")
                 return result
             code = _error_code(data)
-            if code in SESSION_ERRORS and attempt == 1:
+            if attempt == 1 and self._is_session_error(code, api, method, sid):
                 _LOGGER.debug("Session error %s on %s.%s, logging in again", code, api, method)
                 await self.login(stale_sid=sid)
                 continue
+            self._note_refusal(code, api, method, sid)
             raise SSError(api, method, code, data.get("error"))
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _is_session_error(self, code: Any, api: str, method: str, sid: str | None) -> bool:
+        """Whether SS's error code for this call means: log in again and retry."""
+        if code == PERMISSION_ERROR:
+            return self._denied.get((api, method)) != sid
+        return code in SESSION_ERRORS
+
+    def _note_refusal(self, code: Any, api: str, method: str, sid: str | None) -> None:
+        if code == PERMISSION_ERROR and sid is not None:
+            # Refused again after a new login: the account lacks the
+            # permission, which another login won't give (otherwise every
+            # Frigate review would log in again).
+            self._denied[(api, method)] = sid
 
     async def missing_apis(self) -> list[str]:
         """The Web APIs this client needs that the NAS lacks, or has only in older versions (no login needed)."""
@@ -445,10 +512,10 @@ class SurveillanceStationClient:
             self._tz = None
             return info
         try:
-            self._tz = ZoneInfo(info.timezone)
+            self._tz = await _zone(info.timezone)
         except (ZoneInfoNotFoundError, ValueError):
             _LOGGER.warning("Unknown NAS time zone %r, assuming UTC", info.timezone)
-            self._tz = ZoneInfo("UTC")
+            self._tz = await _zone("UTC")
         return info
 
     async def timezone(self) -> ZoneInfo:
@@ -458,7 +525,7 @@ class SurveillanceStationClient:
     async def _timezone(self) -> ZoneInfo:
         if self._tz is None:
             await self.info()
-        return self._tz or ZoneInfo("UTC")
+        return self._tz or await _zone("UTC")
 
     async def cameras(self) -> list[Camera]:
         data = await self._call("SYNO.SurveillanceStation.Camera", "List", 9)
@@ -477,7 +544,35 @@ class SurveillanceStationClient:
         return out
 
     async def recordings(self, camera_id: int, start: int, end: int) -> list[RecordingInfo]:
-        """Recordings of one camera that overlap [start, end], oldest first."""
+        """Recordings of one camera that overlap [start, end], oldest first.
+
+        An answer is reused for RECORDINGS_CACHE_SECONDS by the same lookup,
+        and callers asking for one already on its way share it.
+        """
+        key = (camera_id, start, end)
+        if (hit := self._recording_lists.get(key)) is not None and _monotonic() - hit[0] < RECORDINGS_CACHE_SECONDS:
+            return list(hit[1])
+        if (job := self._recording_jobs.get(key)) is None:
+            job = asyncio.ensure_future(self._list_recordings(*key))
+            self._recording_jobs[key] = job
+            job.add_done_callback(lambda done: self._recordings_listed(key, done))
+        # Shielded: one caller going away doesn't take the others' answer with it.
+        return list(await asyncio.shield(job))
+
+    def _recordings_listed(self, key: tuple[int, float, float], job: asyncio.Future[list[RecordingInfo]]) -> None:
+        del self._recording_jobs[key]
+        if job.cancelled() or job.exception() is not None:
+            return
+        now = _monotonic()
+        self._recording_lists[key] = (now, job.result())
+        self._recording_lists.move_to_end(key)
+        while self._recording_lists and (
+            len(self._recording_lists) > RECORDINGS_CACHE_ENTRIES
+            or now - next(iter(self._recording_lists.values()))[0] >= RECORDINGS_CACHE_SECONDS
+        ):
+            self._recording_lists.popitem(last=False)
+
+    async def _list_recordings(self, camera_id: int, start: int, end: int) -> list[RecordingInfo]:
         out: list[RecordingInfo] = []
         offset = 0
         while True:
@@ -570,15 +665,21 @@ class SurveillanceStationClient:
         if not camera_ids:
             return []
         tz = await self._timezone()
+        # Every bookmark in one answer (tens of thousands, some NASes): its
+        # JSON, two ISO times each and the sort would hold the event loop.
         data = await self._call(
-            "SYNO.SurveillanceStation.ThirdParty.Bookmark", "List", 1,
+            "SYNO.SurveillanceStation.ThirdParty.Bookmark", "List", 1, decode_in_thread=True,
             camIds=",".join(str(int(c)) for c in camera_ids),
         )
+        return await asyncio.to_thread(self._parse_bookmark_list, data, tz)
+
+    @staticmethod
+    def _parse_bookmark_list(data: dict[str, Any], tz: ZoneInfo) -> list[Bookmark]:
         out = []
         for b in _items(data, "bookmarks"):
             # One odd entry must not hide all the others.
             try:
-                out.append(self._parse_bookmark(b, int(b["camId"]), tz))
+                out.append(SurveillanceStationClient._parse_bookmark(b, int(b["camId"]), tz))
             except _BAD_ITEM:
                 _LOGGER.debug("Skipping a bookmark SS lists as %r", b)
         out.sort(key=lambda b: (b.start, b.id), reverse=True)
@@ -663,10 +764,12 @@ class SurveillanceStationClient:
             if not isinstance(err, dict):
                 err = {}
             code = _error_code(err)
-            if code in SESSION_ERRORS and attempt == 1:
+            api, method = "SYNO.SurveillanceStation.Recording", "Download"
+            if attempt == 1 and self._is_session_error(code, api, method, sid):
                 await self.login(stale_sid=sid)
                 continue
-            raise SSError("SYNO.SurveillanceStation.Recording", "Download", code, err.get("error"))
+            self._note_refusal(code, api, method, sid)
+            raise SSError(api, method, code, err.get("error"))
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def download_to(
@@ -725,9 +828,10 @@ class SurveillanceStationClient:
             if not isinstance(err, dict):
                 err = {}
             code = _error_code(err)
-            if code in SESSION_ERRORS and attempt == 1:
+            if attempt == 1 and self._is_session_error(code, api, method, sid):
                 await self.login(stale_sid=sid)
                 continue
+            self._note_refusal(code, api, method, sid)
             raise SSError(api, method, code, err.get("error"))
         raise AssertionError("unreachable")  # pragma: no cover
 

@@ -14,16 +14,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: home-assistant/actions/hassfest@master
+      # Pinned, as hacs/action below: both track a branch, and a push there would change CI unseen.
+      - uses: home-assistant/actions/hassfest@06749dd8c0b54f350bc69c8752456cee498808a3 # master
 
   hacs:
     name: HACS
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: hacs/action@main
+      - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa # main
         with:
           category: integration
+
+  cards:
+    name: cards (node --test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # No npm install: the cards and their tests have no dependencies.
+      - run: for f in custom_components/surveillance_station/frontend/*.js; do node --check "$f"; done
+      - run: node --test "tests/js/*.test.mjs"
 
   test:
     name: pytest (Python 3.14)

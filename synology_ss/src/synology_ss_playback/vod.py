@@ -24,11 +24,14 @@ SEGMENT_SECONDS = 10
 LIVE_MARGIN_SECONDS = 5
 # Anything shorter than this at the edge of a recording is not worth a segment.
 MIN_SEGMENT_SECONDS = 1.0
+# A live playlist's target duration can't change as it grows (RFC 8216), so
+# it is the longest a segment can get: one a sliver was folded into.
+LIVE_TARGET_SECONDS = math.ceil(SEGMENT_SECONDS + MIN_SEGMENT_SECONDS)
 # Two segments further apart than this are separated by a discontinuity.
 GAP_TOLERANCE_SECONDS = 0.5
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Recording:
     """One Surveillance Station recording file (wall-clock seconds)."""
 
@@ -40,7 +43,7 @@ class Recording:
     hevc: bool = True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Segment:
     """One HLS segment: a slice of a single recording."""
 
@@ -56,7 +59,7 @@ class Segment:
     hevc: bool = True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Run:
     """A stretch of the playlist that maps linearly to wall-clock time."""
 
@@ -164,21 +167,26 @@ def _pdt(ts: float) -> str:
     )
 
 
-def render_playlist(segments: list[Segment], live: bool = False) -> str:
+def render_playlist(segments: list[Segment], live: bool = False, event: bool = False) -> str:
     """Render an HLS v7 media playlist with fMP4 segments.
 
     ``live`` renders an EVENT playlist without ENDLIST, which players re-fetch
-    to pick up appended segments; otherwise a closed VOD playlist.
+    to pick up appended segments; ``event`` the same playlist once it has
+    stopped growing (ENDLIST appended, nothing else changed: RFC 8216 lets an
+    EVENT playlist only grow); otherwise a closed VOD playlist.
     URIs are relative to the playlist: ``init/<index>.mp4`` (the init
     segment derived from segment <index>) and ``seg/<index>.m4s``.
     """
+    event = event or live
     target = max((math.ceil(s.duration) for s in segments), default=SEGMENT_SECONDS)
+    if event:
+        target = max(target, LIVE_TARGET_SECONDS)
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         f"#EXT-X-TARGETDURATION:{target}",
         "#EXT-X-MEDIA-SEQUENCE:0",
-        f"#EXT-X-PLAYLIST-TYPE:{'EVENT' if live else 'VOD'}",
+        f"#EXT-X-PLAYLIST-TYPE:{'EVENT' if event else 'VOD'}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
     ]
     for seg in segments:
@@ -196,7 +204,8 @@ def render_playlist(segments: list[Segment], live: bool = False) -> str:
 
 
 def iter_boxes(data: bytes):
-    """Yield (type, bytes) for each top-level ISO BMFF box."""
+    """Yield (type, memoryview) for each top-level ISO BMFF box (views: no copies)."""
+    data = memoryview(data)
     i = 0
     n = len(data)
     while i + 8 <= n:
@@ -215,14 +224,15 @@ def iter_boxes(data: bytes):
 
 def split_fmp4(data: bytes) -> tuple[bytes, bytes]:
     """Split ffmpeg's fragmented MP4 output into (init, media) parts."""
-    init = bytearray()
-    media = bytearray()
+    init: list[memoryview] = []
+    media: list[memoryview] = []
     for typ, box in iter_boxes(data):
         if typ in ("ftyp", "moov"):
-            init += box
+            init.append(box)
         elif typ in ("styp", "moof", "mdat", "sidx", "prft"):
-            media += box
-    return bytes(init), bytes(media)
+            media.append(box)
+    # One copy of each box, into its part (a segment is several MB).
+    return b"".join(init), b"".join(media)
 
 
 def ffmpeg_remux_args(

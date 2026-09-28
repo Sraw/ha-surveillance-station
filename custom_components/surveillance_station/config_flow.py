@@ -25,6 +25,7 @@ from yarl import URL
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_SSL, CONF_USERNAME
 from homeassistant.core import callback
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
     NumberSelector,
@@ -62,8 +63,10 @@ _LOGGER = logging.getLogger(__name__)
 SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): str,
-        vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
-        vol.Required(CONF_SSL, default=False): bool,
+        vol.Required(CONF_PORT, default=DEFAULT_PORT): cv.port,
+        # HTTPS, unverified (DSM ships a self-signed certificate): the password
+        # and session id still don't cross the LAN in the clear.
+        vol.Required(CONF_SSL, default=True): bool,
         vol.Required(CONF_VERIFY_SSL, default=False): bool,
         vol.Required(CONF_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,

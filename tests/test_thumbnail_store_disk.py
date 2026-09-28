@@ -20,7 +20,9 @@ def _os_like(**overrides: MagicMock) -> MagicMock:
     """A stand-in for the ``os`` module, scoped to thumbnail_store's own
     reference to it (patched in with patch.object(ts_mod, "os", ...) below):
     real (wraps the actual module) except for the given overrides, so it
-    can't affect anything else in the process still using the real module."""
+    can't affect anything else in the process still using the real module.
+    Only for what a real file system can't be made to do here: the tests run
+    as root, whom utime and unlink never refuse."""
     return MagicMock(wraps=os, **overrides)
 
 
@@ -28,9 +30,9 @@ async def test_scan_skips_an_unreadable_root(
     hass: HomeAssistant, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A root that exists but can't be listed (not just missing) is a warning, not a crash."""
-    store = ThumbnailStore(hass, str(tmp_path), 1000)
-    with patch.object(ts_mod, "os", _os_like(listdir=MagicMock(side_effect=PermissionError("denied")))):
-        await store.load()
+    (tmp_path / "root").write_bytes(b"a file, not a directory")
+    store = ThumbnailStore(hass, str(tmp_path / "root"), 1000)
+    await store.load()
     assert len(store) == 0
     assert "Can't read the thumbnail cache" in caplog.text
 
@@ -59,22 +61,14 @@ async def test_scan_ignores_entries_that_are_not_thumbnails(hass: HomeAssistant,
 
 
 async def test_scan_skips_a_file_it_cannot_stat(hass: HomeAssistant, tmp_path: Path) -> None:
-    """A file that vanishes between scandir() and stat() (a race) is skipped."""
+    """A file that can't be stat()ed (it vanished after scandir(); here a dangling link) is skipped."""
     entry = tmp_path / "E"
     (entry / "6").mkdir(parents=True)
-    (entry / "6" / "1.jpg").write_bytes(b"x")
-
-    class BadEntry:
-        name = "1.jpg"
-        path = str(entry / "6" / "1.jpg")
-
-        def stat(self):
-            raise OSError("gone")
-
-    with patch.object(ts_mod, "os", _os_like(scandir=MagicMock(return_value=[BadEntry()]))):
-        store = ThumbnailStore(hass, str(tmp_path), 1000)
-        await store.load()
-    assert len(store) == 0
+    (entry / "6" / "1.jpg").symlink_to(tmp_path / "gone.jpg")
+    (entry / "6" / "2.jpg").write_bytes(b"x")
+    store = ThumbnailStore(hass, str(tmp_path), 1000)
+    await store.load()
+    assert len(store) == 1
 
 
 async def test_read_ignores_a_failure_to_update_the_access_time(hass: HomeAssistant, tmp_path: Path) -> None:
@@ -116,6 +110,14 @@ async def test_write_failure_when_the_temp_file_cleanup_also_fails(
         await store.settle()
     assert len(store) == 0
     assert "Can't keep thumbnails" in caplog.text
+
+
+async def test_kept_for_this_user_only(hass: HomeAssistant, tmp_path: Path) -> None:
+    """Camera frames: not readable by other users of the host."""
+    store = ThumbnailStore(hass, str(tmp_path), 1000)
+    store.put(("E", 6, 1), b"data")
+    await store.settle()
+    assert (tmp_path / "E" / "6" / "1.jpg").stat().st_mode & 0o077 == 0
 
 
 def test_unlink_swallows_a_missing_or_locked_file(tmp_path: Path) -> None:

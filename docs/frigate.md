@@ -27,9 +27,12 @@ How it works:
   second step maps each SS camera to its Frigate camera(s). An unmatched one
   is logged once.
 - `new`: bookmark from the review's start, named after its objects
-  ("Person, Car", "Animal"); its end is open (30 s, or up to now) until `end`
+  ("Person, Car", "Animal"); its end is open (30 s, or up to now; for a
+  message that waited out an SS outage, up to when it came) until `end`
   sets it. `update`: renamed as objects are added; a review that only now
   has an object of interest (a bicycle, then a person) is bookmarked then.
+  A bookmark deleted in SS while its review goes on is made again by the
+  review's next message.
   The comment ("Frigate alert [frigate <review id>]") names the review, so
   one that ends after a restart still finds its bookmark. Zones are left
   out of it (only some cameras have them; they are in the event).
@@ -140,7 +143,8 @@ broker down, NAS unreachable at runtime and during HA's start):
   for 30 minutes (DSM's auto-block); DSM blocking the host (407) is not a
   wrong password: no login for a minute, then again.
 - A problem lasting 10 minutes becomes an issue in **Settings → Repairs**,
-  gone by itself once it clears: MQTT not available, bookmarks failing
+  gone by itself once it clears: MQTT not available (at start, or its
+  broker lost later), bookmarks failing
   (checked again every minute) or refused by SS (for more than one review,
   until one is made again),
   Frigate offline (its `<prefix>/available`).

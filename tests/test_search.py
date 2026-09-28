@@ -156,6 +156,44 @@ async def test_which_bookmark(hass: HomeAssistant, bridge: FrigateBridge, hass_w
         assert [r["key"] for r in msg["result"]["results"]] == ["b22"]
 
 
+class Counted:
+    """A bookmark that counts how often any bookmark's camera is looked at."""
+
+    reads = 0
+
+    def __init__(self, bookmark: Bookmark) -> None:
+        self._bookmark = bookmark
+
+    def __getattr__(self, name: str):
+        if name == "camera_id":
+            Counted.reads += 1
+        return getattr(self._bookmark, name)
+
+
+async def test_many_bookmarks(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
+    """Thousands of bookmarks: each result's bookmark is found without going through all of them
+    once per result; one begun long before an object (the camera's longest) still found."""
+    marks = [
+        Bookmark(id=1000 + i, camera_id=6 if i % 2 else 7, name="Car", comment=f"Frigate alert [frigate m{i}]",
+                 start=T0 + 20_000 + 60 * i, end=T0 + 20_010 + 60 * i)
+        for i in range(2000)
+    ]
+    long = Bookmark(id=999, camera_id=6, name="Car", comment="Frigate alert [frigate long]", start=T0 - 5000, end=T0 + 30_500)
+    listed = [Counted(b) for b in [*bridge.client.list_bookmarks.return_value, long, *marks]]
+    bridge.client.list_bookmarks.return_value = listed
+    aioclient_mock.get(f"{F}/api/events/search", json=[
+        *(obj(f"o{i}", start=T0 + 100 + i / 10, end=T0 + 105) for i in range(60)),  # all of b21
+        obj("x", start=T0 + 20_035, end=T0 + 20_045),  # between two short ones: the long one
+    ])
+    # The event list's index is built once per fetch of the list, whoever asks; counted
+    # here is what the search itself does with it.
+    await hass.data[DATA_MANAGER].bookmarks(bridge.entry_id, bridge.client)
+    Counted.reads = 0
+    msg = await ask(hass, hass_ws_client, query="car")
+    assert [r["key"] for r in msg["result"]["results"]] == ["b21", "b999"]
+    assert Counted.reads < 2 * len(listed)  # not 61 results x 2000 bookmarks
+
+
 async def test_empty_answer_asked_again(hass: HomeAssistant, bridge: FrigateBridge, hass_ws_client, aioclient_mock) -> None:
     """Frigate answering nothing (another client's search at the same time): asked once more."""
     answers = iter([[], [obj("o1")]])

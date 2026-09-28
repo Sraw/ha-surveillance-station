@@ -87,6 +87,26 @@ async def test_relay(
     assert (await client.get(url)).status == HTTPStatus.NOT_FOUND  # used up
 
 
+async def test_relay_is_not_compressed(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """Browsers offer permessage-deflate; video doesn't deflate, so it is declined."""
+    upstream = FakeUpstream([])
+    mock_client.open_live = AsyncMock(
+        return_value=(upstream, aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, _msg("vdoCodec=H265"), None))
+    )
+    url = await _live_url(hass, hass_ws_client)
+    client = await hass_client_no_auth()
+    async with client.ws_connect(url, compress=15) as ws:
+        await ws.receive_bytes()
+        assert ws.compress == 0
+        await upstream.close()
+
+
 async def test_entry_unloaded_between_token_and_connect(
     hass: HomeAssistant,
     setup_integration: MockConfigEntry,

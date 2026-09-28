@@ -8,11 +8,14 @@
 |---|---|
 | `synology_ss/` | The protocol library **`synology-ss-playback`** (no HA imports, own `pyproject.toml` and tests; published on [PyPI](https://pypi.org/project/synology-ss-playback/)): the SS Web API client (session renewal on 105/106/107/119, SS info, cameras, recordings, bookmarks, `Recording.Download` range cuts, time-lapse files), the 10 s segment planner and playlist renderer, `fetch_segment` (download + ffmpeg remux + fMP4 split), and for time-lapse the day planner (`plan_day`) and `fetch_timelapse_segment` (streamed download + transcode) |
 | `custom_components/surveillance_station/` | The integration, a thin layer over the library: config flow (user / reauth / reconfigure, unique ID = NAS serial), `entry.runtime_data` = the logged-in client, diagnostics (including the Frigate bridge: subscribed?, review messages (several per review) and how each ended — ignored by reason, dropped, failed, or bookmarked then announced / not announced — queue, failing now, last error) |
+| `…/errors.py` | The WebSocket commands' own refusals (entry not loaded, session gone: `not_found`; bad input: `invalid_format`), so that any other error reaches HA's handler and is logged |
+| `…/bookmarks.py` | The bookmark list indexed once per fetch (by camera, kinds and start) for the event list's pages and kind chips |
 | `…/views.py` | The stream relay `/api/surveillance_station/live/<token>` (live and recordings); HLS VOD endpoints `/api/surveillance_station/vod/<token>/…` for browsers without MSE: playback sessions, the byte-bounded segment cache, the fetch queue; the bookmark cache; event thumbnails `/api/surveillance_station/thumbnail/…` |
 | `…/frigate.py` | Optional: Frigate review items (MQTT) as SS bookmarks, and a `surveillance_station_detection` event per new one (see *Frigate detections*); with a Frigate URL, the notification image and the Frigate bookmarks' thumbnails (Frigate's snapshots, `/api/surveillance_station/frigate_image/…`) |
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE), `/timelapse_days`, `/timelapse` (a time-lapse session: one camera, one day) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 | `…/frontend/ss-timelapse-card.js` | `custom:ss-timelapse-card`, loaded by the timeline card (same version, no resource of its own) |
+| `…/frontend/ss-common.js` | What the two cards share: MSE and the MP4 init-segment parsers, SS's stream message parser, the timeline ticks, the veil, control labels, per-viewer preferences. Each card imports it with its own `?v=` version query, so a release never mixes a new card with a stale cached copy |
 
 ## Deploying a checkout
 
@@ -40,13 +43,17 @@ synology-ss-playback`.
 ```
 scripts/test.sh            # all tests, in a Python 3.14 container
 scripts/test.sh -k reauth  # extra pytest arguments
+node --test "tests/js/*.test.mjs"   # the cards' pure helpers (Node 22+, nothing to install)
 ```
 
 `.github/workflows/ci.yml` runs the same suite on push to `main` and on pull
 request (plain Python 3.14 via `actions/setup-python`, not the local
 container - a GitHub-hosted runner doesn't need the memory/time cap
 `scripts/test.sh` uses to protect the dev host), plus `hassfest` and the HACS
-integration check. Coverage must clear 95% separately for
+integration check (both pinned to a commit), and for the cards (job `cards`)
+`node --check` on each file and the `tests/js` tests: codec strings from real-shaped init
+segments (a wrong one fails `addSourceBuffer`), stream messages, DST-day
+ticks, the slider keys, preferences. Coverage must clear 95% separately for
 `custom_components/surveillance_station` and for
 `synology_ss/src/synology_ss_playback` (`coverage report --include=... --fail-under=95`,
 once per package) - a single pooled number could hide one package dragging
@@ -73,14 +80,20 @@ the card were verified against a live HA 2026.9 + SS setup:
   container on a headless Weston with the Intel GPU's render node, since
   `--headless` can't use hardware decode): `tests/browser/run.sh <scenario>.mjs`
   against a running HA, with the card served from the checkout (see the
-  script's header; `npm install` in `tests/browser` first). Covered: live; jumps (buffered,
+  script's header; `npm install` in `tests/browser` first). Every scenario
+  prints `FAIL` for a check that failed and exits 1. Covered: live; jumps (buffered,
   over the socket, from live); a recording-file boundary; 1/2/4/8x; pause
   (SS paused by flow control) and resume; the 4-camera grid in step after
   jumps, speed changes, pause and a master change; a follower's 72-minute gap
   and a gap the master lands in; gaps all cameras share; a 29 s hole inside a
   recording file (bridged in ~1.5 s); sound kept within ~0.1 s of the video;
   the no-MSE path (native HLS) on a phone-sized viewport; the live timeline
-  scrolling with the present.
+  scrolling with the present; races (a follower made master while it holds
+  its first frame; Live, a past time, Live again before anything landed);
+  notification deep links; grid / one-camera modes and the overlay menu;
+  the event list beside and under the video, kind chips, smart search;
+  audio the browser refuses; the time-lapse card (first frame, seeks, veil,
+  zoom, pan and skips, also on a phone).
 
 ## Surveillance Station API notes (verified on SS 9.x, DSM 7)
 
@@ -147,7 +160,8 @@ the card were verified against a live HA 2026.9 + SS setup:
   `startTime`/`endTime` filters are unusable: they act at day granularity with
   the boundaries in the wrong place (a 14:25-15:00 window on a day with
   bookmarks at 14:28 and 14:47 returns none). So the integration fetches the
-  full list (cached 15 s) and filters and pages it itself. The undocumented
+  full list (cached 60 s, dropped at once when HA makes or changes a
+  bookmark) and filters and pages it itself. The undocumented
   `Recording.Bookmark.ListBookmark` v1 does page properly (`start`/`limit`),
   but isn't used.
 - A thumbnail is `Recording.Download` of 1.5 s at the moment plus one ffmpeg

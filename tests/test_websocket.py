@@ -3,6 +3,7 @@
 from http import HTTPStatus
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator, WebSocketGenerator
 from synology_ss_playback import Bookmark, RecordingInfo, SSConnectionError, SSError
@@ -71,7 +72,7 @@ async def test_no_entry_id_and_nothing_loaded(hass: HomeAssistant, hass_ws_clien
     await ws.send_json_auto_id({"type": "surveillance_station/cameras"})
     msg = await ws.receive_json()
     assert not msg["success"]
-    assert msg["error"]["code"] == "invalid_format"
+    assert msg["error"] == {"code": "not_found", "message": "no Surveillance Station is set up"}
 
 
 async def test_unknown_entry_id(
@@ -81,7 +82,41 @@ async def test_unknown_entry_id(
     await ws.send_json_auto_id({"type": "surveillance_station/cameras", "entry_id": "not-a-real-entry-id"})
     msg = await ws.receive_json()
     assert not msg["success"]
-    assert msg["error"]["code"] == "invalid_format"
+    assert msg["error"] == {"code": "not_found", "message": "Surveillance Station entry not-a-real-entry-id is not loaded"}
+
+
+async def test_a_bug_is_not_reported_as_bad_input(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A KeyError from the code (or the library) reaches HA's handler, which logs it."""
+    mock_client.cameras.side_effect = KeyError("newName")
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/cameras"})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "unknown_error"
+    assert "Error handling message" in caplog.text and "KeyError: 'newName'" in caplog.text
+
+
+async def test_a_value_error_from_a_bug_is_not_invalid_format(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Only the commands' own refusals (InvalidRequest) are invalid_format; any other ValueError is logged."""
+    mock_client.recordings.side_effect = ValueError("invalid literal for int()")
+    ws = await hass_ws_client(hass)
+    await ws.send_json_auto_id({"type": "surveillance_station/recordings", "camera_id": 6, "start": T0, "end": T0 + 60})
+    msg = await ws.receive_json()
+    assert not msg["success"]
+    assert msg["error"]["code"] == "unknown_error"
+    assert "Error handling message" in caplog.text and "ValueError: invalid literal for int()" in caplog.text
 
 
 async def test_generic_ss_error_is_reported_verbatim(
@@ -103,6 +138,18 @@ async def test_invalid_range(hass: HomeAssistant, setup_integration: MockConfigE
     msg = await ws.receive_json()
     assert not msg["success"]
     assert msg["error"]["code"] == "invalid_format"
+
+
+@pytest.mark.parametrize("bad", ["inf", "-inf", "1e999", "nan", -1])
+async def test_times_must_be_epoch_seconds(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator, bad: str | int
+) -> None:
+    """Refused as bad input (vol.Coerce(float) alone takes "inf", and int() of it raises OverflowError)."""
+    ws = await hass_ws_client(hass)
+    for kind, extra in (("recordings", {"camera_id": 6}), ("vod", {"camera_id": 6}), ("bookmarks", {})):
+        for times in ({"start": bad, "end": T0}, {"start": T0, "end": bad}):
+            await ws.send_json_auto_id({"type": f"surveillance_station/{kind}", **extra, **times})
+            assert (await ws.receive_json())["error"]["code"] == "invalid_format", (kind, times)
 
 
 async def test_vod_playlist_and_segments(
@@ -169,6 +216,52 @@ async def test_vod_no_recordings_in_window_returns_no_url(
     assert msg["result"] == {"url": None, "runs": [], "start": float(T0), "end": float(T0 + 60), "live": False}
 
 
+async def test_vod_live_window(
+    hass: HomeAssistant,
+    setup_integration: MockConfigEntry,
+    mock_client: MagicMock,
+    hass_ws_client: WebSocketGenerator,
+    hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """A window reaching the present is live: from a whole second, up to the live edge (not
+    to now, nor to the end asked for), a playlist that grows."""
+    now = T0 + 3600.7  # the live edge: the last 10 s grid line 5 s behind, T0 + 3590
+
+    def recording(end: float) -> list[RecordingInfo]:
+        return [RecordingInfo(id=101, camera_id=6, start=T0 + 1800, end=end, mount_id=1, live=True, hevc=True)]
+
+    mock_client.recordings.return_value = recording(now)
+    ws = await hass_ws_client(hass)
+    client = await hass_client_no_auth()
+    with patch("custom_components.surveillance_station.websocket.time.time") as clock:
+        clock.return_value = now
+        await ws.send_json_auto_id(
+            {"type": "surveillance_station/vod", "camera_id": 6, "start": T0 + 3500.4, "end": T0 + 3700}
+        )
+        res = (await ws.receive_json())["result"]
+        assert (res["live"], res["start"], res["end"]) == (True, T0 + 3500, T0 + 3590)
+        assert res["runs"] == [{"wall_start": T0 + 3500, "media_start": 0.0, "duration": 90.0}]
+        playlist = await (await client.get(res["url"])).text()
+        assert "#EXT-X-PLAYLIST-TYPE:EVENT" in playlist and "#EXT-X-ENDLIST" not in playlist
+        assert playlist.count("#EXTINF:") == 9
+
+        # 20 s later: two more segments, though the end asked for is still ahead.
+        clock.return_value = now + 20
+        mock_client.recordings.return_value = recording(now + 20)
+        playlist = await (await client.get(res["url"])).text()
+        assert playlist.count("#EXTINF:") == 11
+        token = res["url"].rsplit("/", 2)[1]
+        await ws.send_json_auto_id({"type": "surveillance_station/vod_runs", "token": token})
+        assert (await ws.receive_json())["result"]["runs"][0]["duration"] == 110.0
+
+        # Starting over a day ago: never live, and a day long at most.
+        await ws.send_json_auto_id(
+            {"type": "surveillance_station/vod", "camera_id": 6, "start": now - 90_000, "end": now}
+        )
+        res = (await ws.receive_json())["result"]
+        assert (res["live"], res["start"], res["end"]) == (False, T0 - 86_400, T0)
+
+
 async def test_vod_runs(
     hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
 ) -> None:
@@ -182,6 +275,14 @@ async def test_vod_runs(
     assert msg["success"]
     assert msg["result"]["runs"] == created["runs"]
 
+    # As the card sends it when its config names the entry.
+    await ws.send_json_auto_id(
+        {"type": "surveillance_station/vod_runs", "token": token, "entry_id": setup_integration.entry_id}
+    )
+    msg = await ws.receive_json()
+    assert msg["success"]
+    assert msg["result"]["runs"] == created["runs"]
+
 
 async def test_vod_runs_unknown_token(
     hass: HomeAssistant, setup_integration: MockConfigEntry, hass_ws_client: WebSocketGenerator
@@ -190,7 +291,7 @@ async def test_vod_runs_unknown_token(
     await ws.send_json_auto_id({"type": "surveillance_station/vod_runs", "token": "not-a-real-token"})
     msg = await ws.receive_json()
     assert not msg["success"]
-    assert msg["error"]["code"] == "invalid_format"
+    assert msg["error"] == {"code": "not_found", "message": "playback session expired"}
 
 
 async def test_sessions_dropped_on_unload(

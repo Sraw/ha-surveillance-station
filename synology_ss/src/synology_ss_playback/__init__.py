@@ -13,6 +13,7 @@ from .client import (
     TimelapseRecording,
 )
 from .segment import (
+    FFmpegError,
     drain_transcodes,
     fetch_segment,
     fetch_snapshot,
@@ -46,6 +47,7 @@ __all__ = [
     "OTP_ERRORS",
     "Bookmark",
     "Camera",
+    "FFmpegError",
     "Recording",
     "RecordingInfo",
     "Run",

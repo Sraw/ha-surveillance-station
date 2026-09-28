@@ -7,7 +7,13 @@ from pytest_homeassistant_custom_component.components.diagnostics import get_dia
 from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 from synology_ss_playback import SSConnectionError, SSError
 
-from custom_components.surveillance_station.const import CONF_FRIGATE, CONF_FRIGATE_TOPIC, DOMAIN
+from custom_components.surveillance_station.const import (
+    CONF_FRIGATE,
+    CONF_FRIGATE_LINK,
+    CONF_FRIGATE_TOPIC,
+    CONF_FRIGATE_URL,
+    DOMAIN,
+)
 from homeassistant.core import HomeAssistant
 
 
@@ -16,7 +22,7 @@ async def test_diagnostics(
 ) -> None:
     diag = await get_diagnostics_for_config_entry(hass, hass_client, setup_integration)
     text = str(diag)
-    for secret in ("secret", "ha-ss", "192.0.2.10", "2360TESTSERIAL"):
+    for secret in ("secret", "ha-ss", "192.0.2.10", "2360TESTSERIAL", "The-NAS"):
         assert secret not in text
     assert diag["entry"]["data"]["password"] == "**REDACTED**"
     assert diag["surveillance_station"]["info"]["version"] == "9.3.0-12143"
@@ -30,13 +36,17 @@ async def test_diagnostics_with_frigate(
 ) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN, data=mock_config_entry.data, unique_id=mock_config_entry.unique_id,
-        options={CONF_FRIGATE: True, CONF_FRIGATE_TOPIC: "nvr"},
+        options={
+            CONF_FRIGATE: True, CONF_FRIGATE_TOPIC: "nvr",
+            CONF_FRIGATE_URL: "http://frigate.lan:5000", CONF_FRIGATE_LINK: "/cameras-at-home/playback",
+        },
     )
     entry.add_to_hass(hass)
     with patch("custom_components.surveillance_station.frigate.FrigateBridge.start", AsyncMock(return_value=True)):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     diag = await get_diagnostics_for_config_entry(hass, hass_client, entry)
+    assert "frigate.lan" not in str(diag) and "cameras-at-home" not in str(diag)
     assert diag["frigate"]["topic"] == "nvr/reviews"
     assert diag["frigate"]["messages"] == 0 and diag["frigate"]["ignored"] == {}
     assert diag["frigate"]["last_error"] is None

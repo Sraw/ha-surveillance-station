@@ -23,10 +23,21 @@ async def test_setup_and_unload(hass: HomeAssistant, setup_integration: MockConf
     assert entry.state is ConfigEntryState.LOADED
     assert entry.runtime_data is mock_client
 
+    mock_client.close = AsyncMock()
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.NOT_LOADED
-    mock_client.logout.assert_awaited_once()
+    # Closed, not just logged out: nothing still running can log it in again.
+    mock_client.close.assert_awaited_once()
+    mock_client.logout.assert_not_awaited()
+
+
+async def test_unload_survives_a_failing_close(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, mock_client: MagicMock
+) -> None:
+    mock_client.close = AsyncMock(side_effect=RuntimeError("session closed"))
+    assert await hass.config_entries.async_unload(setup_integration.entry_id)
+    assert setup_integration.state is ConfigEntryState.NOT_LOADED
 
 
 async def test_card_registered_as_resource(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
@@ -219,10 +230,11 @@ async def test_removing_the_last_entry_in_yaml_mode_lovelace(
     and returns, leaving the (YAML-mode) card resource it set up alone."""
     resources = hass.data[LOVELACE_DATA].resources
     before = resources.async_items()
-    with patch.object(ss, "_storage_resources", return_value=None) as storage_resources:
+    assert len(before) == 1
+    with patch.object(ss, "_storage_resources", return_value=None):
         assert await hass.config_entries.async_remove(setup_integration.entry_id)
         await hass.async_block_till_done()
-    storage_resources.assert_called_once_with(hass)
+    assert hass.config_entries.async_entries(DOMAIN) == []
     assert resources.async_items() == before
 
 
@@ -237,3 +249,14 @@ def test_card_version_is_the_integrations() -> None:
     assert re.search(r'const CARD_VERSION = "([^"]+)"', card).group(1) == json.loads(
         (here / "manifest.json").read_text()
     )["version"]
+
+
+def test_cards_import_the_shared_module_with_their_version() -> None:
+    """ss-common.js ships with the cards, and each asks for it with its own version query
+    (a missing file, or a stale cached copy, breaks both cards)."""
+    here = Path(__file__).parent.parent / "custom_components/surveillance_station/frontend"
+    assert (here / "ss-common.js").is_file()
+    assert "import(new URL(`./ss-common.js?v=${CARD_VERSION}`" in (here / "ss-timeline-card.js").read_text()
+    assert "import(new URL(`./ss-common.js${new URL(import.meta.url).search}`" in (
+        here / "ss-timelapse-card.js"
+    ).read_text()

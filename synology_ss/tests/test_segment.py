@@ -11,12 +11,13 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from synology_ss_playback import RecordingInfo, SSError, Segment
+from synology_ss_playback import FFmpegError, RecordingInfo, SSError, Segment
 from synology_ss_playback import segment as seg_mod
 
 
@@ -238,3 +239,112 @@ async def test_run_ffmpeg_scratch_write_error_is_an_sserror() -> None:
     with patch.object(seg_mod, "_write_and_close", side_effect=OSError(28, "No space left on device")):
         with pytest.raises(SSError, match="OSError"):
             await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg"], 5)
+
+
+async def test_run_ffmpeg_errors_are_ffmpeg_errors() -> None:
+    """Local failures, not a Surveillance Station call; still SSErrors for callers."""
+    assert issubclass(FFmpegError, SSError)
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=_proc(1, err=b"bad input"))):
+        with pytest.raises(FFmpegError):
+            await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5)
+
+
+# --- the remux scratch file ---
+
+
+@pytest.fixture
+def scratch_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    return tmp_path
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def _hung() -> MagicMock:
+    proc = _proc(None)
+
+    async def hang():
+        await asyncio.sleep(10)
+
+    proc.communicate = hang
+    return proc
+
+
+@pytest.mark.parametrize(
+    ("proc", "error"), [(_proc(0, b"out"), None), (_proc(1, err=b"bad input"), "bad input"), (_hung(), "timed out")]
+)
+async def test_scratch_file_is_deleted_whatever_ffmpeg_did(scratch_dir: Path, proc: MagicMock, error: str | None) -> None:
+    seen = []
+
+    def args(src: str) -> list[str]:
+        seen.append((src, Path(src).read_bytes()))
+        return ["ffmpeg", src]
+
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)):
+        if error is None:
+            assert await seg_mod._run_ffmpeg("ffmpeg", b"raw", args, timeout=0.05) == b"out"
+        else:
+            with pytest.raises(FFmpegError, match=error):
+                await seg_mod._run_ffmpeg("ffmpeg", b"raw", args, timeout=0.05)
+    assert seen == [(seen[0][0], b"raw")] and Path(seen[0][0]).parent == scratch_dir
+    assert list(scratch_dir.iterdir()) == []
+
+
+async def test_scratch_file_is_made_off_the_event_loop(scratch_dir: Path) -> None:
+    made_on = []
+    real = tempfile.mkstemp
+
+    def mkstemp(**kwargs):
+        made_on.append(threading.get_ident())
+        return real(**kwargs)
+
+    with patch.object(seg_mod.tempfile, "mkstemp", side_effect=mkstemp), patch.object(
+        seg_mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=_proc(0, b"out"))
+    ):
+        await seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5)
+    assert made_on and threading.get_ident() not in made_on
+
+
+async def test_caller_gone_while_the_scratch_file_is_written(scratch_dir: Path) -> None:
+    """Neither its descriptor nor the file outlives the cancelled remux."""
+    writing, go_on = threading.Event(), threading.Event()
+    real = seg_mod._write_and_close
+
+    def slow_write(fd: int, data: bytes) -> None:
+        writing.set()
+        go_on.wait(5)
+        real(fd, data)
+
+    fds = _open_fds()
+    with patch.object(seg_mod, "_write_and_close", side_effect=slow_write), patch.object(
+        seg_mod.asyncio, "create_subprocess_exec", AsyncMock()
+    ) as spawn:
+        task = asyncio.create_task(seg_mod._run_ffmpeg("ffmpeg", b"raw", lambda src: ["ffmpeg", src], timeout=5))
+        while not writing.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        go_on.set()
+        for _ in range(500):
+            if not list(scratch_dir.iterdir()):
+                break
+            await asyncio.sleep(0.01)
+    assert list(scratch_dir.iterdir()) == []
+    assert _open_fds() == fds
+    spawn.assert_not_awaited()
+
+
+async def test_fetch_snapshot_of_a_recording_the_caller_found() -> None:
+    """thumbnail_when_recorded has just listed them: not listed again."""
+    now = time.time()
+    rec = RecordingInfo(id=1, camera_id=6, start=now - 100, end=now - 10, mount_id=2, live=False, hevc=True)
+    client = MagicMock()
+    client.recordings = AsyncMock()
+    client.download = AsyncMock(return_value=b"raw")
+    with patch.object(seg_mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=_proc(0, b"\xff\xd8"))):
+        assert await seg_mod.fetch_snapshot(client, 6, now - 50, "ffmpeg", recording=rec) == b"\xff\xd8"
+    client.recordings.assert_not_awaited()
+    assert client.download.await_args.args[:3] == (1, 2, 50000)

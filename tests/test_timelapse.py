@@ -139,7 +139,6 @@ async def test_session_playlist_and_segments(
     _, seg_arg, _, spec = fetch.await_args.args
     assert (seg_arg.recording_id, seg_arg.offset_ms, seg_arg.media_start) == (2, 0, 270.0)
     assert spec == TranscodeSpec("hevc", True, True, 1280, 712)
-    assert fetch.await_args.kwargs["gpu"] is hass.data[DATA_MANAGER]._gpu
     assert hass.data[DATA_MANAGER].stats()["timelapse_transcoded"] == 1
 
 
@@ -170,22 +169,30 @@ async def test_session_on_the_cpu_by_choice(
     timelapse.assert_not_awaited()  # the GPU isn't even checked
 
 
+@pytest.mark.parametrize(
+    ("found", "error"),
+    [
+        (True, None),
+        (False, "not_supported"),  # no GPU: no time-lapse rather than the CPU
+        (None, "gpu_busy"),  # busy, not missing: try again
+    ],
+)
 async def test_session_gpu_only(
-    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
+    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator,
+    found: bool | None, error: str | None,
 ) -> None:
     _transcoder(hass, setup_integration, "gpu")
+    timelapse.return_value = found
     msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
-    assert msg["result"]["codec"] == "hevc" and msg["result"]["hardware"] is True
-    hass.data[DATA_MANAGER]._hardware = None
-    timelapse.return_value = False  # no GPU: no time-lapse rather than the CPU
-    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
-    assert not msg["success"] and msg["error"]["code"] == "not_supported" and "GPU only" in msg["error"]["message"]
-    hass.data[DATA_MANAGER]._hardware = None
-    timelapse.return_value = None  # busy, not missing: try again
-    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22")
-    assert msg["error"]["code"] == "gpu_busy"
-    msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
-    assert msg["success"] and msg["result"]["hardware"] is None
+    if error is None:
+        assert msg["result"]["codec"] == "hevc" and msg["result"]["hardware"] is True
+    else:
+        assert not msg["success"] and msg["error"]["code"] == error
+    if found is False:
+        assert "GPU only" in msg["error"]["message"]
+    if found is None:
+        msg = await _ws(hass, hass_ws_client, type="surveillance_station/timelapse_days")
+        assert msg["success"] and msg["result"]["hardware"] is None
 
 
 async def test_session_nothing_that_day(
@@ -229,12 +236,11 @@ async def test_superseded_while_queued_is_gone(
 ) -> None:
     first = (await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22"))["result"]
     base = first["url"].rsplit("/", 1)[0]
-    manager = hass.data[DATA_MANAGER]
     gate = asyncio.Event()
-    started = asyncio.Event()
+    started: list[int] = []
 
-    async def slow(*args, **kwargs):
-        started.set()
+    async def slow(client, seg, *args, **kwargs):
+        started.append(seg.index)
         await gate.wait()
         return b"i", b"m"
 
@@ -242,8 +248,7 @@ async def test_superseded_while_queued_is_gone(
     with patch(FETCH, AsyncMock(side_effect=slow)):
         # Fill the transcode slots, then queue one more behind them.
         busy = [asyncio.create_task(client.get(f"{base}/seg/{i}.m4s")) for i in range(3)]
-        await started.wait()
-        while not manager._transcode_sem.locked():
+        while len(started) < 3:
             await asyncio.sleep(0.01)
         queued = asyncio.create_task(client.get(f"{base}/seg/10.m4s"))
         await asyncio.sleep(0.05)
@@ -345,3 +350,104 @@ async def test_running_transcodes_are_drained_on_stop(
         hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
         await hass.async_block_till_done()
     drain.assert_awaited_once()
+
+
+def _like_the_library(transcoding: asyncio.Event, started: list[int], on_gpu: list[int]):
+    """fetch_timelapse_segment's shape: download, then the transcode under the GPU lock,
+    shielded (it finishes whoever leaves) and freeing the lock when it ends."""
+
+    async def fetch(client, seg, ffmpeg, spec, gpu):
+        started.append(seg.index)
+        await gpu.acquire()
+        on_gpu.append(seg.index)
+
+        async def transcode() -> tuple[bytes, bytes]:
+            try:
+                await transcoding.wait()
+            finally:
+                gpu.release()
+            return b"i", b"m%d" % seg.index
+
+        return await asyncio.shield(asyncio.ensure_future(transcode()))
+
+    return fetch
+
+
+async def _timelapse_session(hass: HomeAssistant, hass_ws_client: WebSocketGenerator):
+    res = (await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22"))["result"]
+    return hass.data[DATA_MANAGER].get_session(res["url"].rsplit("/", 2)[1])
+
+
+async def test_one_transcode_at_a_time_on_the_gpu(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
+) -> None:
+    session = await _timelapse_session(hass, hass_ws_client)
+    manager = hass.data[DATA_MANAGER]
+    transcoding = asyncio.Event()
+    started: list[int] = []
+    on_gpu: list[int] = []
+    with patch(FETCH, AsyncMock(side_effect=_like_the_library(transcoding, started, on_gpu))):
+        jobs = [asyncio.create_task(manager.fetch(session, s)) for s in session.segments[:3]]
+        while len(started) < 3:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert len(on_gpu) == 1  # three cuts downloaded, one of them on the GPU
+        transcoding.set()
+        await asyncio.gather(*jobs)
+    assert sorted(on_gpu) == [0, 1, 2]
+
+
+async def test_running_transcode_keeps_its_slot_and_result(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse, hass_ws_client: WebSocketGenerator
+) -> None:
+    """Left by everyone while on the GPU: the transcode goes on (and holds its cut), so no
+    other download starts in its place, and what it made is kept."""
+    session = await _timelapse_session(hass, hass_ws_client)
+    manager = hass.data[DATA_MANAGER]
+    transcoding = asyncio.Event()
+    started: list[int] = []
+    on_gpu: list[int] = []
+    fetch = AsyncMock(side_effect=_like_the_library(transcoding, started, on_gpu))
+    with patch(FETCH, fetch):
+        first = asyncio.create_task(manager.fetch(session, session.segments[0]))
+        while not on_gpu:
+            await asyncio.sleep(0.01)
+        first.cancel()
+        others = [asyncio.create_task(manager.fetch(session, s)) for s in session.segments[1:4]]
+        await asyncio.sleep(0.05)
+        assert started == [0, 1, 2]  # MAX_PARALLEL_TRANSCODES, the first one's still among them
+        transcoding.set()
+        await asyncio.gather(*others)
+        assert started == [0, 1, 2, 3]
+        assert await manager.fetch(session, session.segments[0]) == (b"i", b"m0")
+    assert fetch.await_count == 4
+
+
+async def test_segments_answer_home_assistant_cast(
+    hass: HomeAssistant, setup_integration: MockConfigEntry, timelapse,
+    hass_ws_client: WebSocketGenerator, hass_client_no_auth: ClientSessionGenerator,
+) -> None:
+    """The card on HA Cast fetches from another origin: CORS as HA's http integration
+    allows it (Cast by default), no other origin."""
+    res = (await _ws(hass, hass_ws_client, type="surveillance_station/timelapse", camera_id=6, date="2026-09-22"))["result"]
+    base = res["url"].rsplit("/", 1)[0]
+    client = await hass_client_no_auth()
+    cast = "https://cast.home-assistant.io"
+    with patch(FETCH, AsyncMock(return_value=(b"init", b"media"))):
+        for path in ("seg/0.m4s", "init/0.mp4"):
+            resp = await client.get(f"{base}/{path}", headers={"Origin": cast})
+            assert resp.status == HTTPStatus.OK and resp.headers["Access-Control-Allow-Origin"] == cast
+            resp = await client.get(f"{base}/{path}", headers={"Origin": "https://example.com"})
+            assert "Access-Control-Allow-Origin" not in resp.headers
+
+
+async def test_timelapse_lists_per_entry(hass: HomeAssistant, setup_integration: MockConfigEntry) -> None:
+    """One NAS that hangs listing its files holds up only its own time-lapse."""
+    manager = hass.data[DATA_MANAGER]
+    hung, fine = MagicMock(), MagicMock()
+    hung.timelapse_recordings = AsyncMock(side_effect=lambda: asyncio.Event().wait())
+    fine.timelapse_recordings = AsyncMock(return_value=list(FILES))
+    stuck = asyncio.create_task(manager.timelapse_files("A", hung))
+    await asyncio.sleep(0.01)
+    assert await asyncio.wait_for(manager.timelapse_files("B", fine), 1) == FILES
+    stuck.cancel()

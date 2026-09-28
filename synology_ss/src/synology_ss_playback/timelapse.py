@@ -372,11 +372,22 @@ async def hardware_transcode_available(ffmpeg: str, timeout: float = 20) -> bool
     except TimeoutError:
         # SIGTERM first: SIGKILLing QSV sessions mid-way hung an iGPU (see
         # segment.fetch_timelapse_segment), and a check times out when it's busy.
-        proc.terminate()
-        try:
-            async with asyncio.timeout(CHECK_TERM_GRACE_SECONDS):
-                await proc.wait()
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
+        await _stop_check(proc)
         return None
+    except BaseException:
+        # Its caller gone (an unload, HA stopping): not left running for the
+        # loop's teardown to SIGKILL.
+        await asyncio.shield(_stop_check(proc))
+        raise
+
+
+async def _stop_check(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.terminate()
+        async with asyncio.timeout(CHECK_TERM_GRACE_SECONDS):
+            await proc.wait()
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+    except ProcessLookupError:
+        pass

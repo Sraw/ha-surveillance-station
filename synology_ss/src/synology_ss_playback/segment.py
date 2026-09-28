@@ -37,6 +37,13 @@ _NICE = shutil.which("nice")
 SNAPSHOT_WIDTH = 320
 
 
+class FFmpegError(SSError):
+    """ffmpeg (or its scratch file) failed here: not a Surveillance Station call.
+
+    An SSError, so callers that handle a failed segment keep handling it.
+    """
+
+
 def recordings_from(infos: Iterable[RecordingInfo]) -> list[Recording]:
     """What the planner needs from the client's recording list."""
     return [Recording(r.id, r.start, r.end, r.mount_id, r.live, r.hevc) for r in infos]
@@ -58,7 +65,7 @@ async def fetch_segment(
     data = await _remux(ffmpeg, raw, seg, timeout, client.nas)
     init, media = split_fmp4(data)
     if not init or not media:
-        raise SSError("remux", "split", None, f"empty output for segment {seg.index}")
+        raise FFmpegError("remux", "split", None, f"empty output for segment {seg.index}")
     _LOGGER.debug(
         "segment %s rec=%s off=%sms dur=%.1fs: download %.2fs (%d KB), remux %.2fs",
         seg.index, seg.recording_id, seg.offset_ms, seg.duration,
@@ -80,7 +87,7 @@ async def _remux(ffmpeg: str, raw: bytes, seg: Segment, timeout: float, nas: str
             return await _run_ffmpeg(
                 ffmpeg, raw, lambda src: ffmpeg_remux_args(ffmpeg, src, seg.duration, seg.media_start, seg.hevc), timeout
             )
-        except SSError as err:
+        except FFmpegError as err:
             # An audio codec MP4 can't carry (G.711, G.726: many cameras'
             # default): the video without it rather than nothing.
             if err.method != "run" or err.code is None or not _AUDIO_REFUSED.search(str(err)):
@@ -100,26 +107,26 @@ async def _run_ffmpeg(
     ffmpeg: str, raw: bytes, args: Callable[[str], list[str]], timeout: float
 ) -> bytes:
     """Run ffmpeg on a downloaded cut (via a scratch file; see module docstring)."""
-    # A full /tmp or a missing ffmpeg is an SSError like any other failure
+    # A full /tmp or a missing ffmpeg is an FFmpegError like any other failure
     # here, so callers answer 502 and keep going rather than crash.
+    made = asyncio.ensure_future(asyncio.to_thread(_scratch_file, raw))
     try:
-        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
-    except OSError as err:
-        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
+        # The file is made, written and closed in one thread, which a caller
+        # going away can't stop: its file is deleted once it's there.
+        path = await asyncio.shield(made)
+    except asyncio.CancelledError:
+        made.add_done_callback(_discard_scratch_file)
+        raise
     try:
-        try:
-            await asyncio.to_thread(_write_and_close, fd, raw)
-        except OSError as err:
-            raise SSError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
         return await _exec_ffmpeg(args(path), timeout)
     finally:
-        await asyncio.to_thread(_unlink, path)
+        await asyncio.shield(asyncio.to_thread(_unlink, path))
 
 
 async def _exec_ffmpeg(
     argv: list[str], timeout: float, pass_fds: tuple[int, ...] = (), gentle: bool = False
 ) -> bytes:
-    """Run ffmpeg to completion and return its stdout; any failure is an SSError.
+    """Run ffmpeg to completion and return its stdout; any failure is an FFmpegError.
 
     ``gentle``: stop it (timeout, cancellation) with SIGTERM first, which
     lets ffmpeg close its codecs, and SIGKILL only if it hasn't gone in
@@ -138,14 +145,14 @@ async def _exec_ffmpeg(
                 pass_fds=pass_fds,
             )
         except OSError as err:
-            raise SSError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
+            raise FFmpegError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
         try:
             async with asyncio.timeout(timeout):
                 out, err = await proc.communicate()
         except TimeoutError:
-            raise SSError("ffmpeg", "run", None, "timed out") from None
+            raise FFmpegError("ffmpeg", "run", None, "timed out") from None
         if proc.returncode != 0:
-            raise SSError("ffmpeg", "run", proc.returncode, err.decode(errors="replace")[-400:])
+            raise FFmpegError("ffmpeg", "run", proc.returncode, err.decode(errors="replace")[-400:])
         return out
     finally:
         if proc is not None and proc.returncode is None:
@@ -201,7 +208,8 @@ async def fetch_timelapse_segment(
     stops one with SIGTERM before SIGKILL.
 
     An H.265 cut goes to the GPU without its broken frames (see
-    timelapse.broken_frames): one of those hangs it.
+    timelapse.broken_frames): one of those hangs it. A cut whose frames
+    can't be read doesn't go at all.
     """
     if gpu is None and spec.hardware:
         gpu = _DEFAULT_GPU
@@ -209,7 +217,7 @@ async def fetch_timelapse_segment(
     try:
         fd = os.memfd_create("ss_timelapse", os.MFD_CLOEXEC)
     except (AttributeError, OSError) as err:
-        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
+        raise FFmpegError("ffmpeg", "scratch file", None, type(err).__name__) from None
     cut = _Cut(fd)
     try:
         size = await client.download_to(
@@ -246,7 +254,7 @@ async def fetch_timelapse_segment(
         data = await job
     init, media = split_fmp4(data)
     if not init or not media:
-        raise SSError("transcode", "split", None, f"empty output for segment {seg.index}")
+        raise FFmpegError("transcode", "split", None, f"empty output for segment {seg.index}")
     _LOGGER.debug(
         "time-lapse segment %s rec=%s off=%sms dur=%.0fs: download %.2fs (%d MB), transcode %.2fs (%d KB, %s%s)",
         seg.index, seg.recording_id, seg.offset_ms, seg.duration, fetched - started, size >> 20,
@@ -277,14 +285,17 @@ async def _drop_broken_frames(ffmpeg: str, cut: _Cut, seg: Segment, timeout: flo
     The frame before stays on screen for a dropped one (a 30th of a second of
     video) and the rest keep their timestamps; a dropped first or last frame
     leaves the segment that much short. The re-muxed cut must hold exactly
-    the frames that were kept - otherwise it doesn't go to the GPU. Holds the
-    cut twice in memory meanwhile.
+    the frames that were kept - otherwise it doesn't go to the GPU, and
+    neither does a cut whose frames can't be read at all (nothing checked).
+    Holds the cut twice in memory meanwhile.
     """
     def reader(fd: int) -> Callable[[int, int], bytes]:
         return lambda offset, n: os.pread(fd, n, offset)
 
     frames = slice_types(reader(cut.fd), os.fstat(cut.fd).st_size)
-    drop = broken_frames(frames or [])
+    if not frames:
+        raise FFmpegError("ffmpeg", "check frames", None, "the cut's H.265 frames can't be read")
+    drop = broken_frames(frames)
     if not drop:
         return
     _LOGGER.info(
@@ -294,7 +305,7 @@ async def _drop_broken_frames(ffmpeg: str, cut: _Cut, seg: Segment, timeout: flo
     try:
         out = os.memfd_create("ss_timelapse", os.MFD_CLOEXEC)
     except OSError as err:
-        raise SSError("ffmpeg", "scratch file", None, type(err).__name__) from None
+        raise FFmpegError("ffmpeg", "scratch file", None, type(err).__name__) from None
     expr = "+".join(f"eq(n\\,{i})" for i in drop)
     argv = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-i", f"/proc/self/fd/{cut.fd}",
@@ -311,7 +322,7 @@ async def _drop_broken_frames(ffmpeg: str, cut: _Cut, seg: Segment, timeout: flo
     dropped = set(drop)
     kept = [f for i, f in enumerate(frames) if i not in dropped]
     if slice_types(reader(out), os.fstat(out).st_size) != kept:
-        raise SSError("ffmpeg", "drop frames", None, f"the re-muxed cut isn't the {len(kept)} frames kept")
+        raise FFmpegError("ffmpeg", "drop frames", None, f"the re-muxed cut isn't the {len(kept)} frames kept")
 
 
 async def _transcode(argv: list[str], cut: _Cut, timeout: float, hardware: bool) -> bytes:
@@ -338,19 +349,19 @@ async def fetch_snapshot(
     ffmpeg: str,
     width: int = SNAPSHOT_WIDTH,
     timeout: float = REMUX_TIMEOUT_SECONDS,
+    recording: RecordingInfo | None = None,
 ) -> bytes | None:
     """A JPEG of what the camera recorded at wall time t, or None if nothing was.
+
+    ``recording``: the one holding t, if the caller has already found it
+    (the recordings aren't listed again).
 
     SS cuts whole seconds, from the keyframe at or before the offset, so the
     frame is up to one GOP early (a second with a 1 s I-frame interval); the
     cut carries no finer time to correct by.
     """
-    now = time.time()
-    for rec in await client.recordings(camera_id, int(t) - 1, int(t) + 1):
-        end = now if rec.live else rec.end
-        if rec.start <= t < end:
-            break
-    else:
+    rec = recording or _recording_at(await client.recordings(camera_id, int(t) - 1, int(t) + 1), t)
+    if rec is None:
         return None
     raw = await client.download(rec.id, rec.mount_id, int((t - rec.start) * 1000), 1500)
     jpg = await _run_ffmpeg(
@@ -367,6 +378,15 @@ async def fetch_snapshot(
     return jpg or None
 
 
+def _recording_at(recordings: list[RecordingInfo], t: float) -> RecordingInfo | None:
+    now = time.time()
+    for rec in recordings:
+        end = now if rec.live else rec.end
+        if rec.start <= t < end:
+            return rec
+    return None
+
+
 def remove_stale_temp_files() -> int:
     """Delete scratch files a crash (or a killed process) left behind.
 
@@ -381,6 +401,26 @@ def remove_stale_temp_files() -> int:
         except OSError:
             pass
     return removed
+
+
+def _scratch_file(data: bytes) -> str:
+    """A new scratch file holding data (blocking: run it in a thread)."""
+    try:
+        fd, path = tempfile.mkstemp(prefix=TEMP_PREFIX, suffix=".mp4")
+    except OSError as err:
+        raise FFmpegError("ffmpeg", "scratch file", None, type(err).__name__) from None
+    try:
+        _write_and_close(fd, data)
+    except OSError as err:
+        _unlink(path)
+        raise FFmpegError("ffmpeg", "start", None, f"{type(err).__name__}: {err.strerror}") from None
+    return path
+
+
+def _discard_scratch_file(made: asyncio.Future[str]) -> None:
+    """Delete the scratch file made for a caller that has gone."""
+    if not made.cancelled() and made.exception() is None:
+        made.get_loop().run_in_executor(None, _unlink, made.result())
 
 
 def _write_and_close(fd: int, data: bytes) -> None:

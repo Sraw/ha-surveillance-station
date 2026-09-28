@@ -18,6 +18,13 @@ camera and one time window, and expires 4 hours after its last use (at most
 config entry. Login is a POST, and errors are rebuilt without request URLs, so
 neither the password nor the SS session id reaches logs or browsers.
 
+HA talks to DSM over HTTPS (port 5001) by default, without checking the
+certificate, since DSM ships a self-signed one: the password and the session
+id are encrypted on the network, though a machine that can intercept the
+traffic between HA and the NAS could pose as the NAS. Turn on *Verify SSL
+certificate* once DSM has a certificate HA trusts. An entry set up over HTTP
+(port 5000) keeps it, and sends both in the clear; reconfigure it to switch.
+
 Event thumbnail URLs (`/api/surveillance_station/thumbnail/…`) work the same
 way, since an `<img>` can't send a header either: the WebSocket hands out URLs
 carrying an expiry (the end of the next UTC day) and an HMAC-SHA256 of the

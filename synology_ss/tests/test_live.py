@@ -1,6 +1,7 @@
 """SurveillanceStationClient.open_live: re-login on refusal, errors without the sid."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -20,9 +21,35 @@ def _ws(first):
     return ws
 
 
-def _client(sockets):
+class _Ctx:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _answers(*codes):
+    """What SS answers the session check (Info.GetInfo) with, in turn: an error code, or None for success."""
+    it = iter(codes)
+
+    def request(method, url, **kwargs):
+        code = next(it)
+        body = {"success": True, "data": {"serial": "S"}} if code is None else {"success": False, "error": {"code": code}}
+        resp = MagicMock(status=200, headers={"Content-Type": "application/json"})
+        resp.read = AsyncMock(return_value=json.dumps(body).encode())
+        return _Ctx(resp)
+
+    return MagicMock(side_effect=request)
+
+
+def _client(sockets, checks=()):
     session = MagicMock()
     session.ws_connect = AsyncMock(side_effect=sockets)
+    session.request = _answers(*checks)
     client = SurveillanceStationClient(session, "nas", 5000, False, "u", "p")
     sids = iter(["sid1", "sid2", "sid3"])
 
@@ -49,20 +76,23 @@ async def test_playback_from_a_time() -> None:
 
 async def test_expired_sid_logs_in_again_once() -> None:
     refused, ok = _ws(CLOSED), _ws(DATA)
-    client, session = _client([refused, ok])
+    client, session = _client([refused, ok], checks=[119, None])  # the check renews the session
     assert (await client.open_live(10))[0] is ok
     refused.close.assert_awaited()
     assert client.login.await_count == 2
     assert "_sid=sid2" in session.ws_connect.await_args.args[0]
 
 
-async def test_refused_camera_logs_in_at_most_once_a_minute() -> None:
-    client, _ = _client([_ws(CLOSED) for _ in range(4)])
+async def test_refused_camera_never_replaces_a_valid_session() -> None:
+    """An offline camera with a valid sid: no new DSM session (the old one would stay open)."""
+    client, session = _client([_ws(CLOSED) for _ in range(2)], checks=[None])
     for _ in range(2):
         with pytest.raises(SSError, match="refused"):
             await client.open_live(99)
-    # First try: log in, retry, give up. Second try (within the minute): no login.
-    assert client.login.await_count == 2
+    # First try: the session checked, fine, given up. Second (within the minute): not even checked.
+    assert client.login.await_count == 1
+    assert session.request.call_count == 1
+    assert session.ws_connect.await_count == 2
 
 
 async def test_errors_never_carry_the_sid() -> None:

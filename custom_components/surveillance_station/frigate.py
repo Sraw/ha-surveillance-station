@@ -90,6 +90,7 @@ from .const import (
     FRIGATE_QUIET_KINDS,
     FRIGATE_SNAPSHOT_SETTLE_SECONDS,
     FRIGATE_SNAPSHOT_TRIES,
+    FRIGATE_THUMB_CACHE_BYTES,
     FRIGATE_THUMB_HEIGHT,
     FRIGATE_THUMB_PARALLEL,
     FRIGATE_TRACKED_MAX,
@@ -105,7 +106,9 @@ DATA_FRIGATE: HassKey[dict[str, FrigateBridge]] = HassKey(f"{DOMAIN}_frigate")
 # Patchable in tests (time.monotonic itself is the event loop's clock).
 _monotonic = time.monotonic
 
-_REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]")
+# At the comment's end, as _find looks for it: nothing earlier in a comment
+# (a severity off MQTT) can name another review.
+_REVIEW_ID = re.compile(r"\[frigate ([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]\Z")
 
 
 def name_kinds(name: str) -> list[str]:
@@ -140,7 +143,10 @@ def bookmark_name(objects: list[str]) -> str:
 
 def bookmark_comment(review_id: str, severity: str) -> str:
     # No zones: only some cameras have them, and the camera already says where
-    # (they are in the event).
+    # (they are in the event). Frigate's severities only: the rest of the
+    # message is whatever was published on the topic.
+    if severity not in ("alert", "detection"):
+        severity = "review"
     return f"Frigate {severity} [frigate {review_id}]"
 
 
@@ -235,11 +241,13 @@ class FrigateBridge:
         self._stop_health: Callable[[], None] | None = None
         self._stop_listener: Callable[[], None] | None = None
         self._started_at = _monotonic()
+        self._mqtt_down_since: float | None = None  # subscribed, but HA's MQTT without its broker
         self._failing_since: float | None = None
         self._frigate_offline_since: float | None = None
         self._frigate_available: str | None = None
         self._issues: set[str] = set()
         self._dropping = False
+        self._loading = False
         self._stopped = False
         # For diagnostics: is anything arriving, and where does it stop?
         # messages: every review message (new, each update, end), so several
@@ -260,6 +268,10 @@ class FrigateBridge:
         self._image_error: tuple[float, str] | None = None
         self.thumb_sem = asyncio.Semaphore(FRIGATE_THUMB_PARALLEL)
         self._thumbs_down_until = -math.inf
+        # Frigate's thumbnails of reviews that are over (they don't change
+        # any more): (review id, height) -> (image, type), least recently used first.
+        self._thumb_cache: OrderedDict[tuple[str, int | None], tuple[bytes, str]] = OrderedDict()
+        self._thumb_cache_bytes = 0
         self._ss_image_error: tuple[float, str] | None = None  # SS's frame instead, failing too
         # Frigate's camera names (its config), for searching some cameras only.
         self._frigate_camera_names: list[str] = []
@@ -316,6 +328,7 @@ class FrigateBridge:
 
     async def start(self) -> bool:
         """Subscribe once MQTT is there (False: stopped first); stop() undoes it."""
+        self._loading = True
         try:
             stored = await self._store.async_load() or {}
             now = time.time()
@@ -341,6 +354,10 @@ class FrigateBridge:
                     self._deferred[str(key)] = review
         except (ValueError, TypeError, AttributeError, HomeAssistantError):
             _LOGGER.warning("Ignoring unreadable Frigate state %s", store_key(self.entry_id))
+        finally:
+            self._loading = False
+        if self._stopped:  # unloaded while its state was read: nothing to watch for
+            return False
         self._stop_health = async_track_time_interval(
             self.hass, self._check_health, timedelta(seconds=FRIGATE_HEALTH_INTERVAL)
         )
@@ -415,6 +432,10 @@ class FrigateBridge:
 
     async def async_flush(self) -> None:
         """Write what must survive a restart now (after stop(), on unload)."""
+        if self._loading:
+            # Stopped while reading it: nothing newer here than on disk (not
+            # subscribed yet), and writing now would replace it with nothing.
+            return
         await self._store.async_save(self._data())
 
     @callback
@@ -667,7 +688,10 @@ class FrigateBridge:
             ended = float(after["end_time"]) if after.get("end_time") else None
         except (TypeError, ValueError):
             ended = None
-        end = int(ended) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(time.time()))
+        # Still going on: up to now; a message replayed long after it came (SS
+        # was down), whose end never came, up to when it came, not the replay.
+        until = time.time() if self._live(review) else review[_RECEIVED_AT]
+        end = int(ended) + 1 if ended else max(start + FRIGATE_OPEN_BOOKMARK_SECONDS, int(until))
 
         if tracked is None and (review.get(_MAYBE_MADE) or not (kind == "new" or review.get(_SEEN_NEW))):
             # Created before a restart, or by a try that failed after SS did
@@ -700,7 +724,14 @@ class FrigateBridge:
             self._counts["bookmarked"] += 1
             self._bookmarks_changed()
         elif (name, comment) != (tracked.name, tracked.comment) or (ended and end != tracked.end):
-            await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
+            try:
+                await self.client.edit_bookmark(tracked.bookmark_id, camera_id, name, tracked.start, end, comment)
+            except SSError:
+                # Deleted in SS meanwhile, or no answer: the next try looks for
+                # it afresh (and makes it again if it's gone) rather than
+                # editing an id that may be dead at every message.
+                self._tracked.pop(review_id, None)
+                raise
             self._ok()
             tracked.name, tracked.comment, tracked.end = name, comment, end
             self._bookmarks_changed()
@@ -935,14 +966,19 @@ class FrigateBridge:
         a snapshot (any more), or the review gone. FrigateAPIError: no answer
         from Frigate (unreachable, too slow, failing).
         """
+        return (await self._review_snapshot(review_id, height))[0]
+
+    async def _review_snapshot(self, review_id: str, height: int | None) -> tuple[tuple[bytes, str] | None, bool]:
+        """review_image's answer, and whether the review is over (ended, or gone)."""
         if self.api is None:
-            return None
+            return None, False
         try:
             review = await self.api.json(f"/api/review/{review_id}")
         except FrigateAPIError as err:
             if err.status == 404:
-                return None  # gone (Frigate's retention): no snapshot
+                return None, True  # gone (Frigate's retention): no snapshot
             raise  # anything else (refused: a wrong URL; not JSON; failing) is Frigate's trouble
+        ended = isinstance(review, dict) and review.get("end_time") is not None
         data = review.get("data") if isinstance(review, dict) else None
         ids = [i for i in _strings(data.get("detections") if isinstance(data, dict) else None) if FRIGATE_ID.fullmatch(i)]
         ids = ids[:16]
@@ -955,7 +991,7 @@ class FrigateBridge:
             raise next((f for f in found if isinstance(f, FrigateAPIError)), FrigateAPIError("/api/events: no answer"))
         ranked = [e["id"] for e in self.ranked([e for e in found if isinstance(e, dict) and e.get("has_snapshot")])]
         # A few at most: the phone is waiting (and running out the budget counts as Frigate failing).
-        return await self._snapshot([*ranked, *unwritten], height)
+        return await self._snapshot([*ranked, *unwritten], height), ended
 
     async def _snapshot(self, ids: list[str], height: int | None) -> tuple[bytes, str] | None:
         """The first of these objects' snapshots (box drawn) Frigate has; a few tried at most."""
@@ -997,8 +1033,23 @@ class FrigateBridge:
     async def bookmark_image(self, review_id: str, height: int | None = None) -> tuple[bytes, str] | None:
         """A Frigate bookmark's image: its review's snapshot, else (the review gone) that of
         the foremost object Frigate still has from the bookmark's camera and time."""
-        if (found := await self.review_image(review_id, height)) is not None:
-            return found
+        key = (review_id, height)
+        if (cached := self._thumb_cache.get(key)) is not None:
+            self._thumb_cache.move_to_end(key)
+            return cached
+        found, over = await self._review_snapshot(review_id, height)
+        if found is None:
+            found = await self._bookmark_snapshot(review_id, height)
+        if found is not None and over:
+            # Asked again by every page of the event list, every device: once
+            # the review is over its snapshot doesn't change.
+            self._thumb_cache[key] = found
+            self._thumb_cache_bytes += len(found[0])
+            while self._thumb_cache_bytes > FRIGATE_THUMB_CACHE_BYTES:
+                self._thumb_cache_bytes -= len(self._thumb_cache.popitem(last=False)[1][0])
+        return found
+
+    async def _bookmark_snapshot(self, review_id: str, height: int | None) -> tuple[bytes, str] | None:
         client = self.manager.client(self.entry_id)
         if client is None:
             return None
@@ -1147,8 +1198,13 @@ class FrigateBridge:
         elif self._subscribed and self._failing and (self._probe is None or self._probe.done()):
             # Nothing waiting to go: is SS back at all?
             self._probe = self.hass.async_create_background_task(self._probe_ss(), "surveillance_station frigate probe")
+        # Subscribed, but HA's MQTT has lost its broker since: nothing arrives either.
+        if not self._subscribed or _mqtt_connected(self.hass):
+            self._mqtt_down_since = None
+        elif self._mqtt_down_since is None:
+            self._mqtt_down_since = now
         problems = {
-            "frigate_mqtt": not self._subscribed and lasting(self._started_at),
+            "frigate_mqtt": (not self._subscribed and lasting(self._started_at)) or lasting(self._mqtt_down_since),
             # Refusals: of more than one review (a single review refused,
             # nothing after it, is not "bookmarks failing").
             "frigate_failing": lasting(self._failing_since)
@@ -1192,6 +1248,13 @@ class FrigateBridge:
 def frigate_names(value: str) -> list[str]:
     """The Frigate camera names an option lists (comma-separated)."""
     return [n.strip() for n in str(value or "").split(",") if n.strip()]
+
+
+def _mqtt_connected(hass: HomeAssistant) -> bool:
+    try:
+        return mqtt.is_connected(hass)
+    except KeyError:  # HA's MQTT not set up (removed, or reloading)
+        return False
 
 
 # An object is a bookmark's when their times overlap, give or take this

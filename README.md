@@ -68,8 +68,8 @@ library by itself.
    download recordings. It must not use two-step verification (exempt it
    from a policy that enforces 2FA).
 2. **In HA**, *Settings → Devices & services → Add integration →
-   Surveillance Station Playback*: the NAS host, port (5000 http / 5001
-   https) and that user.
+   Surveillance Station Playback*: the NAS host, port (HTTPS on 5001, the
+   default; 5000 for http) and that user.
 3. **Add the card** to a dashboard:
 
    ```yaml

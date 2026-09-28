@@ -11,6 +11,11 @@
           "verify_ssl": "验证 SSL 证书",
           "username": "用户名",
           "password": "密码"
+        },
+        "data_description": {
+          "port": "HTTPS 用 5001，HTTP 用 5000（DSM 的默认端口）。",
+          "ssl": "不开启时，DSM 密码和会话 ID 以明文在网络上传输。",
+          "verify_ssl": "DSM 自带的是自签名证书，保持关闭即可；等 DSM 换上 Home Assistant 信任的证书后再开启。"
         }
       },
       "reauth_confirm": {
@@ -30,6 +35,11 @@
           "verify_ssl": "验证 SSL 证书",
           "username": "用户名",
           "password": "密码"
+        },
+        "data_description": {
+          "port": "HTTPS 用 5001，HTTP 用 5000（DSM 的默认端口）。",
+          "ssl": "不开启时，DSM 密码和会话 ID 以明文在网络上传输。",
+          "verify_ssl": "DSM 自带的是自签名证书，保持关闭即可；等 DSM 换上 Home Assistant 信任的证书后再开启。"
         }
       }
     },
@@ -95,6 +105,10 @@
     }
   },
   "issues": {
+    "ss_unreachable": {
+      "title": "无法访问 Surveillance Station",
+      "description": "{name} 已超过 10 分钟没有响应 Home Assistant，回放、缩略图和书签都无法使用。最近的错误：{error}。请检查 NAS 是否开机、Surveillance Station 是否在运行，以及 Home Assistant 能否访问它；恢复响应后此问题会自动消失。"
+    },
     "frigate_mqtt": {
       "title": "Frigate 检测：MQTT 不可用",
       "description": "Home Assistant 的 MQTT 集成已超过 10 分钟不可用，`{topic}/reviews` 上的 Frigate review 没有被转成 Surveillance Station 书签或通知。请检查 MQTT 集成及其 broker；MQTT 恢复后此问题会自动消失。"

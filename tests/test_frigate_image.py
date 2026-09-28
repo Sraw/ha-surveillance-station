@@ -338,23 +338,30 @@ async def test_bookmark_thumbnail(
     resp = await http.get(url)
     assert resp.status == 200 and await resp.read() == WEBP
     assert [str(c[1]).split("?")[0].split("/api/")[1] for c in aioclient_mock.mock_calls][-1] == "events/o2/snapshot.jpg"
+    # Gone, so over: that snapshot is kept, not looked for again.
+    asked = len(aioclient_mock.mock_calls)
+    assert await (await http.get(url)).read() == WEBP and len(aioclient_mock.mock_calls) == asked
 
-    # SS failing to list the bookmarks: SS's frame, and not Frigate's fault.
+    # Another one's review gone, and SS failing to list the bookmarks: SS's frame, and not Frigate's fault.
+    rid = "1790000000.2-abc"
+    other = Bookmark(32, 6, "Person", f"Frigate alert [frigate {rid}]", T, T + 20)
+    mock_client.list_bookmarks.return_value = [mine, by_hand, other]
+    url = bridge.bookmark_thumbnail(other)
     aioclient_mock.clear_requests()
-    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    aioclient_mock.get(f"{F}/api/review/{rid}", status=404)
     with patch.object(manager, "bookmarks", AsyncMock(side_effect=SSError("Bookmark", "List", 400))):
         resp = await http.get(url, allow_redirects=False)
     assert resp.status == 302 and bridge.thumbs_from_frigate()
 
     # Nothing of it left, or Frigate down: SS's frame (and not asking Frigate for a minute).
-    ss = manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, mine))
+    ss = manager.sign_thumbnail(bridge.entry_id, 6, manager.frame(bridge.entry_id, other))
     aioclient_mock.clear_requests()
-    aioclient_mock.get(f"{F}/api/review/{RID}", status=404)
+    aioclient_mock.get(f"{F}/api/review/{rid}", status=404)
     aioclient_mock.get(f"{F}/api/events", json=[])
     resp = await http.get(url, allow_redirects=False)
     assert resp.status == 302 and resp.headers["Location"] == ss and bridge.image_from_frigate()
     aioclient_mock.clear_requests()
-    aioclient_mock.get(f"{F}/api/review/{RID}", status=503)
+    aioclient_mock.get(f"{F}/api/review/{rid}", status=503)
     resp = await http.get(url, allow_redirects=False)
     assert resp.status == 302 and not bridge.thumbs_from_frigate()
     # The notifications' own: they find out for themselves (their lookup is lighter).
@@ -363,6 +370,41 @@ async def test_bookmark_thumbnail(
     asked = len(aioclient_mock.mock_calls)
     assert (await http.get(url, allow_redirects=False)).status == 302
     assert len(aioclient_mock.mock_calls) == asked
+
+
+async def test_thumbnails_of_reviews_that_are_over_are_kept(
+    bridge: FrigateBridge, hass_client_no_auth, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Asked for by every page of the event list on every device: a review that is over has its
+    thumbnail asked of Frigate once; one still going on (its snapshot may get better) every time."""
+    url = bridge.bookmark_thumbnail(Bookmark(30, 6, "Person", f"Frigate alert [frigate {RID}]", T, T + 20))
+    http = await hass_client_no_auth()
+    mock_review(aioclient_mock, [event("e1", "person", 0.9)])  # no end_time: going on
+    aioclient_mock.get(f"{F}/api/events/e1/snapshot.jpg", content=JPG)
+    for _ in range(2):
+        assert await (await http.get(url)).read() == JPG
+    assert len(aioclient_mock.mock_calls) == 6  # the review, its object, the snapshot: each time
+
+    def ended(rid: str, body: bytes) -> None:
+        aioclient_mock.get(f"{F}/api/review/{rid}", json={"id": rid, "end_time": T + 20, "data": {"detections": [f"o{rid}"]}})
+        aioclient_mock.get(f"{F}/api/events/o{rid}", json=event(f"o{rid}", "person", 0.9))
+        aioclient_mock.get(f"{F}/api/events/o{rid}/snapshot.jpg", content=body)
+
+    aioclient_mock.clear_requests()
+    ended(RID, JPG)
+    for _ in range(3):
+        assert await (await http.get(url)).read() == JPG
+    assert len(aioclient_mock.mock_calls) == 3  # once
+
+    # Bounded by size: the least recently used goes first.
+    rid = "1790000000.2-abc"
+    other = bridge.bookmark_thumbnail(Bookmark(31, 6, "Person", f"Frigate alert [frigate {rid}]", T, T + 20))
+    ended(rid, WEBP)
+    with patch.object(frigate_mod, "FRIGATE_THUMB_CACHE_BYTES", len(JPG) + len(WEBP) - 1):
+        assert await (await http.get(other)).read() == WEBP
+        asked = len(aioclient_mock.mock_calls)
+        assert await (await http.get(other)).read() == WEBP and len(aioclient_mock.mock_calls) == asked
+        assert await (await http.get(url)).read() == JPG and len(aioclient_mock.mock_calls) == asked + 3
 
 
 async def test_thumbnails_queued(hass: HomeAssistant, bridge: FrigateBridge, hass_client_no_auth) -> None:

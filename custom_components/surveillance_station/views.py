@@ -33,6 +33,7 @@ import aiohttp
 from aiohttp import web
 from synology_ss_playback import (
     Bookmark,
+    RecordingInfo,
     Segment,
     SSConnectionError,
     SSError,
@@ -53,6 +54,7 @@ from homeassistant.components.ffmpeg import get_ffmpeg_manager
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.storage import Store
 from homeassistant.util.hass_dict import HassKey
 
@@ -61,11 +63,13 @@ from .const import (
     BOOKMARK_ERROR_SECONDS,
     BOOKMARK_FRAMES_MAX,
     DOMAIN,
+    FRIGATE_ISSUE_AFTER_SECONDS,
     LARGE_IMAGE_DISK_BYTES,
     LARGE_IMAGE_WIDTH,
     LIVE_IDLE_SECONDS,
     LIVE_KEEP_ALIVE_SECONDS,
     LIVE_TOKEN_TTL_SECONDS,
+    LIVE_TOKENS_MAX,
     LIVE_URL,
     MAX_LIVE_STREAMS,
     MAX_PARALLEL_FETCHES,
@@ -87,6 +91,7 @@ from .const import (
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
+from .bookmarks import BookmarkIndex
 from .thumbnail_store import ThumbnailStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,13 +119,17 @@ class VodSession:
     # recording id). Empty for recordings, which are stream-copied.
     transcode: dict[int, TranscodeSpec] = field(default_factory=dict)
     playlist: str = field(init=False, default="")
+    # Started live: its playlist stays an EVENT playlist once it stops growing
+    # (RFC 8216 lets an EVENT playlist only be appended to, not turn VOD).
+    event: bool = field(init=False, default=False)
     lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
+        self.event = self.live
         self.render()
 
     def render(self) -> None:
-        self.playlist = render_playlist(self.segments, live=self.live)
+        self.playlist = render_playlist(self.segments, live=self.live, event=self.event)
 
 
 class VodManager:
@@ -128,8 +137,10 @@ class VodManager:
 
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
-        # Entries whose Surveillance Station is known to be unreachable (logged once).
-        self._unreachable: set[str] = set()
+        # Entries whose Surveillance Station is known to be unreachable (logged
+        # once), since when; and those with a Repairs issue for it.
+        self._unreachable: dict[str, float] = {}
+        self._unreachable_issues: set[str] = set()
         self._sessions: OrderedDict[str, VodSession] = OrderedDict()
         # key -> (init, media). media_start is part of the key because the
         # fragment timestamps depend on it, so only reloads of the same window
@@ -153,7 +164,8 @@ class VodManager:
         self._hardware_task: asyncio.Task | None = None
         # entry_id -> (fetched at, every time-lapse file).
         self._timelapse: dict[str, tuple[float, list[TimelapseRecording]]] = {}
-        self._timelapse_lock = asyncio.Lock()
+        # One listing per entry at a time (a NAS that hangs holds up only its own).
+        self._timelapse_locks: dict[str, asyncio.Lock] = {}
         self.transcoded = 0
         self.transcode_failures = 0
         # (entry_id, camera_id, ts) -> (made at, JPEG or b"" for "nothing
@@ -174,9 +186,9 @@ class VodManager:
         # "entry_id/bookmark_id" -> the moment its thumbnail shows (see set_frame), oldest first.
         self._frames: OrderedDict[str, int] = OrderedDict()
         self._frame_store: Store[dict[str, int]] = Store(hass, 1, f"{DOMAIN}.bookmark_frames")
-        # entry_id -> (fetched at, every bookmark newest first, or the error),
-        # and the one fetch per entry that every request waits on.
-        self._bookmarks: dict[str, tuple[float, list[Bookmark] | SSError]] = {}
+        # entry_id -> (fetched at, every bookmark newest first (indexed), or
+        # the error), and the one fetch per entry that every request waits on.
+        self._bookmarks: dict[str, tuple[float, BookmarkIndex | SSError]] = {}
         self._bookmark_tasks: dict[str, asyncio.Task] = {}
         # Live streams: unused tokens -> (entry_id, camera_id, expires), and
         # the relays running (entry_id, browser socket).
@@ -223,14 +235,39 @@ class VodManager:
         return entry.runtime_data
 
     def track(self, entry_id: str, err: Exception | None) -> None:
-        """Log once when Surveillance Station goes away, and once when it's back."""
+        """Log once when Surveillance Station goes away, and once when it's back.
+
+        Still unreachable FRIGATE_ISSUE_AFTER_SECONDS later (asked again then,
+        not just once), it's a Repairs issue until it answers.
+        """
         if isinstance(err, SSConnectionError):
-            if entry_id not in self._unreachable:
-                self._unreachable.add(entry_id)
+            if (since := self._unreachable.get(entry_id)) is None:
+                self._unreachable[entry_id] = _monotonic()
                 _LOGGER.warning("Surveillance Station is unreachable: %s", err)
+            elif _monotonic() - since >= FRIGATE_ISSUE_AFTER_SECONDS and entry_id not in self._unreachable_issues:
+                entry = self.hass.config_entries.async_get_entry(entry_id)
+                self._unreachable_issues.add(entry_id)
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    _unreachable_issue(entry_id),
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.ERROR,
+                    translation_key="ss_unreachable",
+                    translation_placeholders={
+                        "name": entry.title if entry is not None else entry_id,
+                        "error": str(err)[:300],
+                    },
+                )
         elif err is None and entry_id in self._unreachable:
-            self._unreachable.discard(entry_id)
+            del self._unreachable[entry_id]
+            self._clear_unreachable_issue(entry_id)
             _LOGGER.info("Surveillance Station is reachable again")
+
+    def _clear_unreachable_issue(self, entry_id: str) -> None:
+        if entry_id in self._unreachable_issues:
+            self._unreachable_issues.discard(entry_id)
+            ir.async_delete_issue(self.hass, DOMAIN, _unreachable_issue(entry_id))
 
     def drop_entry(self, entry_id: str) -> None:
         """Forget an unloaded entry's sessions and segments."""
@@ -255,9 +292,12 @@ class VodManager:
             # it notices the entry is gone once connected.
             if stream[1].prepared:
                 self.hass.async_create_task(stream[1].close(code=aiohttp.WSCloseCode.GOING_AWAY))
-        self._unreachable.discard(entry_id)
+        # An unloaded entry's outage is no issue any more (a reload looks afresh).
+        self._unreachable.pop(entry_id, None)
+        self._clear_unreachable_issue(entry_id)
         self._bookmarks.pop(entry_id, None)
         self._timelapse.pop(entry_id, None)
+        self._timelapse_locks.pop(entry_id, None)
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -272,6 +312,7 @@ class VodManager:
             "disk_images": len(self.disk_large),
             "disk_image_bytes": self.disk_large.bytes,
             "live_streams": len(self.live_streams),
+            "live_tokens": len(self._live_tokens),
             "timelapse_hardware": self._hardware,
             "timelapse_transcoded": self.transcoded,
             "timelapse_transcode_failures": self.transcode_failures,
@@ -311,7 +352,7 @@ class VodManager:
 
     async def timelapse_files(self, entry_id: str, client: SurveillanceStationClient) -> list[TimelapseRecording]:
         """Every time-lapse file of the entry's NAS, at most TIMELAPSE_LIST_SECONDS old."""
-        async with self._timelapse_lock:
+        async with self._timelapse_locks.setdefault(entry_id, asyncio.Lock()):
             hit = self._timelapse.get(entry_id)
             if hit is not None and _monotonic() - hit[0] < TIMELAPSE_LIST_SECONDS:
                 return hit[1]
@@ -325,7 +366,11 @@ class VodManager:
             return files
 
     async def bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
-        """Every bookmark of every camera, newest first, at most a few seconds old.
+        """Every bookmark of every camera, newest first, at most a minute old."""
+        return (await self.bookmark_index(entry_id, client)).all
+
+    async def bookmark_index(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
+        """The same bookmarks, indexed for the event list.
 
         One fetch per entry at a time, whose result (or error) every request
         waiting meanwhile shares: a NAS that hangs costs one timeout, not one
@@ -347,23 +392,32 @@ class VodManager:
             self._bookmark_tasks[entry_id] = task
         return await _join(task, "bookmarks")
 
-    async def _load_bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> list[Bookmark]:
+    async def _load_bookmarks(self, entry_id: str, client: SurveillanceStationClient) -> BookmarkIndex:
         me = asyncio.current_task()
         try:
             cameras = await client.cameras()
             found = await client.list_bookmarks([c.id for c in cameras])
+            # Tens of thousands of bookmarks take a while: not on the loop.
+            index = await self.hass.async_add_executor_job(BookmarkIndex, found)
         except SSError as err:
             self._bookmarks[entry_id] = (_monotonic(), err)
             raise
         finally:
             if self._bookmark_tasks.get(entry_id) is me:
                 del self._bookmark_tasks[entry_id]
-        self._bookmarks[entry_id] = (_monotonic(), found)
-        return found
+        self._bookmarks[entry_id] = (_monotonic(), index)
+        return index
 
     def forget_bookmarks(self, entry_id: str) -> None:
         """Changed in SS by us: list them afresh on the next request."""
         self._bookmarks.pop(entry_id, None)
+
+    async def forget_frames(self, entry_id: str) -> None:
+        """A removed entry's bookmarks: their frames aren't kept any more."""
+        prefix = f"{entry_id}/"
+        for key in [k for k in self._frames if k.startswith(prefix)]:
+            del self._frames[key]
+        await self._frame_store.async_save(dict(self._frames))
 
     async def thumbnail_when_recorded(
         self, entry_id: str, camera_id: int, ts: int, wait: float, width: int = THUMBNAIL_WIDTH
@@ -381,8 +435,9 @@ class VodManager:
             try:
                 if client is not None:
                     recordings = await client.recordings(camera_id, ts - RECORDING_GAP_SECONDS, ts + 1)
-                    if any(r.start <= ts and r.end >= ts + 1 for r in recordings):
-                        return await self.thumbnail(entry_id, camera_id, ts, width)
+                    if (rec := next((r for r in recordings if r.start <= ts and r.end >= ts + 1), None)) is not None:
+                        # The recording found here is the one cut: not listed again.
+                        return await self.thumbnail(entry_id, camera_id, ts, width, recording=rec)
                     if _monotonic() >= grace and not any(
                         r.live or r.end >= ts - RECORDING_GAP_SECONDS for r in recordings
                     ):
@@ -417,7 +472,8 @@ class VodManager:
 
     def check_thumbnail(self, path: str, exp: str | None, sig: str | None) -> bool:
         # isascii: str.isdigit() accepts "²", and compare_digest rejects non-ASCII str.
-        if not exp or not sig or not (exp.isascii() and exp.isdigit()) or not sig.isascii():
+        # At most 12 digits: int() refuses a string of over 4300 (a 500, not a 404).
+        if not exp or not sig or len(exp) > 12 or not (exp.isascii() and exp.isdigit()) or not sig.isascii():
             return False
         if int(exp) < time.time():
             return False
@@ -427,12 +483,14 @@ class VodManager:
         return hmac.new(self._thumb_key, f"{path}\n{exp}".encode(), hashlib.sha256).hexdigest()[:32]
 
     async def thumbnail(
-        self, entry_id: str, camera_id: int, ts: int, width: int = THUMBNAIL_WIDTH
+        self, entry_id: str, camera_id: int, ts: int, width: int = THUMBNAIL_WIDTH,
+        recording: RecordingInfo | None = None,
     ) -> bytes | None:
         """JPEG of camera_id at ts, width pixels wide, or None if nothing was recorded then.
 
         Requests for the same frame share one job; a job nobody waits for any
-        more (the thumbnail was scrolled past) is cancelled.
+        more (the thumbnail was scrolled past) is cancelled. recording: the one
+        holding ts, if the caller has found it already.
         """
         key = (entry_id, camera_id, ts, width)
         if (hit := self._thumbs.get(key)) is not None:
@@ -447,7 +505,7 @@ class VodManager:
         task = self._thumb_tasks.get(key)
         if task is None or task.cancelling():
             task = self.hass.async_create_background_task(
-                self._make_thumbnail(key), f"surveillance_station thumbnail {camera_id}@{ts}", eager_start=False
+                self._make_thumbnail(key, recording), f"surveillance_station thumbnail {camera_id}@{ts}", eager_start=False
             )
             task.add_done_callback(_retrieve_exception)
             self._thumb_tasks[key] = task
@@ -460,7 +518,9 @@ class VodManager:
             elif not task.done():
                 task.cancel()
 
-    async def _make_thumbnail(self, key: tuple[str, int, int, int]) -> bytes | None:
+    async def _make_thumbnail(
+        self, key: tuple[str, int, int, int], recording: RecordingInfo | None = None
+    ) -> bytes | None:
         me = asyncio.current_task()
         entry_id, camera_id, ts, width = key
         disk = self.disk if width == THUMBNAIL_WIDTH else self.disk_large
@@ -473,7 +533,7 @@ class VodManager:
                 async with self._thumb_sem:
                     try:
                         jpg = await fetch_snapshot(
-                            client, camera_id, ts, get_ffmpeg_manager(self.hass).binary, width
+                            client, camera_id, ts, get_ffmpeg_manager(self.hass).binary, width, recording=recording
                         )
                     except SSError as err:
                         self.track(entry_id, err)
@@ -501,6 +561,8 @@ class VodManager:
         now = time.time()
         for token in [t for t, v in self._live_tokens.items() if v[3] < now]:
             del self._live_tokens[token]
+        while len(self._live_tokens) >= LIVE_TOKENS_MAX:
+            del self._live_tokens[next(iter(self._live_tokens))]  # the oldest
         token = secrets.token_urlsafe(32)
         self._live_tokens[token] = (entry_id, camera_id, at, now + LIVE_TOKEN_TTL_SECONDS)
         return token
@@ -628,20 +690,47 @@ class VodManager:
         try:
             async with self._sem if spec is None else self._transcode_sem:
                 self._started.add(me)
-                result = await self._fetch_uncached(entry_id, seg, spec)
+                if spec is None:
+                    result = await self._fetch_uncached(entry_id, seg)
+                else:
+                    result = await self._fetch_transcoded(key, entry_id, seg, spec)
         finally:
             self._started.discard(me)
             if self._inflight.get(key) is me:
                 del self._inflight[key]
+        self._keep(key, result)
+        return result
+
+    async def _fetch_transcoded(
+        self, key: tuple, entry_id: str, seg: Segment, spec: TranscodeSpec
+    ) -> tuple[bytes, bytes]:
+        turn = _GpuTurn(self._gpu)
+        job = asyncio.ensure_future(self._fetch_uncached(entry_id, seg, spec, turn))
+        job.add_done_callback(_retrieve_exception)
+        try:
+            return await asyncio.shield(job)
+        except asyncio.CancelledError as err:
+            if not (spec.hardware and turn.taken):
+                job.cancel()
+                raise
+            cancelled = err
+        # A hardware transcode, once running, finishes whoever leaves (see
+        # fetch_timelapse_segment) and holds its cut until then: so this
+        # permit is held until then too, and what it made is kept.
+        result = await asyncio.shield(job)
+        if self.client(entry_id) is not None:  # not unloaded meanwhile
+            self._keep(key, result)
+        raise cancelled
+
+    def _keep(self, key: tuple, result: tuple[bytes, bytes]) -> None:
         self._cache[key] = result
         self._cache_bytes += len(result[0]) + len(result[1])
         while self._cache_bytes > SEGMENT_CACHE_BYTES and len(self._cache) > 1:
             _, (init, media) = self._cache.popitem(last=False)
             self._cache_bytes -= len(init) + len(media)
-        return result
 
     async def _fetch_uncached(
-        self, entry_id: str, seg: Segment, spec: TranscodeSpec | None = None
+        self, entry_id: str, seg: Segment, spec: TranscodeSpec | None = None, gpu: _GpuTurn | None = None
     ) -> tuple[bytes, bytes]:
         client = self.client(entry_id)
         if client is None:
@@ -652,7 +741,7 @@ class VodManager:
                 result = await fetch_segment(client, seg, ffmpeg)
             else:
                 try:
-                    result = await fetch_timelapse_segment(client, seg, ffmpeg, spec, gpu=self._gpu)
+                    result = await fetch_timelapse_segment(client, seg, ffmpeg, spec, gpu=gpu)
                 except SSError:
                     self.transcode_failures += 1
                     raise
@@ -662,6 +751,23 @@ class VodManager:
             raise
         self.track(entry_id, None)
         return result
+
+
+class _GpuTurn:
+    """The GPU lock as fetch_timelapse_segment takes it for one segment: right
+    before its transcode, released when that ends. Tells whether it began."""
+
+    def __init__(self, lock: asyncio.Semaphore) -> None:
+        self._lock = lock
+        self.taken = False
+
+    async def acquire(self) -> bool:
+        await self._lock.acquire()
+        self.taken = True
+        return True
+
+    def release(self) -> None:
+        self._lock.release()
 
 
 class LiveStreamView(HomeAssistantView):
@@ -689,8 +795,9 @@ class LiveStreamView(HomeAssistantView):
             raise web.HTTPNotFound()
         entry_id, camera_id, at = found
         # No heartbeat: video flows all the time, and the browser's
-        # keep-alives (or their absence) tell whether it is still there.
-        browser = web.WebSocketResponse(max_msg_size=4096)
+        # keep-alives (or their absence) tell whether it is still there. No
+        # permessage-deflate: compressed video only costs HA CPU.
+        browser = web.WebSocketResponse(max_msg_size=4096, compress=False)
         if not browser.can_prepare(request).ok:
             raise web.HTTPBadRequest()
         client = self.manager.client(entry_id)
@@ -784,6 +891,10 @@ async def _join[T](task: asyncio.Task[T], what: str) -> T:
 
 
 DATA_MANAGER: HassKey[VodManager] = HassKey(DOMAIN)
+
+
+def _unreachable_issue(entry_id: str) -> str:
+    return f"ss_unreachable_{entry_id}"
 
 
 def _retrieve_exception(task: asyncio.Task) -> None:

@@ -192,7 +192,7 @@ def _write(path: str, data: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
-        os.chmod(tmp, 0o644)
+        # Left 0600, as mkstemp makes it: these are camera frames.
         os.replace(tmp, path)  # never a half-written JPEG under the real name
     except OSError:
         try:

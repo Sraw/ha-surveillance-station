@@ -54,6 +54,11 @@ viewer's choice is remembered in the browser and wins over the options.
   and for 15 s after a pan).
 - **Bookmark pins** on the timeline open their event when tapped, exactly like
   tapping the event in the list.
+- **Keyboard**: the timeline is a slider over its span. The arrow keys move the
+  playhead 1 % of the span, Page Up / Down 10 %, Home / End to its ends; the
+  cameras go there once the keys stop (the right end, when it is now, is
+  live). Each pin is a button (Tab to it, Enter opens its event), and every
+  icon button has a name for screen readers.
 - **Clock**: the overlay button toggles it; remembered per browser.
 - **Fullscreen**: the stage (video + a slim auto-hiding control bar) goes
   fullscreen and asks for landscape (`screen.orientation.lock`; honoured on

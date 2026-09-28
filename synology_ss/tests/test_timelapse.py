@@ -13,6 +13,7 @@ import aiohttp
 import pytest
 
 from synology_ss_playback import (
+    FFmpegError,
     SSConnectionError,
     SSError,
     SurveillanceStationClient,
@@ -564,6 +565,29 @@ async def test_hardware_transcode_available_times_out() -> None:
     proc.kill.assert_not_called()
 
 
+async def test_hardware_check_stops_with_its_caller() -> None:
+    """Not left running for the loop's teardown to SIGKILL (a QSV session: see the GPU hang)."""
+    proc = _proc()
+    started = asyncio.Event()
+
+    async def wait():
+        if not proc.terminate.called:
+            started.set()
+            await asyncio.sleep(10)
+        return -15
+
+    proc.wait = AsyncMock(side_effect=wait)
+    proc.terminate = MagicMock()
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        check = asyncio.create_task(hardware_transcode_available("ffmpeg"))
+        await started.wait()
+        check.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await check
+    proc.terminate.assert_called_once()
+    proc.kill.assert_not_called()
+
+
 async def test_hardware_check_ignoring_sigterm_is_killed() -> None:
     proc = _proc()
 
@@ -597,7 +621,11 @@ def _tseg():
     return segs[1]
 
 
-def _dl_client(data: bytes = b"cut") -> MagicMock:
+# A whole H.265 cut: what the GPU is given as it is.
+CUT = _mp4([[19, 19]] * 2)
+
+
+def _dl_client(data: bytes = CUT) -> MagicMock:
     client = MagicMock()
 
     async def download_to(fd, *args, **kwargs):
@@ -625,7 +653,7 @@ async def test_fetch_timelapse_segment(spec: TranscodeSpec) -> None:
     with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=run)):
         init, media = await fetch_timelapse_segment(client, seg, "ffmpeg", spec, gpu=asyncio.Semaphore(1))
     assert init.startswith(_box("ftyp", b"iso5")) and media.startswith(_box("moof", b"m"))
-    assert seen["cut"] == b"cut"
+    assert seen["cut"] == CUT[:100]
     assert "/proc/self/fd/" in seen["argv"][seen["argv"].index("-i") + 1]
     client.download_to.assert_awaited_once()
     args = client.download_to.await_args
@@ -663,7 +691,7 @@ async def test_broken_frames_never_reach_the_gpu() -> None:
     assert init and media and not gpu.locked()
     (remux, (cut_fd, new_fd), data1, locked1), (transcode, fds2, data2, locked2) = calls
     assert "noise=drop=eq(n\\,3)+eq(n\\,5)" in remux and "copy" in remux
-    assert data1 == b"cut" and not locked1  # re-muxed before taking the GPU
+    assert data1 == CUT[:100] and not locked1  # re-muxed before taking the GPU
     assert fds2 == (new_fd,) and data2 == b"whole" and locked2 and "-hwaccel" in transcode
     assert sorted(closed) == sorted([cut_fd, new_fd])  # each once
 
@@ -691,11 +719,25 @@ async def test_only_a_gpu_decoding_h265_is_checked(spec: TranscodeSpec) -> None:
     assert run.await_count == 1
 
 
-@pytest.mark.parametrize("cut", [_mp4([[19, 19]] * 2), b"not an mp4"])
-async def test_whole_or_unreadable_cut_goes_to_the_gpu_as_it_is(cut: bytes) -> None:
+async def test_whole_cut_goes_to_the_gpu_as_it_is() -> None:
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_proc(0, FMP4))) as run:
-        await fetch_timelapse_segment(_dl_client(cut), _tseg(), "ffmpeg", HW)
+        await fetch_timelapse_segment(_dl_client(), _tseg(), "ffmpeg", HW)
     assert run.await_count == 1
+
+
+@pytest.mark.parametrize("cut", [b"not an mp4", _mp4([[19, 19]] * 2, entry="avc1"), _mp4([])])
+async def test_unreadable_cut_never_reaches_the_gpu(cut: bytes) -> None:
+    """Nothing checked: it could hold a frame that hangs the GPU."""
+    gpu = asyncio.Semaphore(1)
+    closed = []
+    real_close = os.close
+    with patch("asyncio.create_subprocess_exec", AsyncMock()) as run, patch.object(
+        seg_mod.os, "close", side_effect=lambda fd: closed.append(fd) or real_close(fd)
+    ):
+        with pytest.raises(FFmpegError, match="can't be read"):
+            await fetch_timelapse_segment(_dl_client(cut), _tseg(), "ffmpeg", HW, gpu=gpu)
+    run.assert_not_awaited()
+    assert len(closed) == 1 and not gpu.locked()
 
 
 async def test_dropping_frames_fails() -> None:

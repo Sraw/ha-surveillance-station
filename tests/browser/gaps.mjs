@@ -2,13 +2,25 @@
 // recording" until the master reaches its next footage; a master sent into
 // its own gap lands on its next footage and takes the others there; a gap
 // every camera shares is skipped over. The gaps are found in the last week.
-import { open, sleep } from "./harness.mjs";
+// Exits 1 if a check fails.
+import { open, sleep, checks } from "./harness.mjs";
 const { browser, ev } = await open({ prefs: {} });
+const { check, done } = checks();
 await sleep(6000);
-const st = async (label) => console.log(label.padEnd(10), await ev((c) => {
-  const m = c._master.wall();
-  return new Date(m * 1000).toISOString().slice(11, 19) + " | " + [...c._players.values()].map((p) => `${c._master === p ? "*" : ""}${p.cameraId}:${(p.wall() - m).toFixed(1)}${p.video.paused ? "P" : ""}${p.gap ? "G" : ""}${p.loading ? "L" : ""}${p.veilKind ? "[" + p.veil.textContent.trim().replace(/\s+/g, " ").slice(0, 20) + "]" : ""}`).join(" ");
-}));
+// Prints a line, and returns the master's time and each camera's state.
+const st = async (label) => {
+  const s = await ev((c) => {
+    const m = c._master.wall();
+    const players = [...c._players.values()].map((p) => ({ id: p.cameraId, master: c._master === p, d: p.wall() - m, paused: p.video.paused, gap: !!p.gap, loading: p.loading,
+      veil: p.veilKind ? p.veil.textContent.trim().replace(/\s+/g, " ").slice(0, 20) : "" }));
+    return { m, players };
+  });
+  console.log(label.padEnd(10), new Date(s.m * 1000).toISOString().slice(11, 19) + " | " + s.players.map((p) => `${p.master ? "*" : ""}${p.id}:${p.d.toFixed(1)}${p.paused ? "P" : ""}${p.gap ? "G" : ""}${p.loading ? "L" : ""}${p.veil ? "[" + p.veil + "]" : ""}`).join(" "));
+  return s;
+};
+// Followers with footage then are within 0.5 s of the master (a gap of their own: under the veil).
+const inStep = (p) => !p.gap && !p.loading && Math.abs(p.d) < 0.5;
+const othersInStep = (s) => s.players.every((p) => p.master || p.gap || inStep(p));
 const gaps = await ev(async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const out = {};
@@ -31,16 +43,25 @@ if (own) {
   console.log(`camera ${own.id} records nothing ${new Date(own.a * 1000).toISOString()} +${own.b - own.a}s; master ${own.master}`);
   await ev((c, id) => c._setMaster(id), own.master);
   await ev((c, t) => c._seekAll(t, true), own.a - 8);
-  for (let i = 0; i < 12; i++) { await sleep(1000); if (i > 6) await st(`in +${i + 1}s`); }
+  let s;
+  for (let i = 0; i < 12; i++) { await sleep(1000); if (i > 6) s = await st(`in +${i + 1}s`); }
+  const cam = s.players.find((p) => p.id === own.id);
+  check(cam.gap && cam.veil.startsWith("No recording"), `camera ${own.id} in its gap: "No recording"`);
+  check(s.m > own.a && s.players.find((p) => p.master).paused === false, "the master plays on past it");
   await ev((c, t) => c._seekAll(t, true), own.b - 8);
-  for (let i = 0; i < 12; i++) { await sleep(1000); await st(`out +${i + 1}s`); }
+  for (let i = 0; i < 12; i++) { await sleep(1000); s = await st(`out +${i + 1}s`); }
+  check(s.m > own.b && inStep(s.players.find((p) => p.id === own.id)) && othersInStep(s), `past the gap's end: camera ${own.id} back in step`);
   await ev((c, id) => c._setMaster(id), own.id);
   await ev((c, t) => c._seekAll(t, true), Math.floor((own.a + own.b) / 2));
-  for (let i = 0; i < 5; i++) { await sleep(1000); await st(`into +${i + 1}s`); }
+  for (let i = 0; i < 5; i++) { await sleep(1000); s = await st(`into +${i + 1}s`); }
+  // SS starts at the keyframe before the next footage.
+  check(s.m >= own.b - 2 && othersInStep(s), "a master sent into its gap lands on its next footage, the others with it");
 } else console.log("no single-camera gap of a minute or more in the last week");
 if (shared) {
   console.log(`every camera stops ${new Date(shared[0] * 1000).toISOString()}`);
   await ev((c, t) => c._seekAll(t, true), shared[0] - 8);
-  for (let i = 0; i < 14; i++) { await sleep(1000); if (i > 5) await st(`all +${i + 1}s`); }
+  let s;
+  for (let i = 0; i < 14; i++) { await sleep(1000); if (i > 5) s = await st(`all +${i + 1}s`); }
+  check(s.m > shared[0] + 5 && !s.players.find((p) => p.master).paused, "a gap every camera shares is skipped over");
 } else console.log("no gap every camera shares in the last week");
-await browser.close(); process.exit(0);
+await done(browser);

@@ -1,7 +1,8 @@
 """Bookmark create / edit / delete: epoch times in, NAS-local times back."""
 
+import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -11,11 +12,43 @@ API = "SYNO.SurveillanceStation.ThirdParty.Bookmark"
 T = 1790000000  # 2026-09-21T07:13:20 in Los Angeles (summer time)
 
 
-def _client(answer):
-    client = SurveillanceStationClient(MagicMock(), "nas", 5000, False, "u", "p")
-    client._tz = ZoneInfo("America/Los_Angeles")
-    client._call = AsyncMock(return_value=answer)
-    return client
+class _Ctx:
+    def __init__(self, resp: MagicMock) -> None:
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _client(answer: dict[str, Any]) -> tuple[SurveillanceStationClient, list[dict[str, Any]]]:
+    """A client of a NAS in Los Angeles that answers ``answer`` to every bookmark call,
+    and the parameters of each request it got."""
+    calls: list[dict[str, Any]] = []
+
+    def request(method, url, **kwargs):
+        params = kwargs.get("params") or kwargs["data"]
+        calls.append(params)
+        if params["api"] == "SYNO.API.Auth":
+            data = {"sid": "s"}
+        elif params["api"] == "SYNO.SurveillanceStation.Info":
+            data = {"serial": "S", "timezoneTZDB": "America/Los_Angeles"}
+        else:
+            data = answer
+        resp = MagicMock(status=200, headers={"Content-Type": "application/json"})
+        resp.read = AsyncMock(return_value=json.dumps({"success": True, "data": data}).encode())
+        return _Ctx(resp)
+
+    session = MagicMock()
+    session.request = MagicMock(side_effect=request)
+    return SurveillanceStationClient(session, "nas", 5000, False, "u", "p"), calls
+
+
+def _bookmark_call(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    [call] = [c for c in calls if c["api"] == API]
+    return call
 
 
 def _stored(bid, name, comment, start, end):
@@ -23,41 +56,45 @@ def _stored(bid, name, comment, start, end):
 
 
 async def test_create() -> None:
-    client = _client(_stored(12, 'a "b"', "c", "2026-09-21T07:13:20", "2026-09-21T07:13:50"))
+    client, calls = _client(_stored(12, 'a "b"', "c", "2026-09-21T07:13:20", "2026-09-21T07:13:50"))
     bm = await client.create_bookmark(6, 'a "b"', T + 0.9, T + 30, "c")
     assert (bm.id, bm.camera_id, bm.name, bm.comment, bm.start, bm.end) == (12, 6, 'a "b"', "c", T, T + 30)
-    assert client._call.await_args.args == (API, "Create", 1)
+    call = _bookmark_call(calls)
+    assert (call["method"], call["version"]) == ("Create", 1)
     # Epoch seconds (a local time is read an hour off in summer); strings JSON-quoted.
-    assert client._call.await_args.kwargs == {
+    assert {k: call[k] for k in ("camId", "name", "comment", "startTime", "endTime")} == {
         "camId": 6, "name": '"a \\"b\\""', "comment": '"c"', "startTime": T, "endTime": T + 30,
     }
 
 
 async def test_end_never_before_start() -> None:
-    client = _client(_stored(1, "x", "", "2026-09-21T07:13:20", ""))
+    client, calls = _client(_stored(1, "x", "", "2026-09-21T07:13:20", ""))
     bm = await client.create_bookmark(6, "x", T, T - 5)
-    assert client._call.await_args.kwargs["endTime"] == T
+    assert _bookmark_call(calls)["endTime"] == T
     assert bm.end == bm.start == T
 
 
 async def test_edit() -> None:
-    client = _client(_stored(12, "人", "", "2026-09-21T07:13:20", "2026-09-21T07:14:00"))
+    client, calls = _client(_stored(12, "人", "", "2026-09-21T07:13:20", "2026-09-21T07:14:00"))
     bm = await client.edit_bookmark(12, 6, "人", T, T + 40)
     assert bm.end == T + 40
-    assert client._call.await_args.args == (API, "Edit", 1)
-    assert client._call.await_args.kwargs["bookmarkId"] == 12
-    assert client._call.await_args.kwargs["name"] == '"人"'
+    call = _bookmark_call(calls)
+    assert (call["method"], call["version"]) == ("Edit", 1)
+    assert call["bookmarkId"] == 12
+    assert call["name"] == '"人"'
 
 
 async def test_unexpected_answer() -> None:
+    client, _ = _client({})
     with pytest.raises(SSError):
-        await _client({}).create_bookmark(6, "x", T, T)
+        await client.create_bookmark(6, "x", T, T)
 
 
 async def test_delete() -> None:
-    client = _client({})
+    client, calls = _client({})
     await client.delete_bookmarks([3, 4])
-    assert client._call.await_args.kwargs == {"bookmarkIds": "3,4"}
-    client._call.reset_mock()
+    call = _bookmark_call(calls)
+    assert (call["method"], call["bookmarkIds"]) == ("Delete", "3,4")
+    calls.clear()
     await client.delete_bookmarks([])
-    client._call.assert_not_awaited()
+    assert calls == []

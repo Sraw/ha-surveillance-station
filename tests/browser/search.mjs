@@ -9,7 +9,7 @@ const rows = () => ev((c) => [...c.shadowRoot.querySelectorAll(".ev-items .ev")]
 const state = () => ev((c) => ({
   search: !c.shadowRoot.querySelector(".ev-search").hidden,
   chips: [...c.shadowRoot.querySelectorAll(".ev-kinds button")].map((b) => b.textContent.trim()),
-  pins: c.shadowRoot.querySelectorAll(".bars .bm").length,
+  pins: c.shadowRoot.querySelectorAll(".pins .bm").length,
   foot: c.shadowRoot.querySelector(".ev-foot").textContent,
   sims: c.shadowRoot.querySelectorAll(".ev-items .sim").length,
 }));

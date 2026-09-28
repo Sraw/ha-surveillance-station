@@ -33,7 +33,6 @@ from .const import (
     CONF_TRANSCODER,
     DEFAULT_TRANSCODER,
     FRIGATE_SEARCH_MAX,
-    KIND_CHIPS_MAX,
     DOMAIN,
     LIVE_END_STALE_SECONDS,
     LIVE_URL,
@@ -42,7 +41,8 @@ from .const import (
     VOD_SESSION_TTL_SECONDS,
     VOD_URL,
 )
-from .frigate import DATA_FRIGATE, name_kinds
+from .errors import EntryNotLoaded, InvalidRequest, SessionNotFound
+from .frigate import DATA_FRIGATE
 from .frigate_api import FrigateAPIError
 from .search import search
 from .views import DATA_MANAGER, VodManager, VodSession
@@ -53,6 +53,9 @@ LIVE_THRESHOLD_SECONDS = 60
 ERR_SS = "surveillance_station_error"
 ERR_FRIGATE = "frigate_error"
 ERR_GPU_BUSY = "gpu_busy"
+
+# Epoch seconds. Bounded: vol.Coerce(float) alone takes "inf", which int() can't convert.
+_EPOCH = vol.All(vol.Coerce(float), vol.Range(min=0, max=2**32))
 
 
 @callback
@@ -73,10 +76,10 @@ def _client(hass: HomeAssistant, entry_id: str | None) -> tuple[str, Surveillanc
     if entry_id is None:
         entries = hass.config_entries.async_loaded_entries(DOMAIN)
         if not entries:
-            raise KeyError("no Surveillance Station is set up")
+            raise EntryNotLoaded("no Surveillance Station is set up")
         entry_id = entries[0].entry_id
     if (client := _manager(hass).client(entry_id)) is None:
-        raise KeyError(f"Surveillance Station entry {entry_id} is not loaded")
+        raise EntryNotLoaded(f"Surveillance Station entry {entry_id} is not loaded")
     return entry_id, client
 
 
@@ -114,9 +117,9 @@ async def _transcode_on_gpu(hass: HomeAssistant, entry_id: str, wait: bool = Tru
 def _range(msg: dict[str, Any]) -> tuple[int, int]:
     start, end = int(msg["start"]), int(msg["end"])
     if end <= start:
-        raise ValueError("end must be after start")
+        raise InvalidRequest("end must be after start")
     if end - start > MAX_QUERY_WINDOW_SECONDS:
-        raise ValueError(f"window is longer than {MAX_QUERY_WINDOW_SECONDS // 86400} days")
+        raise InvalidRequest(f"window is longer than {MAX_QUERY_WINDOW_SECONDS // 86400} days")
     return start, end
 
 
@@ -127,7 +130,12 @@ async def _run(
     entry_id = msg.get("entry_id")
     try:
         result = await coro
-    except (KeyError, ValueError) as err:
+    except (EntryNotLoaded, SessionNotFound) as err:
+        connection.send_error(msg["id"], websocket_api.ERR_NOT_FOUND, str(err))
+        return
+    except InvalidRequest as err:
+        # The commands' own checks of what was asked. Any other ValueError is
+        # a bug: HA's handler logs it (unknown_error).
         connection.send_error(msg["id"], websocket_api.ERR_INVALID_FORMAT, str(err))
         return
     except SSConnectionError as err:
@@ -190,8 +198,8 @@ def _describe(session: VodSession) -> dict[str, Any]:
 _RANGE_SCHEMA = {
     vol.Optional("entry_id"): str,
     vol.Required("camera_id"): vol.Coerce(int),
-    vol.Required("start"): vol.Coerce(float),
-    vol.Required("end"): vol.Coerce(float),
+    vol.Required("start"): _EPOCH,
+    vol.Required("end"): _EPOCH,
 }
 
 
@@ -220,8 +228,8 @@ async def ws_recordings(hass: HomeAssistant, connection: websocket_api.ActiveCon
         vol.Optional("entry_id"): str,
         # Omitted: every camera.
         vol.Optional("camera_ids"): [vol.Coerce(int)],
-        vol.Required("start"): vol.Coerce(float),
-        vol.Required("end"): vol.Coerce(float),
+        vol.Required("start"): _EPOCH,
+        vol.Required("end"): _EPOCH,
     }
 )
 @websocket_api.async_response
@@ -270,18 +278,13 @@ async def ws_bookmark_page(
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
         cams = msg.get("camera_ids")
-        shown = [b for b in await _manager(hass).bookmarks(entry_id, client) if cams is None or b.camera_id in cams]
+        manager = _manager(hass)
+        index = await manager.bookmark_index(entry_id, client)
         wanted = {k.strip().casefold() for k in msg.get("kinds") or [] if k.strip()}
-        matching = [b for b in shown if not wanted or wanted & {k.casefold() for k in name_kinds(b.name)}]
-        if "before" in msg:
-            cursor = (msg["before"], msg["before_id"])
-            rest = [b for b in matching if (b.start, b.id) < cursor]
-        else:
-            rest = matching
-        page = rest[: msg["limit"]]
+        cursor = (msg["before"], msg["before_id"]) if "before" in msg else None
+        page, total, more = index.page(cams, wanted, cursor, msg["limit"])
         # Frigate's bookmarks: Frigate's snapshot, as the notification's image.
         bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
-        manager = _manager(hass)
 
         def thumbnail(b: Bookmark) -> str:
             if bridge is not None:
@@ -289,28 +292,13 @@ async def ws_bookmark_page(
             return manager.sign_thumbnail(entry_id, b.camera_id, manager.frame(entry_id, b))
 
         return {
-            "total": len(matching),
-            "more": len(rest) > len(page),
-            "kinds": _kind_counts(shown),
+            "total": total,
+            "more": more,
+            "kinds": index.kind_counts(cams),
             "bookmarks": [_bookmark(b, thumbnail(b)) for b in page],
         }
 
     await _run(hass, connection, msg, go())
-
-
-def _kind_counts(bookmarks: list[Bookmark]) -> list[list[Any]]:
-    """The kinds to filter the event list by: those of more than one bookmark
-    (a hand-made bookmark's own name is no kind), most common first."""
-    counts: dict[str, int] = {}
-    spellings: dict[str, dict[str, int]] = {}  # "car": {"Car": 3, "car": 1}
-    for b in bookmarks:
-        for k in name_kinds(b.name):
-            key = k.casefold()
-            counts[key] = counts.get(key, 0) + 1
-            spellings.setdefault(key, {})[k] = spellings.setdefault(key, {}).get(k, 0) + 1
-    common = sorted((kc for kc in counts.items() if kc[1] > 1), key=lambda kc: (-kc[1], kc[0]))
-    # Each kind as it is mostly written.
-    return [[max(spellings[k].items(), key=lambda s: s[1])[0], n] for k, n in common[:KIND_CHIPS_MAX]]
 
 
 @websocket_api.websocket_command(
@@ -333,7 +321,7 @@ async def ws_search(hass: HomeAssistant, connection: websocket_api.ActiveConnect
         entry_id, _ = _client(hass, msg.get("entry_id"))
         bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
         if bridge is None:
-            raise ValueError("smart search needs Frigate detections turned on in the integration's options")
+            raise InvalidRequest("smart search needs Frigate detections turned on in the integration's options")
         results = await search(
             _manager(hass), entry_id, bridge,
             query=msg.get("query"), bookmark_id=msg.get("bookmark_id"),
@@ -365,7 +353,7 @@ def _bookmark(b: Bookmark, thumbnail: str | None = None) -> dict[str, Any]:
         vol.Optional("entry_id"): str,
         vol.Required("camera_id"): vol.Coerce(int),
         # Epoch seconds: play the recordings from then on. Omitted: real time.
-        vol.Optional("time"): vol.All(vol.Coerce(float), vol.Range(min=0, max=2**32)),
+        vol.Optional("time"): _EPOCH,
     }
 )
 @websocket_api.async_response
@@ -402,7 +390,7 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
         live = end >= now - LIVE_THRESHOLD_SECONDS and now < max_end
         end = min(live_edge(now) if live else min(end, now), max_end)
         if end <= start:
-            raise ValueError("window is in the future")
+            raise InvalidRequest("window is in the future")
         infos = await client.recordings(msg["camera_id"], int(start), int(end) + 1)
         segments = plan_segments(recordings_from(infos), start, end, now)
         if not segments:
@@ -418,7 +406,12 @@ async def ws_vod(hass: HomeAssistant, connection: websocket_api.ActiveConnection
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): "surveillance_station/vod_runs", vol.Required("token"): str}
+    {
+        vol.Required("type"): "surveillance_station/vod_runs",
+        # Sent by the card whenever its config names an entry; the token alone decides.
+        vol.Optional("entry_id"): str,
+        vol.Required("token"): str,
+    }
 )
 @websocket_api.async_response
 async def ws_vod_runs(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
@@ -427,9 +420,9 @@ async def ws_vod_runs(hass: HomeAssistant, connection: websocket_api.ActiveConne
     async def go():
         session = _manager(hass).get_session(msg["token"])
         if session is None:
-            raise KeyError("playback session expired")
+            raise SessionNotFound("playback session expired")
         if session.transcode:
-            raise KeyError("not a recordings session (time-lapse runs come with the session)")
+            raise SessionNotFound("not a recordings session (time-lapse runs come with the session)")
         return _describe(session)
 
     await _run(hass, connection, msg, go())
@@ -546,12 +539,15 @@ async def ws_timelapse(hass: HomeAssistant, connection: websocket_api.ActiveConn
     async def go():
         entry_id, client = _client(hass, msg.get("entry_id"))
         manager = _manager(hass)
-        day = date.fromisoformat(msg["date"])
+        try:
+            day = date.fromisoformat(msg["date"])  # the schema checks its shape only: 2026-13-40
+        except ValueError:
+            raise InvalidRequest("not a date") from None
         tz = await client.timezone()
         try:
             start, end = _day_bounds(day, tz)
         except OverflowError:
-            raise ValueError("date out of range") from None
+            raise InvalidRequest("date out of range") from None
         files = _camera_files(await manager.timelapse_files(entry_id, client), msg["camera_id"])
         segments, runs = plan_day(files, start, end)
         result: dict[str, Any] = {"date": day.isoformat(), "start": start, "end": end}
