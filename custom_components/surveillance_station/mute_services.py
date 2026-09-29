@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from functools import partial
 import logging
 import time
 from typing import Any
@@ -113,26 +114,16 @@ def _notification_action(hass: HomeAssistant, event: Event) -> None:
     bridge = hass.data.get(DATA_FRIGATE, {}).get(entry_id)
     if bridge is None or not 0 < seconds_int <= MUTE_ACTION_MAX_SECONDS:
         return
+    key = camera_key(camera) if camera else None
     # Only a camera the entry knows (any event on the bus may say anything).
-    if camera and (camera := camera_key(camera)) not in bridge.camera_keys():
+    if key is not None and key not in bridge.camera_keys():
         return
     # A button pressed on an old notification must not cut short a longer mute.
-    bridge.mute.extend(camera or None, time.time() + seconds_int)
+    bridge.mute.extend(key, time.time() + seconds_int)
 
 
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
-    async def mute(call: ServiceCall) -> None:
-        await _mute(hass, call)
-
-    async def unmute(call: ServiceCall) -> None:
-        await _unmute(hass, call)
-
-    hass.services.async_register(DOMAIN, SERVICE_MUTE, mute, MUTE_SCHEMA)
-    hass.services.async_register(DOMAIN, SERVICE_UNMUTE, unmute, UNMUTE_SCHEMA)
-
-    @callback
-    def pressed(event: Event) -> None:
-        _notification_action(hass, event)
-
-    hass.bus.async_listen(NOTIFICATION_ACTION_EVENT, pressed)
+    hass.services.async_register(DOMAIN, SERVICE_MUTE, partial(_mute, hass), MUTE_SCHEMA)
+    hass.services.async_register(DOMAIN, SERVICE_UNMUTE, partial(_unmute, hass), UNMUTE_SCHEMA)
+    hass.bus.async_listen(NOTIFICATION_ACTION_EVENT, partial(_notification_action, hass))

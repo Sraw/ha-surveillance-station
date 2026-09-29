@@ -20,7 +20,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-import math
 import time
 from typing import Any
 
@@ -53,6 +52,11 @@ class MuteRule:
 
     def active(self, now: float) -> bool:
         return self.until is None or self.until > now
+
+
+def _acceptable(rule: MuteRule, now: float) -> bool:
+    """Still in force, and not beyond MUTE_MAX_SECONDS (nor infinite, nor NaN)."""
+    return rule.until is None or now < rule.until <= now + MUTE_MAX_SECONDS
 
 
 def outlasts(end: float | None, other: float | None) -> bool:
@@ -99,9 +103,7 @@ class MuteRules:
                     None if item.get("until") is None else float(item["until"]),
                     frozenset(str(k) for k in excluded) if item.get("kind") is None else frozenset(),
                 )
-                if rule.until is not None and not math.isfinite(rule.until):
-                    continue
-                if rule.active(now) and (rule.until is None or rule.until - now <= MUTE_MAX_SECONDS) and (rule.camera, rule.kind) not in seen:
+                if _acceptable(rule, now) and (rule.camera, rule.kind) not in seen:
                     seen.add((rule.camera, rule.kind))
                     self._rules.append(rule)
                     if len(self._rules) == MUTE_RULES_MAX:
@@ -169,12 +171,12 @@ class MuteRules:
         else:
             self.replace(lambda r: False, [MuteRule(camera, k, until) for k in held[(camera, None)].excluded if longer(k)])
 
-    def replace(self, matches: Callable[[MuteRule], bool], add: list[MuteRule]) -> None:
-        """Drop the rules ``matches`` says yes to and add ``add`` (each replacing the rule of its camera and kind), as one change."""
+    def replace(self, matches: Callable[[MuteRule], bool], new: list[MuteRule]) -> None:
+        """Drop the rules ``matches`` says yes to and add ``new`` (each replacing the rule of its camera and kind), as one change."""
         now = time.time()
         if self._stopped:
             return
-        added = [r for r in add if r.until is None or now < r.until <= now + MUTE_MAX_SECONDS]
+        added = [r for r in new if _acceptable(r, now)]
         replaced = {(a.camera, a.kind) for a in added}
         rules = [r for r in self._rules if r.active(now) and not matches(r) and (r.camera, r.kind) not in replaced] + added
         # Bounded (a runaway script): the oldest timed rules go first, those
@@ -227,9 +229,6 @@ class MuteRules:
 
     async def async_flush(self) -> None:
         await self._store.async_save(self._data())
-
-    async def async_remove(self) -> None:
-        await self._store.async_remove()
 
     @callback
     def stop(self) -> None:

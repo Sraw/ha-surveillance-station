@@ -58,7 +58,7 @@ from .const import (
 from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, FrigateThumbnailView, store_key as frigate_store_key
 from .frigate_api import FrigateAPI
 from .manager import DATA_MANAGER, VodManager
-from .mute import MuteRules, store_key as mute_store_key
+from .mute import store_key as mute_store_key
 from .mute_services import async_setup_services
 from .views import (
     LargeImageView,
@@ -205,10 +205,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         _LOGGER.exception("Could not register the timeline card's Lovelace resource")
     if entry.options.get(CONF_FRIGATE):
         options = entry.options
-        mute = MuteRules(hass, entry.entry_id)
-        await mute.async_load()
-        # Its timer, also if setup fails after this (unloading stops it too).
-        entry.async_on_unload(mute.stop)
         bridge = FrigateBridge(
             hass,
             entry.entry_id,
@@ -221,8 +217,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             set(options.get(CONF_FRIGATE_QUIET_KINDS, DEFAULT_FRIGATE_QUIET_KINDS)),
             options.get(CONF_FRIGATE_CAMERAS) or {},
             FrigateAPI(async_get_clientsession(hass), url) if (url := options.get(CONF_FRIGATE_URL)) else None,
-            mute,
         )
+        await bridge.async_load_mute()
+        # Its mute rules' timer, also if setup fails after this (unloading stops it too).
+        entry.async_on_unload(bridge.mute.stop)
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.
         entry.async_create_background_task(hass, bridge.start(), "surveillance_station frigate setup")
@@ -254,16 +252,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
         if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
             return False
         hass.data[DATA_FRIGATE].pop(entry.entry_id)
-        bridge.stop()
-        try:
-            await bridge.async_flush()
-        except Exception:  # noqa: BLE001 - never a failed unload for it
-            _LOGGER.warning("Could not save the Frigate bridge's state", exc_info=True)
-        bridge.mute.stop()
-        try:
-            await bridge.mute.async_flush()
-        except Exception:  # noqa: BLE001 - never a failed unload for it
-            _LOGGER.warning("Could not save the mute rules", exc_info=True)
+        await bridge.async_unload()
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     # Closed rather than logged out: a handler still running can't log it in
     # again (a DSM session nobody would end).

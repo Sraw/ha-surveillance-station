@@ -17,10 +17,11 @@
  */
 
 const MUTE_TAG = "ss-mute-card";
-const { esc, labelAttrs, fillText, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups } = await import(
+const { esc, labelAttrs, fillText, kindLabel, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups } = await import(
   new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href
 );
-// Off and on, as icons.json has them for the switches.
+// Off and on, as icons.json has them for the switches. The kinds are listed in
+// this order, then any others; their names are muteText's `kinds`.
 const ALL_ICONS = ["mdi:bell-outline", "mdi:bell-off"];
 const CAMERA_ICONS = ["mdi:cctv", "mdi:cctv-off"];
 const KIND_ICONS = { person: ["mdi:walk", "mdi:account-off"], car: ["mdi:car", "mdi:car-off"], animal: ["mdi:paw", "mdi:paw-off"] };
@@ -39,7 +40,7 @@ const CSS = `
   .section { padding: 8px 16px 2px; font-size: .8em; text-transform: uppercase; letter-spacing: .05em; color: var(--secondary-text-color); }
   .row { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 0 16px; }
   .row.kind { padding-left: 52px; }
-  .row.unavailable { opacity: .45; }
+  .row.locked, .row.unavailable { opacity: .45; }
   .row ha-icon { color: var(--secondary-text-color); flex: none; }
   .row.on ha-icon { color: var(--primary-color); }
   .name { flex: 1; min-width: 0; }
@@ -134,15 +135,17 @@ class SSMuteCard extends HTMLElement {
     for (const r of this._rows) {
       const s = this._hass.states[r.id];
       const on = s?.state === "on";
-      const gone = !s || s.state === "unavailable" || s.attributes.locked === true; // locked: covered by a wider mute
+      const unavailable = !s || s.state === "unavailable";
+      const locked = !unavailable && s.attributes.locked === true; // covered by a wider mute
       // A camera partly muted says which of its kinds are.
-      const partial = r.kinds && !on ? Object.entries(r.kinds).filter(([, id]) => this._hass.states[id]?.state === "on").map(([k]) => this._text[k] ?? k) : [];
+      const partial = r.kinds && !on ? Object.entries(r.kinds).filter(([, id]) => this._hass.states[id]?.state === "on").map(([k]) => kindLabel(this._text, k)) : [];
       r.el.classList.toggle("on", on);
-      r.el.classList.toggle("unavailable", gone);
+      r.el.classList.toggle("locked", locked);
+      r.el.classList.toggle("unavailable", unavailable);
       r.icon.setAttribute("icon", r.icons[on ? 1 : 0]);
       r.sub.textContent = partial.length ? `${partial.join(", ")} · ${this._text.muted}` : muteEnds(s, this._text, this._hass.locale);
       r.sw.checked = on; // also puts back a switch whose call was refused
-      r.sw.disabled = gone;
+      r.sw.disabled = locked || unavailable;
     }
   }
 
@@ -154,10 +157,10 @@ class SSMuteCard extends HTMLElement {
   }
 
   _kindRows(kinds, text, row, camera) {
-    return ["person", "car", "animal", ...Object.keys(kinds).filter((k) => !KIND_ICONS[k])]
+    return [...Object.keys(KIND_ICONS), ...Object.keys(kinds).filter((k) => !KIND_ICONS[k])]
       .filter((k) => kinds[k])
       .map((k) => {
-        const label = text[k] ?? k[0].toUpperCase() + k.slice(1);
+        const label = kindLabel(text, k);
         const aria = camera == null ? fillText(text.muteKind, { kind: label }) : fillText(text.muteCameraKind, { kind: label, camera });
         return row({ id: kinds[k], label, aria, icons: KIND_ICONS[k] ?? OTHER_KIND_ICONS, cls: "kind" });
       })
@@ -188,14 +191,15 @@ class SSMuteCard extends HTMLElement {
   }
 
   _onClick(e) {
-    const t = e.target.closest?.("button");
-    if (!t) return;
+    const button = e.target.closest?.("button");
+    if (!button) return;
     const reported = () => {}; // HA shows a refused call's error
-    if (t.dataset.mute) this._hass.callService("surveillance_station", "mute", { duration: { hours: Number(t.dataset.mute) } }).catch(reported);
-    else if ("unmute" in t.dataset) this._hass.callService("surveillance_station", "unmute", {}).catch(reported);
-    else if (t.dataset.camera != null) {
-      const camera = t.dataset.camera;
-      this._open.has(camera) ? this._open.delete(camera) : this._open.add(camera);
+    if (button.dataset.mute) this._hass.callService("surveillance_station", "mute", { duration: { hours: Number(button.dataset.mute) } }).catch(reported);
+    else if ("unmute" in button.dataset) this._hass.callService("surveillance_station", "unmute", {}).catch(reported);
+    else if (button.dataset.camera != null) {
+      const camera = button.dataset.camera;
+      if (this._open.has(camera)) this._open.delete(camera);
+      else this._open.add(camera);
       this._seen = null;
       this._render();
       // The markup was rebuilt: keep the focus on this camera's arrow.

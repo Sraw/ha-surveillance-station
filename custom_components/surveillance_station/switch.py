@@ -32,21 +32,18 @@ from .frigate import DATA_FRIGATE, FrigateBridge, camera_key
 from .mute import MuteRule, MuteRules
 
 PARALLEL_UPDATES = 0
+# Every per-camera switch's unique id starts with this (after the entry id).
+CAMERA_ID_PREFIX = "mute_camera_"
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: SurveillanceStationConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     bridge = hass.data[DATA_FRIGATE][entry.entry_id]
-    rules = bridge.mute
-    async_add_entities(
-        [
-            MuteSwitch(entry, rules, "mute_all"),
-            *(MuteSwitch(entry, rules, f"mute_{kind.lower()}", kind=kind) for kind in MUTE_KINDS),
-        ]
-    )
+    mute = bridge.mute
+    async_add_entities([MuteSwitch(entry, mute, scope) for scope in (AllScope(), *(KindScope(kind) for kind in MUTE_KINDS))])
     registry = er.async_get(hass)
-    per_camera = f"{entry.entry_id}_mute_camera_"
+    per_camera = f"{entry.entry_id}_{CAMERA_ID_PREFIX}"
     known: set[str] = set()
 
     @callback
@@ -57,9 +54,7 @@ async def async_setup_entry(
         listed = {key: name for name in names if (key := camera_key(name))}  # a name of only symbols has no key to mute by
         # A camera SS no longer lists (removed, or renamed: a new key) loses its
         # switches; its rules stay (unmute takes its old name).
-        wanted = {f"{per_camera}{key}" for key in listed} | {
-            f"{per_camera}kind_{key}_{kind.lower()}" for key in listed for kind in MUTE_KINDS
-        }
+        wanted = {scope.unique_id(entry.entry_id) for key in listed for scope in camera_scopes(key)}
         for item in er.async_entries_for_config_entry(registry, entry.entry_id):
             if item.domain == "switch" and item.unique_id.startswith(per_camera) and item.unique_id not in wanted:
                 registry.async_remove(item.entity_id)
@@ -68,11 +63,7 @@ async def async_setup_entry(
         for key, name in listed.items():
             if key not in known:
                 known.add(key)
-                new.append(MuteSwitch(entry, rules, "mute_camera", camera=key, camera_name=name))
-                new.extend(
-                    MuteSwitch(entry, rules, "mute_camera_kind", camera=key, kind=kind, camera_name=name)
-                    for kind in MUTE_KINDS
-                )
+                new.extend(MuteSwitch(entry, mute, scope, camera_name=name) for scope in camera_scopes(key))
         if new:
             async_add_entities(new)
 
@@ -91,38 +82,105 @@ async def _list_cameras(bridge: FrigateBridge) -> None:
         wait = min(2 * wait, FRIGATE_CAMERAS_TTL)
 
 
+class Scope:
+    """What a switch mutes: every camera or one (camera, a camera key), every kind or one (kind)."""
+
+    camera: str | None = None
+    kind: str | None = None
+    # Muted, it locks the switch: shown on, not to be turned (None: nothing does).
+    wider: Scope | None = None
+    translation_key: str
+    unique_suffix: str
+
+    def unique_id(self, entry_id: str) -> str:
+        return f"{entry_id}_{self.unique_suffix}"
+
+    def turn_on(self, mute: MuteRules) -> None:
+        on, until = mute.coverage(self.camera, self.kind)
+        if not on or until is not None:  # a timed mute becomes one until turned off
+            mute.add(self.camera, self.kind, None)
+
+    def turn_off(self, mute: MuteRules) -> None:
+        """Everything, or a kind for every camera: that rule."""
+        mute.remove(lambda r: r.camera == self.camera and r.kind == self.kind)
+
+
+class AllScope(Scope):
+    translation_key = unique_suffix = "mute_all"
+
+
+class KindScope(Scope):
+    """One kind on every camera."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.wider = AllScope()
+        self.translation_key = self.unique_suffix = f"mute_{kind.lower()}"
+
+
+class CameraScope(Scope):
+    """Every kind on one camera."""
+
+    translation_key = "mute_camera"
+
+    def __init__(self, camera: str) -> None:
+        self.camera = camera
+        self.wider = AllScope()
+        self.unique_suffix = f"{CAMERA_ID_PREFIX}{camera}"
+
+    def turn_on(self, mute: MuteRules) -> None:
+        """One rule for the camera in place of its kinds'."""
+        mute.replace(lambda r: r.camera == self.camera and r.kind is not None, [MuteRule(self.camera, None, None)])
+
+    def turn_off(self, mute: MuteRules) -> None:
+        """Whatever mutes the camera, its kinds included."""
+        mute.remove(lambda r: r.camera == self.camera)
+
+
+class CameraKindScope(Scope):
+    """One kind on one camera."""
+
+    def __init__(self, camera: str, kind: str) -> None:
+        self.camera, self.kind = camera, kind
+        self.wider = KindScope(kind)
+        self.translation_key = f"mute_camera_{kind.lower()}"
+        # Camera keys have no underscore, so this cannot clash with another camera's.
+        self.unique_suffix = f"{CAMERA_ID_PREFIX}kind_{camera}_{kind.lower()}"
+
+    def turn_off(self, mute: MuteRules) -> None:
+        """The camera's all-kinds rule leaves the kind out, keeping its end, so every other kind stays muted."""
+        whole = next((r for r in mute.rules() if r.camera == self.camera and r.kind is None), None)
+        narrowed = [] if whole is None or self.kind in whole.excluded else [replace(whole, excluded=whole.excluded | {self.kind})]
+        mute.replace(lambda r: r.camera == self.camera and r.kind == self.kind, narrowed)
+
+
+def camera_scopes(camera: str) -> list[Scope]:
+    """A camera's switches: all kinds, and each kind."""
+    return [CameraScope(camera), *(CameraKindScope(camera, kind) for kind in MUTE_KINDS)]
+
+
 class MuteSwitch(SwitchEntity):
     _attr_has_entity_name = True
     _attr_should_poll = False
 
     def __init__(
-        self,
-        entry: SurveillanceStationConfigEntry,
-        rules: MuteRules,
-        key: str,
-        camera: str | None = None,
-        kind: str | None = None,
-        camera_name: str | None = None,
+        self, entry: SurveillanceStationConfigEntry, mute: MuteRules, scope: Scope, camera_name: str | None = None
     ) -> None:
-        self._rules = rules
-        self._camera = camera
-        self._kind = kind
+        self._mute = mute
+        self._scope = scope
         self._camera_name = camera_name
-        self._attr_translation_key = f"mute_camera_{kind.lower()}" if camera and kind else key
+        self._attr_translation_key = scope.translation_key
         if camera_name is not None:
             self._attr_translation_placeholders = {"camera": camera_name}
-        self._attr_unique_id = f"{entry.entry_id}_{key}" + (f"_{camera}" if camera else "")
-        if camera and kind:  # camera keys have no underscore, so this cannot clash with another camera's
-            self._attr_unique_id += f"_{kind.lower()}"
+        self._attr_unique_id = scope.unique_id(entry.entry_id)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)}, name="Surveillance Station", manufacturer="Synology"
         )
 
     def _locked(self) -> bool:
         """With everything muted, or the kind muted for every camera, the narrower switches are shown on but cannot be turned."""
-        if self._camera is None and self._kind is None:
-            return False
-        return self._rules.coverage(None, self._kind if self._camera is not None else None)[0]
+        wider = self._scope.wider
+        return wider is not None and self._mute.coverage(wider.camera, wider.kind)[0]
 
     def _check_unlocked(self) -> None:
         if self._locked():
@@ -131,13 +189,13 @@ class MuteSwitch(SwitchEntity):
     @callback
     def _update(self) -> None:
         """The state and attributes, worked out once per change of the rules."""
-        on, until = self._rules.coverage(self._camera, self._kind)
+        on, until = self._mute.coverage(self._scope.camera, self._scope.kind)
         self._attr_is_on = on
         # The scope (which camera, which kind) is for the mute card to lay the switches out by;
         # muted_until is None when off or until lifted.
         self._attr_extra_state_attributes = {
             "camera": self._camera_name,
-            "kind": self._kind.lower() if self._kind else None,
+            "kind": self._scope.kind.lower() if self._scope.kind else None,
             "locked": self._locked(),
             "muted_until": None if until is None else dt_util.utc_from_timestamp(until).isoformat(),
         }
@@ -149,27 +207,12 @@ class MuteSwitch(SwitchEntity):
 
     async def async_added_to_hass(self) -> None:
         self._update()
-        self.async_on_remove(self._rules.async_add_listener(self._rules_changed))
+        self.async_on_remove(self._mute.async_add_listener(self._rules_changed))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._check_unlocked()
-        if self._camera is not None and self._kind is None:  # all kinds: one rule for the camera in place of its kinds'
-            self._rules.replace(lambda r: r.camera == self._camera and r.kind is not None, [MuteRule(self._camera, None, None)])
-            return
-        on, until = self._rules.coverage(self._camera, self._kind)
-        if not on or until is not None:  # a timed mute becomes one until turned off
-            self._rules.add(self._camera, self._kind, None)
+        self._scope.turn_on(self._mute)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._check_unlocked()
-        camera, kind = self._camera, self._kind
-        if camera is not None and kind is None:  # all kinds: whatever mutes the camera, its kinds included
-            self._rules.remove(lambda r: r.camera == camera)
-            return
-        if camera is None:  # everything, or a kind for every camera: that rule
-            self._rules.remove(lambda r: r.camera is None and r.kind == kind)
-            return
-        # One kind of a camera: the camera's all-kinds rule leaves it out, keeping its end, so every other kind stays muted.
-        whole = next((r for r in self._rules.rules() if r.camera == camera and r.kind is None), None)
-        narrowed = [replace(whole, excluded=whole.excluded | {kind})] if whole is not None and kind not in whole.excluded else []
-        self._rules.replace(lambda r: r.camera == camera and r.kind == kind, narrowed)
+        self._scope.turn_off(self._mute)

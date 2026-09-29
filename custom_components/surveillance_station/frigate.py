@@ -43,7 +43,6 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
-import contextlib
 from dataclasses import dataclass, replace
 from datetime import timedelta
 import json
@@ -225,12 +224,12 @@ class FrigateBridge:
         quiet_kinds: set[str] | None = None,
         cameras: dict[str, str] | None = None,
         api: FrigateAPI | None = None,
-        mute: MuteRules | None = None,
     ) -> None:
         self.hass = hass
         self.api = api
-        # Which detections are announced as muted (see mute.py).
-        self.mute = mute or MuteRules(hass, entry_id)
+        # Which detections are announced as muted (see mute.py): read by
+        # async_load_mute, stopped by stop(), written by async_unload.
+        self.mute = MuteRules(hass, entry_id)
         self.entry_id = entry_id
         self.client = client
         self.manager = manager
@@ -436,10 +435,15 @@ class FrigateBridge:
         self._queue.canary()  # left over from before a restart: try now, not in a minute
         return True
 
+    async def async_load_mute(self) -> None:
+        """Read the mute rules: before the switches, which show them (start() reads the rest)."""
+        await self.mute.async_load()
+
     @callback
     def stop(self) -> None:
         self._stopped = True
         self._subscribed = False
+        self.mute.stop()
         # Not handled yet, or cut short: kept for next time (async_flush
         # writes it).
         self._queue.stop()
@@ -473,6 +477,16 @@ class FrigateBridge:
             # subscribed yet), and writing now would replace it with nothing.
             return
         await self._store.async_save(self._data())
+
+    async def async_unload(self) -> None:
+        """Stop, and write now what must survive a restart (before a reload reads it, or a removal
+        deletes it): the reviews' state and the mute rules. Never fails."""
+        self.stop()
+        for what, flush in (("the Frigate bridge's state", self.async_flush), ("the mute rules", self.mute.async_flush)):
+            try:
+                await flush()
+            except Exception:  # noqa: BLE001 - never a failed unload for it
+                _LOGGER.warning("Could not save %s", what, exc_info=True)
 
     @callback
     def _availability(self, msg: mqtt.ReceiveMessage) -> None:
@@ -833,15 +847,26 @@ class FrigateBridge:
             return self._cameras_by_name.get(name)
         return self._cameras.get(key)
 
-    async def _find_camera(self, frigate_camera: str) -> tuple[int, str] | None:
+    async def _find_camera(self, frigate_camera: str, stale_ok: bool = False) -> tuple[int, str] | None:
         """The SS camera (id, name) a Frigate camera is; the list read again when due."""
         age = _monotonic() - self._cameras_at
         # Listed again at most once a minute for a camera not there (added or
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
-        if age > FRIGATE_CAMERAS_TTL or (self._lookup(frigate_camera) is None and age > 60):
-            await self._list_cameras()
+        due = age > FRIGATE_CAMERAS_TTL or (self._lookup(frigate_camera) is None and age > 60)
+        await self._refresh_cameras(due, stale_ok)
         return self._lookup(frigate_camera)
+
+    async def _refresh_cameras(self, due: bool, stale_ok: bool) -> None:
+        """List the cameras again if due. SS failing: SSError, or with stale_ok the list as it was
+        (still due, so the next asker tries again)."""
+        if not due:
+            return
+        try:
+            await self._list_cameras()
+        except SSError:
+            if not stale_ok:
+                raise
 
     async def _list_cameras(self) -> None:
         """SS's cameras listed afresh: one listing at a time, whose outcome everyone asking meanwhile shares.
@@ -874,21 +899,20 @@ class FrigateBridge:
         self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
         self._cameras_by_name = {c.name: (c.id, c.name) for c in cameras}
         for listener in list(self._camera_listeners):
-            listener([c.name for c in cameras])
+            listener(self._camera_names())
+
+    def _camera_names(self) -> list[str]:
+        """The SS cameras' names, as last listed."""
+        return list(self._cameras_by_name)
 
     async def camera_names(self) -> list[str]:
         """The SS cameras' names: listed again after a while; if SS fails, as they were."""
-        if _monotonic() - self._cameras_at > FRIGATE_CAMERAS_TTL:
-            with contextlib.suppress(SSError):  # still due: tried again by the next asker
-                await self._list_cameras()
-        return [name for _, name in self._cameras_by_name.values()]
+        await self._refresh_cameras(_monotonic() - self._cameras_at > FRIGATE_CAMERAS_TTL, stale_ok=True)
+        return self._camera_names()
 
     async def resolve_camera(self, name: str) -> str | None:
         """The camera key (as detections name their camera) of the SS or Frigate camera called ``name``."""
-        try:
-            found = await self._find_camera(name)
-        except SSError:
-            found = self._lookup(name)  # SS not answering: the list as it was
+        found = await self._find_camera(name, stale_ok=True)  # SS not answering: the list as it was
         return (camera_key(found[1]) or None) if found else None
 
     def camera_keys(self) -> set[str]:
@@ -904,7 +928,7 @@ class FrigateBridge:
         """Told the SS cameras' names each time they are listed (and now, if they have been)."""
         self._camera_listeners.append(listener)
         if self._cameras_by_name:
-            listener([name for _, name in self._cameras_by_name.values()])
+            listener(self._camera_names())
 
         @callback
         def remove() -> None:

@@ -283,19 +283,22 @@ const MUTE_TEXT = {
   en: {
     title: "Notifications", everything: "Everything", byKind: "By kind", cameras: "Cameras", forever: "forever",
     until: "until {t}", muteFor: "Mute {n} h", unmuteAll: "Unmute all", none: "No Surveillance Station mute switches found.",
-    muted: "muted", person: "Person", car: "Car", animal: "Animal", kindsOf: "Kinds on {camera}",
+    muted: "muted", kinds: { person: "Person", car: "Car", animal: "Animal" }, kindsOf: "Kinds on {camera}",
     muteAll: "Mute everything", muteKind: "Mute {kind} on every camera", muteCamera: "Mute {camera}", muteCameraKind: "Mute {kind} on {camera}",
   },
   zh: {
     title: "通知", everything: "全部", byKind: "按类型", cameras: "摄像头", forever: "永久",
     until: "至 {t}", muteFor: "静音 {n} 小时", unmuteAll: "全部取消静音", none: "未找到 Surveillance Station 的静音开关。",
-    muted: "已静音", person: "人", car: "车", animal: "动物", kindsOf: "{camera}的类型",
+    muted: "已静音", kinds: { person: "人", car: "车", animal: "动物" }, kindsOf: "{camera}的类型",
     muteAll: "全部静音", muteKind: "静音所有摄像头的{kind}", muteCamera: "静音{camera}", muteCameraKind: "静音{camera}的{kind}",
   },
 };
 
 /** The mute card's texts for a UI language (English for the ones it has none of). */
 export const muteText = (language) => MUTE_TEXT[String(language ?? "").toLowerCase().startsWith("zh") ? "zh" : "en"];
+
+/** A kind's name in the card's texts; one it has no name for (a Frigate label's) capitalized. */
+export const kindLabel = (text, kind) => text.kinds[kind] ?? kind[0].toUpperCase() + kind.slice(1);
 
 /** A text with its {name} places filled in (a function, so a "$&" in a camera's name stays as it is). */
 export const fillText = (template, values) => template.replace(/\{(\w+)\}/g, (_, k) => values[k]);

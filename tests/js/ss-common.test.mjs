@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
   audioCodecOf, codecOf, esc, findBox, hour12Of, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml, fillText, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText,
+  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -453,7 +453,7 @@ describe("mute card helpers", () => {
       assert.equal(ends(null, en24, muteText("zh-Hans")), "永久");
       assert.equal(ends("2026-09-29T20:00:00+00:00", { language: "zh-Hans", time_format: "24" }, muteText("zh-Hans")), "至 20:00");
       assert.equal(ends("not a time"), "");
-      assert.equal(muteText("de").person, "Person");
+      assert.equal(muteText("de").kinds.person, "Person");
     });
   });
 
@@ -470,6 +470,12 @@ describe("mute card helpers", () => {
     assert.deepEqual(muteDurations("4"), [1, 8]);
     assert.deepEqual(muteDurations([2, "0.5", "abc", 0, -1, null, Infinity, "24"]), [2, 0.5, 24]);
     assert.deepEqual(muteDurations([]), []);
+  });
+
+  test("a kind's name: the card's, or the kind capitalized (never a UI text of the same name)", () => {
+    assert.equal(kindLabel(muteText("zh"), "car"), "车");
+    assert.equal(kindLabel(muteText("en"), "bicycle"), "Bicycle");
+    assert.equal(kindLabel(muteText("en"), "title"), "Title");
   });
 
   test("fillText fills every place, and a name's $ stays as it is", () => {
