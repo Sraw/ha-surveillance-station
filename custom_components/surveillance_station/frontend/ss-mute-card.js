@@ -203,8 +203,9 @@ class SSMuteCard extends HTMLElement {
       else this._open.add(camera);
       this._seen = null;
       this._render();
-      // The markup was rebuilt: keep the focus on this camera's arrow.
-      [...this.shadowRoot.querySelectorAll("button.chevron")].find((b) => b.dataset.camera === camera)?.focus();
+      // The markup was rebuilt: keep the focus on this camera's arrow. Its new ha-card (a Lit element)
+      // renders in a microtask, and until then the arrow is not in the flat tree and can't take focus.
+      requestAnimationFrame(() => [...this.shadowRoot.querySelectorAll("button.chevron")].find((b) => b.dataset.camera === camera)?.focus());
     }
   }
 }
