@@ -45,7 +45,7 @@ const section = async (name, run) => {
 };
 
 const shot = (ev, bar = ".controls") => () => ev((c, bar) => c.shadowRoot.querySelector(`${bar} [data-act="snap"]`).click(), bar);
-const one = { grid: false, cameras: [7] }; // a smaller camera than the 4K one: the rig has little memory
+const one = { grid: false, cameras: [7] };
 
 await section("live", async (start) => {
   const { browser, page, ev } = await start({ prefs: one });
@@ -63,14 +63,17 @@ await section("fullscreen bar", async (start) => {
   check(!!r.size, "the fullscreen bar's button saves too");
   await browser.close();
 });
-// The grid, live (playback crashes this rig's Chrome with or without a snapshot when memory is short).
+// The grid, in playback, all the cameras.
 await section("grid", async (start) => {
-  const { browser, page, ev } = await start({ prefs: { grid: true, cameras: [7, 10] } });
+  const { browser, page, ev } = await start({ prefs: { grid: true } });
   await waitReady(ev);
-  await sleep(4000);
+  const t = Math.floor(Date.now() / 1000) - 3 * 3600 - 600;
+  await ev((c, t) => c._seekAll(t, true), t);
+  await sleep(6000);
+  await waitReady(ev);
   const [n, cols] = await ev((c) => [c._players.size, Number(c._stage.style.getPropertyValue("--cols"))]);
   const r = await save(page, shot(ev));
-  const d = new Date();
+  const d = new Date((t + 6) * 1000);
   const p2 = (x) => String(x).padStart(2, "0");
   check(n > 1 && r.size && r.size.w > 1000 && r.size.w <= 3840 && r.bytes > 20000, `grid of ${n} (${cols} columns): one JPEG ${r.size?.w}x${r.size?.h}, ${r.bytes} bytes`);
   check(r.name.startsWith(`Cameras ${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}-`), `grid: named for the time played ("${r.name}")`);
