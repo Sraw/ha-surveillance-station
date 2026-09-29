@@ -37,11 +37,11 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.22.2";
+const CARD_VERSION = "0.22.3";
 // What this card shares with the time-lapse card, loaded as that card is:
 // with this card's version, so a release never runs against a stale cached copy.
 const {
-  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, sliderKey, setSliderValue, kindTest, veilHtml, VEIL_CSS, setVeil,
+  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, hour12Of, sliderKey, setSliderValue, kindTest, veilHtml, VEIL_CSS, setVeil,
   ticksOf, liveViewEnd, readStreamMsg, findBox, codecOf, audioCodecOf,
 } = await import(new URL(`./ss-common.js?v=${CARD_VERSION}`, import.meta.url).href);
 // After giving up on a stream, it is tried again this often while visible.
@@ -138,15 +138,10 @@ const prefs = prefsFor("ss-timeline-card.");
 let hour12 = false;
 let hour12Key;
 function setTimeFormat(locale) {
-  const f = locale?.time_format;
-  const key = `${f}|${locale?.language}`;
+  const key = `${locale?.time_format}|${locale?.language}`;
   if (key === hour12Key) return; // hass is set on every state change
   hour12Key = key;
-  if (f === "12" || f === "24") hour12 = f === "12";
-  else {
-    const lang = f === "system" ? undefined : locale?.language;
-    hour12 = Boolean(new Intl.DateTimeFormat(lang, { hour: "numeric" }).resolvedOptions().hour12);
-  }
+  hour12 = hour12Of(locale);
 }
 function fmtTime(t, seconds = true) {
   const d = new Date(t * 1000);

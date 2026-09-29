@@ -50,6 +50,13 @@ async def test_card_registered_as_resource(hass: HomeAssistant, setup_integratio
     assert urls == [f"/surveillance_station_static/{CARD_FILENAME}?v={version}"]
 
 
+async def test_cards_are_cached_by_version(hass: HomeAssistant, setup_integration: MockConfigEntry, hass_client) -> None:
+    """Every URL of the cards carries the version, so they are served to be kept."""
+    client = await hass_client()
+    response = await client.get(f"/surveillance_station_static/{CARD_FILENAME}?v=1")
+    assert response.status == 200 and response.headers["Cache-Control"].startswith("public, max-age=")
+
+
 async def test_card_resource_follows_the_last_entry(
     hass: HomeAssistant, setup_integration: MockConfigEntry
 ) -> None:

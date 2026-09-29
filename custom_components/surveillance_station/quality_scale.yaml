@@ -7,14 +7,16 @@ rules:
   action-setup: done
   appropriate-polling:
     status: exempt
-    comment: Nothing is polled; every NAS call answers a card request.
+    comment: >-
+      No entity polls (the switches show local rules). The NAS is called for
+      the cards and Frigate's reviews, and while it is down to see whether it
+      is back: the Frigate bridge each minute while bookmarks fail, the mute
+      switches (to find the cameras) after 1, 2, 4, 8, then every 10 minutes.
   brands: done
   common-modules: done
   config-flow-test-coverage: done
   config-flow: done
-  dependency-transparency:
-    status: todo
-    comment: synology-ss-playback is built from this repo, not yet on PyPI.
+  dependency-transparency: done
   docs-actions: done
   docs-conditions:
     status: exempt
@@ -49,9 +51,7 @@ rules:
   log-when-unavailable: done
   parallel-updates: done
   reauthentication-flow: done
-  test-coverage:
-    status: todo
-    comment: 86 % (2026-09-25); the fetch-cancellation and cache-eviction paths lack tests.
+  test-coverage: done
 
   # Gold
   devices: done
@@ -71,7 +71,9 @@ rules:
   docs-use-cases: done
   dynamic-devices:
     status: exempt
-    comment: No devices.
+    comment: >-
+      One device per entry, made with it; a camera SS lists later gets its
+      switches on that device then, and one it no longer lists loses them.
   entity-category:
     status: exempt
     comment: The switches are controls, with no category.
@@ -80,7 +82,9 @@ rules:
     comment: Plain switches.
   entity-disabled-by-default:
     status: exempt
-    comment: Four switches and one per camera, each one wanted.
+    comment: >-
+      Four switches, and four per camera (all kinds, and each kind): the mute
+      card lays them all out as one hierarchy, so each one is wanted.
   entity-translations: done
   exception-translations: done
   icon-translations: done

@@ -203,7 +203,8 @@ actions:
 
 A mute is a rule: a camera (or every camera), a kind (or every kind: Person,
 Car, Animal, or a Frigate label's name) and an end (or none, until lifted).
-Muting is only about being told: the detection is still bookmarked and its
+A rule for every kind can leave some out (a kind turned off on a muted
+camera's switches). Muting is only about being told: the detection is still bookmarked and its
 event still fires, with **`muted: true`**, for an automation to respect (the
 blueprint does, so nothing is sent). A review is muted when **every** kind in
 it is covered by a rule for its camera, so muting animals doesn't silence a
@@ -213,26 +214,40 @@ person who joins a dog's review. The rules are kept across restarts.
   all optional; no duration: until unmuted) and `surveillance_station.unmute`
   (`camera`, `objects`; with neither, everything). `camera` takes the SS name
   or Frigate's (`drive_way`); several `objects` are a rule each; a camera with
-  objects mutes just those there. `unmute` lifts every rule that has the given
-  camera and/or objects, whatever else it covers. E.g. the driveway's people
+  objects mutes just those there. `mute` sets the end of the rules it names,
+  also when that is sooner than before. `unmute` lifts every rule that has the given
+  camera and/or objects, whatever else it covers; for a camera SS no longer
+  lists (removed, renamed), its old name still works. E.g. the driveway's people
   for 2 hours: `camera: drive_way`, `objects: [person]`, `duration: "02:00:00"`.
 - **Switches** (device *Surveillance Station*): *Mute all notifications*, one
   per kind, one per camera (*all kinds*), and one per kind on each camera. On
   mutes until turned off; a timed mute from the action shows on, with
-  `muted_until` (and `mute_ends`, the same for display: a local time, or
-  `forever`). The switches follow the hierarchy: a camera's *all kinds* shows
-  its kinds on; turning one of them off leaves the camera's other kinds muted
-  and *all kinds* off; all its kinds on shows *all kinds* on, and turning that
-  off lifts them all. With *Mute all* on, every other switch shows on but is
+  `muted_until` (UTC, ISO 8601; `null` when off, or on until turned off). A
+  switch shows on exactly when every detection it is about is muted, so the
+  switches follow the hierarchy: a camera's *all kinds* shows its kinds on,
+  and shows on itself only when every kind there is muted, the kinds without
+  a switch (Bicycle, Package, ...) too; its three kinds turned on one by one
+  leave it off. Turning one kind off on a muted camera leaves every other
+  kind there muted, those without a switch included; turning it on again
+  shows *all kinds* on again, and turning *all kinds* off lifts them all.
+  *All kinds* lasts as long as the longest of what mutes all of it (its own
+  rule, *Mute all*, or its kinds together, until the first of them ends).
+  With *Mute all* on, every other switch shows on but is
   `locked` (turning it is refused; likewise a camera's kind while that kind is
-  muted for every camera). A camera
-  renamed in SS gets new switches (rules name cameras by their name, ignoring
-  case, spaces and punctuation).
+  muted for every camera). The attributes `camera`, `kind` and `locked` are
+  what the mute card lays the switches out by. A camera removed or renamed in
+  SS loses its switches the next time SS lists its cameras (a renamed one
+  gets new ones: rules name cameras by their name, ignoring case, spaces and
+  punctuation); its rules stay until they end or are unmuted.
 - **Buttons on the notification** (the blueprint's *Mute buttons*, Android):
   *Mute all 1 h* and *Mute <camera> 1 h*, the hours being its *Mute hours*.
   They fire the companion app's `mobile_app_notification_action` with the id
   `SS_MUTE:<entry id>:<seconds>:<camera key, empty for all>`, which the
-  integration answers.
+  integration answers. Unlike the action, a button never cuts a mute short:
+  pressed on an old notification while everything is muted until turned
+  off, or a camera for longer, it leaves that mute as it is (a kind turned
+  off on that camera is muted for the button's hours). A camera whose name
+  is only symbols has no key, and no button of its own.
 
 **After updating, re-import the blueprint** (Blueprints → the three dots →
 Re-import blueprint): the mute is honoured by the automation, and the copy

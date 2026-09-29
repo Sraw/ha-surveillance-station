@@ -59,6 +59,17 @@ export function setLabel(el, text) {
 }
 
 /**
+ * Whether times read 12 h, as the user's HA profile says (hass.locale.time_format:
+ * "12", "24", "language" or "system").
+ */
+export function hour12Of(locale) {
+  const f = locale?.time_format;
+  if (f === "12" || f === "24") return f === "12";
+  const lang = f === "system" ? undefined : locale?.language;
+  return Boolean(new Intl.DateTimeFormat(lang, { hour: "numeric" }).resolvedOptions().hour12);
+}
+
+/**
  * A slider's value after a key: the arrows move it by `step`, Page Up / Down
  * by `page`, Home / End to its ends, always within [min, max]. null: a key
  * the slider leaves alone.
@@ -270,39 +281,87 @@ export function audioCodecOf(moov) {
 
 const MUTE_TEXT = {
   en: {
-    title: "Notifications", everything: "Everything", allCameras: "All cameras", allKinds: "All kinds", cameras: "Cameras", forever: "forever",
+    title: "Notifications", everything: "Everything", byKind: "By kind", cameras: "Cameras", forever: "forever",
     until: "until {t}", muteFor: "Mute {n} h", unmuteAll: "Unmute all", none: "No Surveillance Station mute switches found.",
-    muted: "muted", person: "Person", car: "Car", animal: "Animal",
+    muted: "muted", person: "Person", car: "Car", animal: "Animal", kindsOf: "Kinds on {camera}",
+    muteAll: "Mute everything", muteKind: "Mute {kind} on every camera", muteCamera: "Mute {camera}", muteCameraKind: "Mute {kind} on {camera}",
   },
   zh: {
-    title: "通知", everything: "全部", allCameras: "所有摄像头", allKinds: "所有类型", cameras: "摄像头", forever: "永久",
+    title: "通知", everything: "全部", byKind: "按类型", cameras: "摄像头", forever: "永久",
     until: "至 {t}", muteFor: "静音 {n} 小时", unmuteAll: "全部取消静音", none: "未找到 Surveillance Station 的静音开关。",
-    muted: "已静音", person: "人", car: "车", animal: "动物",
+    muted: "已静音", person: "人", car: "车", animal: "动物", kindsOf: "{camera}的类型",
+    muteAll: "全部静音", muteKind: "静音所有摄像头的{kind}", muteCamera: "静音{camera}", muteCameraKind: "静音{camera}的{kind}",
   },
 };
 
 /** The mute card's texts for a UI language (English for the ones it has none of). */
 export const muteText = (language) => MUTE_TEXT[String(language ?? "").toLowerCase().startsWith("zh") ? "zh" : "en"];
 
-/** How long a mute switch's mute lasts, as text: "forever", "until 2026-09-29 20:00", "" when off. */
-export function muteEnds(state, text) {
-  const ends = state?.attributes?.mute_ends;
-  if (!ends) return "";
-  return ends === "forever" ? text.forever : text.until.replace("{t}", ends);
+/** A text with its {name} places filled in (a function, so a "$&" in a camera's name stays as it is). */
+export const fillText = (template, values) => template.replace(/\{(\w+)\}/g, (_, k) => values[k]);
+
+const endFormats = new Map();
+function endFormat(language, opts) {
+  const key = `${language}|${JSON.stringify(opts)}`;
+  let f = endFormats.get(key);
+  if (!f) {
+    try {
+      f = new Intl.DateTimeFormat(language, opts);
+    } catch (e) {
+      f = new Intl.DateTimeFormat(undefined, opts); // a language tag Intl doesn't know
+    }
+    endFormats.set(key, f);
+  }
+  return f;
 }
 
 /**
- * The mute switches among hass.states, laid out for the card: one group per
- * device (a Surveillance Station entry) with `all` (everything), `kinds`
- * (kind -> entity id, for every camera) and `cameras` (by name, each with `all`
- * and `kinds`). A mute switch is one with the mute_ends attribute; the
- * integration says which camera and kind it is for in `camera` and `kind`.
+ * How long a mute switch's mute lasts, as text in the browser's time zone and
+ * the user's 12 / 24 h setting: "forever" (on without muted_until: until
+ * lifted), "until 20:00" today, with the day (and year) otherwise, "" when off.
  */
-export function muteGroups(hass) {
+export function muteEnds(state, text, locale, now = Date.now()) {
+  if (state?.state !== "on") return "";
+  const until = state.attributes?.muted_until;
+  if (until == null) return text.forever;
+  const t = new Date(until);
+  if (Number.isNaN(t.getTime())) return "";
+  const today = new Date(now);
+  // h23, not hour12: false, which some browsers show as 24:00 at midnight.
+  const opts = { hour: "numeric", minute: "2-digit", hourCycle: hour12Of(locale) ? "h12" : "h23" };
+  if (t.toDateString() !== today.toDateString()) {
+    Object.assign(opts, { month: "short", day: "numeric" }, t.getFullYear() !== today.getFullYear() ? { year: "numeric" } : {});
+  }
+  return fillText(text.until, { t: endFormat(locale?.language || undefined, opts).format(t) });
+}
+
+/** The hours the card's buttons mute everything for: its `durations` that are positive numbers (default 1 and 8). */
+export function muteDurations(durations) {
+  if (!Array.isArray(durations)) return [1, 8];
+  return durations.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+}
+
+/**
+ * The entities that may be mute switches: this integration's switches in
+ * hass.entities (the registry, which changes far less often than the states).
+ */
+export const muteSwitchIds = (hass) =>
+  Object.entries(hass?.entities ?? {})
+    .filter(([id, e]) => id.startsWith("switch.") && e?.platform === "surveillance_station")
+    .map(([id]) => id);
+
+/**
+ * The mute switches among `ids`, laid out for the card: one group per device
+ * (a Surveillance Station entry) with `all` (everything), `kinds` (kind ->
+ * entity id, for every camera) and `cameras` (by name, each with `all` and
+ * `kinds`). A mute switch has the `camera` and `locked` attributes; `camera`
+ * and `kind` say which camera and kind it is for.
+ */
+export function muteGroups(hass, ids = muteSwitchIds(hass)) {
   const groups = new Map();
-  for (const [id, state] of Object.entries(hass?.states ?? {})) {
-    const attrs = state?.attributes;
-    if (!id.startsWith("switch.") || !attrs || !("mute_ends" in attrs) || !("camera" in attrs)) continue;
+  for (const id of ids) {
+    const attrs = hass.states?.[id]?.attributes;
+    if (!attrs || !("camera" in attrs) || !("locked" in attrs)) continue;
     const device = hass.entities?.[id]?.device_id ?? "";
     if (!groups.has(device)) groups.set(device, { device, all: null, kinds: {}, cameras: [] });
     const group = groups.get(device);

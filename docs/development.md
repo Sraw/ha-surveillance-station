@@ -21,7 +21,8 @@
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE), `/timelapse_days`, `/timelapse` (a time-lapse session: one camera, one day) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 | `…/frontend/ss-timelapse-card.js` | `custom:ss-timelapse-card`, loaded by the timeline card (same version, no resource of its own) |
-| `…/frontend/ss-mute-card.js` | `custom:ss-mute-card`, loaded by the timeline card (same version, no resource of its own): the mute switches as a hierarchy (everything, a kind, a camera, one kind on a camera), found by their `mute_ends` attribute; `tests/browser/mute-card.mjs` drives it |
+| `…/mute.py`, `…/mute_services.py`, `…/switch.py` | Muting notifications (see *Frigate detections*): the rules and what they cover (`MuteRules.coverage`, which the switches show), the mute/unmute actions and the notification's buttons, the switches |
+| `…/frontend/ss-mute-card.js` | `custom:ss-mute-card`, loaded by the timeline card (same version, no resource of its own): the mute switches as a hierarchy (everything, a kind, a camera, one kind on a camera), found as this integration's switches with `camera` and `locked` attributes; `tests/browser/mute-card.mjs` drives it |
 | `…/frontend/ss-common.js` | What the cards share: MSE and the MP4 init-segment parsers, SS's stream message parser, the timeline ticks, the veil, control labels, per-viewer preferences. Each card imports it with its own `?v=` version query, so a release never mixes a new card with a stale cached copy |
 
 ## Deploying a checkout
@@ -38,13 +39,21 @@ synology-ss-playback`.
 `scripts/dashboard.py` creates a test dashboard `/ss-playback` from
 `dashboards/ss-playback.json`.
 
+The cards are served to be kept for a month (every URL of them carries the
+version), so a changed card deployed under the same version shows only after
+a reload that bypasses the browser's cache, or once `manifest.json`'s
+`version` and `CARD_VERSION` are bumped.
+
 ## Releasing
 
-1. Library changed: bump `synology_ss/pyproject.toml`, push, then tag
+1. Library changed: bump `synology_ss/pyproject.toml`, push it to `main`, then tag
    `synology-ss-vX.Y.Z` and push the tag: `.github/workflows/publish-library.yml`
-   builds and uploads it to PyPI (Trusted Publishing, no token; the tag must
-   match the version). Then pin the new version in `manifest.json`'s
+   runs the library tests, builds it and uploads it to PyPI (Trusted Publishing,
+   no token; the tag must match the version and be on a commit already on
+   `main`). Then pin the new version in `manifest.json`'s
    `requirements`. (Manual fallback: `python -m build synology_ss` + `twine upload`.)
+   Set required reviewers on the repository's `pypi` environment (Settings →
+   Environments → pypi) so the upload waits for an approval.
 2. Bump `manifest.json`'s `version`, tag `vX.Y.Z` and create a GitHub release
    (HACS offers releases).
 

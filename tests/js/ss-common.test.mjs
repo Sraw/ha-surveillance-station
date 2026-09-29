@@ -4,8 +4,8 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
-  audioCodecOf, codecOf, esc, findBox, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml, muteEnds, muteGroups, muteText,
+  audioCodecOf, codecOf, esc, findBox, hour12Of, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
+  sliderKey, ticksOf, veilHtml, fillText, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -379,21 +379,32 @@ describe("the veil", () => {
 // ---- The mute card ---------------------------------------------------------------
 
 describe("mute card helpers", () => {
-  const sw = (camera, kind, state = "off", mute_ends = null) => ({ state, attributes: { camera, kind, mute_ends } });
+  const sw = (camera, kind, state = "off", muted_until = null) => ({ state, attributes: { camera, kind, locked: false, muted_until } });
+  const ours = (device) => ({ platform: "surveillance_station", device_id: device });
   const hass = {
-    entities: { "switch.a": { device_id: "d1" }, "switch.b": { device_id: "d1" }, "switch.c": { device_id: "d1" }, "switch.d": { device_id: "d1" },
-      "switch.e": { device_id: "d1" }, "switch.x": { device_id: "d2" } },
+    entities: {
+      "switch.a": ours("d1"), "switch.b": ours("d1"), "switch.c": ours("d1"), "switch.d": ours("d1"), "switch.e": ours("d1"),
+      "switch.x": ours("d2"), "switch.other": ours("d1"), "switch.new": ours("d1"),
+      "switch.theirs": { platform: "other", device_id: "d1" }, "light.k": ours("d1"),
+    },
     states: {
       "switch.a": sw(null, null),
       "switch.b": sw(null, "person"),
-      "switch.c": sw("Front Door", null, "on", "forever"),
+      "switch.c": sw("Front Door", null, "on"),
       "switch.d": sw("Front Door", "car"),
       "switch.e": sw("Backyard", null),
       "switch.x": sw(null, null),
-      "switch.other": { state: "on", attributes: {} }, // not a mute switch
-      "light.k": { state: "on", attributes: { camera: null, kind: null, mute_ends: null } },
+      "switch.other": { state: "on", attributes: {} }, // one of ours, not a mute switch
+      // switch.new: in the registry, no state yet
+      "switch.theirs": sw("Front Door", null, "on"), // the same attributes from another integration
+      "light.k": sw(null, null),
     },
   };
+
+  test("the integration's switches are the ones that may be mute switches", () => {
+    assert.deepEqual(muteSwitchIds(hass), ["switch.a", "switch.b", "switch.c", "switch.d", "switch.e", "switch.x", "switch.other", "switch.new"]);
+    assert.deepEqual(muteSwitchIds({}), []);
+  });
 
   test("groups the mute switches by device, camera and kind", () => {
     const groups = muteGroups(hass);
@@ -404,14 +415,64 @@ describe("mute card helpers", () => {
     assert.deepEqual(g.cameras.map((c) => c.name), ["Backyard", "Front Door"]);
     assert.deepEqual(g.cameras[1], { name: "Front Door", all: "switch.c", kinds: { car: "switch.d" } });
     assert.deepEqual(muteGroups({}), []);
+    // Only the ids given: the card passes the ones it took from hass.entities.
+    assert.deepEqual(muteGroups(hass, ["switch.e"]), [{ device: "d1", all: null, kinds: {}, cameras: [{ name: "Backyard", all: "switch.e", kinds: {} }] }]);
   });
 
-  test("says how long a mute lasts, in the UI language", () => {
-    const en = muteText("en-GB");
-    assert.equal(muteEnds(sw(null, null, "on", "forever"), en), "forever");
-    assert.equal(muteEnds(sw(null, null, "on", "2026-09-29 20:00"), en), "until 2026-09-29 20:00");
-    assert.equal(muteEnds(sw(null, null), en), "");
-    assert.equal(muteEnds(sw(null, null, "on", "forever"), muteText("zh-Hans")), "永久");
-    assert.equal(muteText("de").person, "Person");
+  describe("how long a mute lasts", () => {
+    const tz = process.env.TZ;
+    afterEach(() => {
+      if (tz === undefined) delete process.env.TZ;
+      else process.env.TZ = tz;
+    });
+    const now = Date.UTC(2026, 8, 29, 12); // Sep 29, 05:00 PDT
+    const en24 = { language: "en", time_format: "24" };
+    const ends = (until, locale = en24, text = muteText("en")) => muteEnds(sw(null, null, "on", until), text, locale, now);
+
+    test("in the browser's time zone, the day only when it isn't today", () => {
+      process.env.TZ = "America/Los_Angeles";
+      assert.equal(ends("2026-09-29T20:00:00+00:00"), "until 13:00");
+      assert.equal(ends("2026-09-30T03:00:00+00:00"), "until 20:00");
+      assert.equal(ends("2026-09-30T07:30:00+00:00"), "until Sep 30, 00:30");
+      assert.equal(ends("2027-01-02T20:00:00+00:00"), "until Jan 2, 2027, 12:00");
+    });
+
+    test("12 or 24 h as the user's profile says", () => {
+      process.env.TZ = "UTC";
+      assert.match(ends("2026-09-29T20:05:00+00:00", { language: "en", time_format: "12" }), /^until 8:05\sPM$/);
+      assert.match(ends("2026-09-29T20:05:00+00:00", { language: "en-US", time_format: "language" }), /^until 8:05\sPM$/);
+      assert.equal(ends("2026-09-29T20:05:00+00:00", { language: "en-GB", time_format: "language" }), "until 20:05");
+      assert.equal(ends("2026-09-29T00:00:00+00:00", { language: "en-US", time_format: "24" }), "until 00:00");
+    });
+
+    test("forever: on without an end; nothing when off; in the UI language", () => {
+      process.env.TZ = "UTC";
+      assert.equal(ends(null), "forever");
+      assert.equal(muteEnds(sw(null, null, "off", "2026-09-29T20:00:00+00:00"), muteText("en"), en24, now), "");
+      assert.equal(muteEnds(undefined, muteText("en"), en24, now), "");
+      assert.equal(ends(null, en24, muteText("zh-Hans")), "永久");
+      assert.equal(ends("2026-09-29T20:00:00+00:00", { language: "zh-Hans", time_format: "24" }, muteText("zh-Hans")), "至 20:00");
+      assert.equal(ends("not a time"), "");
+      assert.equal(muteText("de").person, "Person");
+    });
+  });
+
+  test("hour12Of: the profile's choice, else the language's (or the browser's)", () => {
+    assert.equal(hour12Of({ time_format: "12", language: "en-GB" }), true);
+    assert.equal(hour12Of({ time_format: "24", language: "en-US" }), false);
+    assert.equal(hour12Of({ time_format: "language", language: "en-US" }), true);
+    assert.equal(hour12Of({ time_format: "language", language: "de" }), false);
+    assert.equal(typeof hour12Of({ time_format: "system", language: "en-US" }), "boolean");
+  });
+
+  test("durations: positive numbers only, 1 and 8 h unless configured", () => {
+    assert.deepEqual(muteDurations(undefined), [1, 8]);
+    assert.deepEqual(muteDurations("4"), [1, 8]);
+    assert.deepEqual(muteDurations([2, "0.5", "abc", 0, -1, null, Infinity, "24"]), [2, 0.5, 24]);
+    assert.deepEqual(muteDurations([]), []);
+  });
+
+  test("fillText fills every place, and a name's $ stays as it is", () => {
+    assert.equal(fillText("Mute {kind} on {camera}", { kind: "Car", camera: "Cam $& 1" }), "Mute Car on Cam $& 1");
   });
 });

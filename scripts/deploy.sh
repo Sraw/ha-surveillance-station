@@ -10,8 +10,9 @@
 #    run this again (the integration then fails to load with a requirement
 #    error until you do).
 #
-# Restart Home Assistant afterwards (Python changes need it; a card-only change
-# just needs a browser reload, the card URL carries the manifest version).
+# Restart Home Assistant afterwards (Python changes need it). The cards are
+# cached for a month by version, so a card-only change under the same version
+# needs a reload that bypasses the browser's cache (see docs/development.md).
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 config="${HA_CONFIG:?set HA_CONFIG to the Home Assistant config directory}"

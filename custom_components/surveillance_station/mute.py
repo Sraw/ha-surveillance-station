@@ -9,6 +9,8 @@ to respect (the shipped blueprint does).
 
 The cameras are named by ``camera_key`` (a name without case, spaces or
 punctuation), the kinds as the event names them (Person, Car, Animal, ...).
+A rule for every kind may leave some kinds out (one turned off on a muted
+camera), so that the camera's other kinds, any label at all, stay muted.
 Rules are kept across restarts and dropped when they end.
 """
 
@@ -42,16 +44,32 @@ class MuteRule:
     camera: str | None  # camera_key; None: every camera
     kind: str | None  # None: every kind
     until: float | None  # epoch seconds; None: until it is lifted
+    # Of every kind, the kinds left out (only with kind None).
+    excluded: frozenset[str] = frozenset()
 
-    def covers(self, camera: str, kind: str) -> bool:
-        return self.camera in (None, camera) and self.kind in (None, kind)
+    def covers(self, camera: str | None, kind: str) -> bool:
+        """Mutes kind on camera (None: on every camera, which only a rule for every camera does)."""
+        return self.camera in (None, camera) and (kind not in self.excluded if self.kind is None else self.kind == kind)
 
     def active(self, now: float) -> bool:
         return self.until is None or self.until > now
 
 
+def outlasts(end: float | None, other: float | None) -> bool:
+    """Whether a mute ending at end lasts longer than one ending at other (None: until lifted)."""
+    return other is not None and (end is None or end > other)
+
+
 def store_key(entry_id: str) -> str:
     return f"{DOMAIN}.mute.{entry_id}"
+
+
+def _stored(rule: MuteRule) -> dict[str, Any]:
+    # Without "excluded" when there are none: as 0.22.2 wrote them.
+    data: dict[str, Any] = {"camera": rule.camera, "kind": rule.kind, "until": rule.until}
+    if rule.excluded:
+        data["excluded"] = sorted(rule.excluded)
+    return data
 
 
 class MuteRules:
@@ -70,20 +88,27 @@ class MuteRules:
         try:
             stored = await self._store.async_load() or {}
             now = time.time()
+            seen: set[tuple[str | None, str | None]] = set()
             for item in stored.get("rules") or []:
+                excluded = item.get("excluded") or []
+                if not isinstance(excluded, list):
+                    raise TypeError(excluded)
                 rule = MuteRule(
                     None if item.get("camera") is None else str(item["camera"]),
                     None if item.get("kind") is None else str(item["kind"]),
                     None if item.get("until") is None else float(item["until"]),
+                    frozenset(str(k) for k in excluded) if item.get("kind") is None else frozenset(),
                 )
                 if rule.until is not None and not math.isfinite(rule.until):
                     continue
-                if rule.active(now) and (rule.until is None or rule.until - now <= MUTE_MAX_SECONDS) and rule not in self._rules:
+                if rule.active(now) and (rule.until is None or rule.until - now <= MUTE_MAX_SECONDS) and (rule.camera, rule.kind) not in seen:
+                    seen.add((rule.camera, rule.kind))
                     self._rules.append(rule)
+                    if len(self._rules) == MUTE_RULES_MAX:
+                        break
         except (ValueError, TypeError, AttributeError, HomeAssistantError):
             _LOGGER.warning("Ignoring unreadable mute rules %s", store_key(self.entry_id))
             self._rules = []
-        self._rules = self._rules[:MUTE_RULES_MAX]
         self._reschedule()
 
     def rules(self, now: float | None = None) -> list[MuteRule]:
@@ -92,29 +117,74 @@ class MuteRules:
         return [r for r in self._rules if r.active(now)]
 
     def is_muted(self, camera: str, kinds: list[str], now: float | None = None) -> bool:
+        if not kinds:  # kinds unknown: only when every kind is
+            return self.coverage(camera, None, now)[0]
         rules = self.rules(now)
-        if not kinds:
-            return any(r.kind is None and r.camera in (None, camera) for r in rules)
         return all(any(r.covers(camera, k) for r in rules) for k in kinds)
+
+    def coverage(self, camera: str | None, kind: str | None, now: float | None = None) -> tuple[bool, float | None]:
+        """Whether every detection of kind on camera is muted (None: every camera, every kind), and until when.
+
+        What is_muted says of each such detection. Every camera (SS may list
+        more later) is muted only by rules for every camera; every kind (a
+        label may be anything) only by rules for every kind, with the kinds
+        they leave out muted by rules of their own. Rules only end, so the
+        mute lasts until the first end after which it no longer holds (None:
+        until lifted).
+        """
+        now = time.time() if now is None else now
+        rules = [r for r in self.rules(now) if r.camera in (None, camera)]
+
+        def holds(rules: list[MuteRule]) -> bool:
+            if kind is not None:
+                return any(r.covers(camera, kind) for r in rules)
+            left_out = {k for r in rules for k in r.excluded}
+            return any(r.kind is None for r in rules) and all(any(r.covers(camera, k) for r in rules) for k in left_out)
+
+        if not holds(rules):
+            return False, None
+        for end in sorted({r.until for r in rules if r.until is not None}):
+            if not holds([r for r in rules if r.active(end)]):
+                return True, end
+        return True, None
 
     def add(self, camera: str | None, kind: str | None, until: float | None) -> None:
         """Mute; replaces the rule for the same camera and kind (a new end, or none)."""
         self.replace(lambda r: False, [MuteRule(camera, kind, until)])
+
+    def extend(self, camera: str | None, until: float | None) -> None:
+        """Mute every kind on camera, never shortening a mute of it.
+
+        Its rule keeps the longer end (None: until lifted); what that rule
+        leaves out is muted until then by rules of its own (again never
+        shortening one).
+        """
+        held = {(r.camera, r.kind): r for r in self.rules()}
+
+        def longer(kind: str | None) -> bool:
+            return (old := held.get((camera, kind))) is None or outlasts(until, old.until)
+
+        if longer(None):
+            self.add(camera, None, until)
+        else:
+            self.replace(lambda r: False, [MuteRule(camera, k, until) for k in held[(camera, None)].excluded if longer(k)])
 
     def replace(self, matches: Callable[[MuteRule], bool], add: list[MuteRule]) -> None:
         """Drop the rules ``matches`` says yes to and add ``add`` (each replacing the rule of its camera and kind), as one change."""
         now = time.time()
         if self._stopped:
             return
-        rules = [r for r in self._rules if r.active(now) and not matches(r)]
         added = [r for r in add if r.until is None or now < r.until <= now + MUTE_MAX_SECONDS]
-        rules = [r for r in rules if (r.camera, r.kind) not in {(a.camera, a.kind) for a in added}] + added
+        replaced = {(a.camera, a.kind) for a in added}
+        rules = [r for r in self._rules if r.active(now) and not matches(r) and (r.camera, r.kind) not in replaced] + added
         # Bounded (a runaway script): the oldest timed rules go first, those
         # lasting until lifted (a switch turned on) only when there are no others;
         # never the ones just added.
         while len(rules) > MUTE_RULES_MAX:
             older = [r for r in rules if not any(r is a for a in added)] or rules
             rules.remove(next((r for r in older if r.until is not None), older[0]))
+        if rules == self._rules:
+            return
         self._rules = rules
         self._changed()
 
@@ -148,7 +218,7 @@ class MuteRules:
             listener()
 
     def _data(self) -> dict[str, Any]:
-        return {"rules": [{"camera": r.camera, "kind": r.kind, "until": r.until} for r in self.rules()]}
+        return {"rules": [_stored(r) for r in self.rules()]}
 
     def _save(self) -> None:
         if self._stopped:

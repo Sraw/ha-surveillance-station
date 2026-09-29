@@ -43,3 +43,13 @@ shaped like Frigate's (`1790406867.462609-6jc58g`) go into Frigate's URLs.
 
 Every HA user can use the card and so see every camera, like HA's own camera
 entities; there is no per-user camera permission.
+
+Muting notifications is open the same way: any HA user can call
+`surveillance_station.mute` and `unmute` and turn the mute switches. A
+notification's mute buttons are answered from the
+`mobile_app_notification_action` event, which anything that can fire events
+can fire (any user's companion app, an automation, a script); it names the
+entry by its id, which every `surveillance_station_detection` event carries.
+Such an event can only mute, never unmute or cut a mute short, every camera
+or one the entry knows, for at most 7 days. A muted detection is still
+bookmarked, and its event still fires (with `muted: true`).

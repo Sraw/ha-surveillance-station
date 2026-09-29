@@ -4,12 +4,12 @@
  * its kinds, and expanded, one kind at a time).
  *
  * Loaded by ss-timeline-card.js (same version), so it needs no resource of
- * its own. It is built from the integration's mute switches (found by their
- * mute_ends attribute, so cameras that come, go or are renamed need no
- * configuring) and turns them with switch.turn_on / turn_off; the switches
- * keep the hierarchy straight (all kinds on shows its kinds on, everything
- * muted leaves the rest unavailable). The buttons call the mute and unmute
- * actions.
+ * its own. It is built from the integration's mute switches (its switches
+ * with the camera and locked attributes, so cameras that come, go or are
+ * renamed need no configuring) and turns them with switch.turn_on / turn_off;
+ * the switches keep the hierarchy straight (all kinds on shows its kinds on,
+ * everything muted leaves the rest locked). The buttons call the mute and
+ * unmute actions.
  *
  * Card options (all optional):
  *   title:     the heading (default: Notifications)
@@ -17,10 +17,14 @@
  */
 
 const MUTE_TAG = "ss-mute-card";
-const { esc, muteText, muteEnds, muteGroups } = await import(
+const { esc, labelAttrs, fillText, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups } = await import(
   new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href
 );
-const KIND_ICONS = { person: "mdi:account", car: "mdi:car", animal: "mdi:paw" };
+// Off and on, as icons.json has them for the switches.
+const ALL_ICONS = ["mdi:bell-outline", "mdi:bell-off"];
+const CAMERA_ICONS = ["mdi:cctv", "mdi:cctv-off"];
+const KIND_ICONS = { person: ["mdi:walk", "mdi:account-off"], car: ["mdi:car", "mdi:car-off"], animal: ["mdi:paw", "mdi:paw-off"] };
+const OTHER_KIND_ICONS = ["mdi:tag", "mdi:tag"];
 
 const CSS = `
   :host { display: block; }
@@ -40,6 +44,7 @@ const CSS = `
   .row.on ha-icon { color: var(--primary-color); }
   .name { flex: 1; min-width: 0; }
   .name small { display: block; color: var(--secondary-text-color); }
+  .name small:empty { display: none; }
   .chevron { flex: none; width: 24px; height: 24px; padding: 0; border: 0; background: none; color: var(--secondary-text-color); cursor: pointer; }
   .chevron ha-icon { transition: transform .15s; }
   .open .chevron ha-icon { transform: rotate(90deg); }
@@ -51,14 +56,17 @@ class SSMuteCard extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._open = new Set(); // cameras expanded (kept across the redraws a state change makes)
-    this._sig = null;
+    this._ids = []; // the entities that may be mute switches, from hass.entities
+    this._seen = null; // what the rows show was last taken from (null: take it again)
+    this._layout = null; // what the markup was built for; the rows are updated in place while it holds
+    this._rows = []; // the rows drawn: entity id, elements, icons
     this.shadowRoot.addEventListener("change", (e) => this._onChange(e));
     this.shadowRoot.addEventListener("click", (e) => this._onClick(e));
   }
 
   setConfig(config) {
     this._config = config ?? {};
-    this._sig = null;
+    this._seen = null;
     this._render();
   }
 
@@ -71,6 +79,7 @@ class SSMuteCard extends HTMLElement {
   }
 
   set hass(hass) {
+    if (hass?.entities !== this._hass?.entities) this._ids = muteSwitchIds(hass);
     this._hass = hass;
     this._render();
   }
@@ -81,77 +90,116 @@ class SSMuteCard extends HTMLElement {
 
   _render() {
     if (!this._hass || !this._config) return;
-    const groups = muteGroups(this._hass);
-    const ids = groups.flatMap((g) => [g.all, ...Object.values(g.kinds), ...g.cameras.flatMap((c) => [c.all, ...Object.values(c.kinds)])]);
-    // Only what the card shows: a state or its end changing, not every entity's.
-    const sig = JSON.stringify([this._language(), this._config, [...this._open], ids.map((id) => {
-      const s = this._hass.states[id];
-      return [id, s?.state, s?.attributes.mute_ends, s?.attributes.camera, s?.attributes.locked];
-    })]);
-    if (sig === this._sig) return;
-    this._sig = sig;
-    const text = muteText(this._language());
-    const hours = Array.isArray(this._config.durations) ? this._config.durations : [1, 8];
+    // HA sets hass on every state change in the house; only the mute switches' states, the language and the time format matter here.
+    const seen = [this._hass.locale, this._hass.language, ...this._ids.map((id) => this._hass.states[id])];
+    if (this._seen && seen.length === this._seen.length && seen.every((s, i) => s === this._seen[i])) return;
+    this._seen = seen;
+    const groups = muteGroups(this._hass, this._ids);
+    const layout = JSON.stringify([this._language(), this._config, [...this._open], groups]);
+    if (layout !== this._layout) {
+      this._layout = layout;
+      this._build(groups);
+    }
+    this._update();
+  }
+
+  /** The markup: rows, labels, buttons; what each row shows is _update's. */
+  _build(groups) {
+    const text = (this._text = muteText(this._language()));
+    const rows = [];
+    const row = (spec) => {
+      rows.push(spec);
+      return this._rowHtml(spec);
+    };
     const body = groups.length
-      ? groups.map((g) => this._device(g, text)).join("")
+      ? groups.map((g) => this._device(g, text, row)).join("")
       : `<div class="empty">${esc(text.none)}</div>`;
     this.shadowRoot.innerHTML = `<style>${CSS}</style><ha-card>
       <h2>${esc(this._config.title ?? text.title)}</h2>
       ${groups.length ? `<div class="buttons">
-        ${hours.map((n) => `<button data-mute="${Number(n)}">${esc(text.muteFor.replace("{n}", n))}</button>`).join("")}
+        ${muteDurations(this._config.durations).map((n) => `<button data-mute="${n}">${esc(fillText(text.muteFor, { n }))}</button>`).join("")}
         <button data-unmute>${esc(text.unmuteAll)}</button></div>` : ""}
       ${body}</ha-card>`;
+    const switches = new Map([...this.shadowRoot.querySelectorAll("ha-switch[data-e]")].map((sw) => [sw.dataset.e, sw]));
+    this._rows = rows.map((spec) => {
+      const sw = switches.get(spec.id);
+      const el = sw.closest(".row");
+      // :scope > : the row's own icon, not the camera arrow's.
+      return { ...spec, el, sw, icon: el.querySelector(":scope > ha-icon"), sub: el.querySelector("small") };
+    });
   }
 
-  _row(id, label, icon, text, cls = "", lead = "", sub = "") {
-    if (!id) return "";
-    const s = this._hass.states[id];
-    const on = s?.state === "on";
-    const gone = !s || s.state === "unavailable" || s.attributes.locked === true; // locked: covered by a wider mute
-    const ends = sub || (on ? muteEnds(s, text) : "");
-    return `<div class="row ${cls} ${on ? "on" : ""} ${gone ? "unavailable" : ""}">
-      ${lead}<ha-icon icon="${icon}"></ha-icon>
-      <div class="name">${esc(label)}${ends ? `<small>${esc(ends)}</small>` : ""}</div>
-      <ha-switch data-e="${esc(id)}" ${on ? "checked" : ""} ${gone ? "disabled" : ""}></ha-switch></div>`;
+  /** Each row's state: on, locked or unavailable, its icon and how long it lasts. */
+  _update() {
+    for (const r of this._rows) {
+      const s = this._hass.states[r.id];
+      const on = s?.state === "on";
+      const gone = !s || s.state === "unavailable" || s.attributes.locked === true; // locked: covered by a wider mute
+      // A camera partly muted says which of its kinds are.
+      const partial = r.kinds && !on ? Object.entries(r.kinds).filter(([, id]) => this._hass.states[id]?.state === "on").map(([k]) => this._text[k] ?? k) : [];
+      r.el.classList.toggle("on", on);
+      r.el.classList.toggle("unavailable", gone);
+      r.icon.setAttribute("icon", r.icons[on ? 1 : 0]);
+      r.sub.textContent = partial.length ? `${partial.join(", ")} · ${this._text.muted}` : muteEnds(s, this._text, this._hass.locale);
+      r.sw.checked = on; // also puts back a switch whose call was refused
+      r.sw.disabled = gone;
+    }
   }
 
-  _kindRows(kinds, text, cls) {
+  _rowHtml({ id, label, aria, cls = "", lead = "" }) {
+    return `<div class="row ${cls}">
+      ${lead}<ha-icon></ha-icon>
+      <div class="name">${esc(label)}<small></small></div>
+      <ha-switch data-e="${esc(id)}" aria-label="${esc(aria)}"></ha-switch></div>`;
+  }
+
+  _kindRows(kinds, text, row, camera) {
     return ["person", "car", "animal", ...Object.keys(kinds).filter((k) => !KIND_ICONS[k])]
       .filter((k) => kinds[k])
-      .map((k) => this._row(kinds[k], text[k] ?? k[0].toUpperCase() + k.slice(1), KIND_ICONS[k] ?? "mdi:tag", text, cls))
+      .map((k) => {
+        const label = text[k] ?? k[0].toUpperCase() + k.slice(1);
+        const aria = camera == null ? fillText(text.muteKind, { kind: label }) : fillText(text.muteCameraKind, { kind: label, camera });
+        return row({ id: kinds[k], label, aria, icons: KIND_ICONS[k] ?? OTHER_KIND_ICONS, cls: "kind" });
+      })
       .join("");
   }
 
-  _device(g, text) {
+  _device(g, text, row) {
     const cameras = g.cameras.map((c) => {
       const open = this._open.has(c.name);
-      const lead = `<button class="chevron" data-camera="${esc(c.name)}"><ha-icon icon="mdi:chevron-right"></ha-icon></button>`;
-      const partial = Object.entries(c.kinds).filter(([, id]) => this._hass.states[id]?.state === "on").map(([k]) => text[k] ?? k);
-      const all = this._hass.states[c.all]?.state === "on";
-      const sub = !all && partial.length ? `${partial.join(", ")} · ${text.muted}` : "";
-      const row = this._row(c.all, c.name, "mdi:cctv", text, "camera", lead, sub);
-      return `<div class="${open ? "open" : ""}">${row}${open ? this._kindRows(c.kinds, text, "kind") : ""}</div>`;
+      const lead = `<button class="chevron" data-camera="${esc(c.name)}" ${labelAttrs(fillText(text.kindsOf, { camera: c.name }))}
+        aria-expanded="${open}"><ha-icon icon="mdi:chevron-right"></ha-icon></button>`;
+      const camRow = c.all
+        ? row({ id: c.all, label: c.name, aria: fillText(text.muteCamera, { camera: c.name }), icons: CAMERA_ICONS, cls: "camera", lead, kinds: c.kinds })
+        : "";
+      return `<div class="${open ? "open" : ""}">${camRow}${open ? this._kindRows(c.kinds, text, row, c.name) : ""}</div>`;
     }).join("");
     return `<div class="device">
-      ${this._row(g.all, text.everything, "mdi:bell-off", text)}
-      ${Object.keys(g.kinds).length ? `<div class="section">${esc(text.allCameras)}</div>${this._kindRows(g.kinds, text, "kind")}` : ""}
+      ${g.all ? row({ id: g.all, label: text.everything, aria: text.muteAll, icons: ALL_ICONS }) : ""}
+      ${Object.keys(g.kinds).length ? `<div class="section">${esc(text.byKind)}</div>${this._kindRows(g.kinds, text, row)}` : ""}
       ${g.cameras.length ? `<div class="section">${esc(text.cameras)}</div>${cameras}` : ""}</div>`;
   }
 
   _onChange(e) {
     const el = e.target.closest?.("ha-switch[data-e]");
     if (!el) return;
-    this._hass.callService("switch", el.checked ? "turn_on" : "turn_off", { entity_id: el.dataset.e });
+    // Refused (a wider mute came first, the connection dropped): HA says why, the state stays, and so must the switch.
+    this._hass.callService("switch", el.checked ? "turn_on" : "turn_off", { entity_id: el.dataset.e }).catch(() => this._update());
   }
 
   _onClick(e) {
     const t = e.target.closest?.("button");
     if (!t) return;
-    if (t.dataset.mute) this._hass.callService("surveillance_station", "mute", { duration: { hours: Number(t.dataset.mute) } });
-    else if ("unmute" in t.dataset) this._hass.callService("surveillance_station", "unmute", {});
+    const reported = () => {}; // HA shows a refused call's error
+    if (t.dataset.mute) this._hass.callService("surveillance_station", "mute", { duration: { hours: Number(t.dataset.mute) } }).catch(reported);
+    else if ("unmute" in t.dataset) this._hass.callService("surveillance_station", "unmute", {}).catch(reported);
     else if (t.dataset.camera != null) {
-      this._open.has(t.dataset.camera) ? this._open.delete(t.dataset.camera) : this._open.add(t.dataset.camera);
+      const camera = t.dataset.camera;
+      this._open.has(camera) ? this._open.delete(camera) : this._open.add(camera);
+      this._seen = null;
       this._render();
+      // The markup was rebuilt: keep the focus on this camera's arrow.
+      [...this.shadowRoot.querySelectorAll("button.chevron")].find((b) => b.dataset.camera === camera)?.focus();
     }
   }
 }

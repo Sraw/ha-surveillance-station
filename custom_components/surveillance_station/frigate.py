@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
+import contextlib
 from dataclasses import dataclass, replace
 from datetime import timedelta
 import json
@@ -100,6 +101,7 @@ from .frigate_api import FRIGATE_ID, FRIGATE_ID_PATTERN, FrigateAPI, FrigateAPIE
 from .frigate_queue import Queued, ReviewQueue
 from .manager import VodManager
 from .mute import MuteRules
+from .shared import SharedJobs
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -256,7 +258,8 @@ class FrigateBridge:
         self._store: Store[dict[str, Any]] = Store(hass, 1, store_key(entry_id))
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
         self._cameras_by_name: dict[str, tuple[int, str]] = {}  # SS name -> (SS id, SS name)
-        self._cameras_at = -math.inf
+        self._cameras_at = -math.inf  # when SS last listed them
+        self._camera_listing: SharedJobs[None, None] = SharedJobs(hass, "cameras")
         self._camera_listeners: list[Callable[[list[str]], None]] = []  # told the SS camera names
         self._unknown: set[str] = set()  # Frigate cameras warned about
         self._tracked: OrderedDict[str, _Tracked] = OrderedDict()
@@ -450,6 +453,7 @@ class FrigateBridge:
         for task in (self._worker, self._probe, *self._announcing):
             if task is not None:
                 task.cancel()
+        self._camera_listing.cancel(lambda _: True)
         # An unloaded entry's problems are not problems any more (a reload
         # checks again from scratch).
         for issue in list(self._issues):
@@ -836,9 +840,23 @@ class FrigateBridge:
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
         if age > FRIGATE_CAMERAS_TTL or (self._lookup(frigate_camera) is None and age > 60):
-            self._cameras_at = _monotonic()
-            self._set_cameras(await self.client.cameras())
+            await self._list_cameras()
         return self._lookup(frigate_camera)
+
+    async def _list_cameras(self) -> None:
+        """SS's cameras listed afresh: one listing at a time, whose outcome everyone asking meanwhile shares.
+
+        The list counts as fresh only once SS has answered: a review handled
+        while it is being read (the switches list the cameras at setup, as
+        deferred reviews are replayed) waits for it rather than finding it
+        empty and its camera unknown.
+        """
+        await self._camera_listing.run(None, self._read_cameras, "surveillance_station cameras")
+
+    async def _read_cameras(self) -> None:
+        cameras = await self.client.cameras()
+        self._cameras_at = _monotonic()
+        self._set_cameras(cameras)
 
     async def ss_camera(self, frigate_camera: str) -> tuple[int, str] | None:
         """The SS camera (id, name) a Frigate camera is, as its reviews are bookmarked on."""
@@ -861,11 +879,8 @@ class FrigateBridge:
     async def camera_names(self) -> list[str]:
         """The SS cameras' names: listed again after a while; if SS fails, as they were."""
         if _monotonic() - self._cameras_at > FRIGATE_CAMERAS_TTL:
-            try:
-                self._cameras_at = _monotonic()
-                self._set_cameras(await self.client.cameras())
-            except SSError:
-                self._cameras_at = -math.inf  # tried again by the next asker
+            with contextlib.suppress(SSError):  # still due: tried again by the next asker
+                await self._list_cameras()
         return [name for _, name in self._cameras_by_name.values()]
 
     async def resolve_camera(self, name: str) -> str | None:
@@ -1258,12 +1273,10 @@ class FrigateBridge:
     async def _probe_ss(self) -> None:
         """Bookmarks failed and nothing is waiting: does SS answer again?"""
         try:
-            cameras = await self.client.cameras()
+            await self._read_cameras()
         except SSError as err:
             self._bookmark_error = str(err)[:300]
         else:
-            self._set_cameras(cameras)
-            self._cameras_at = _monotonic()
             self._ok(bookmark=False)  # SS answers; says nothing about refusals
         finally:
             self._probe = None

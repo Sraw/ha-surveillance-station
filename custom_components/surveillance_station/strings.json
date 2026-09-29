@@ -193,7 +193,7 @@
       "fields": {
         "camera": {
           "name": "Camera",
-          "description": "A Surveillance Station or Frigate camera name; without it, every camera."
+          "description": "A Surveillance Station or Frigate camera name (for a camera Surveillance Station no longer lists, its old name); without it, every camera."
         },
         "objects": {
           "name": "Objects",

@@ -42,6 +42,7 @@ from custom_components.surveillance_station.frigate import (
     review_id_of,
     store_key,
 )
+from custom_components.surveillance_station.frigate_queue import Queued
 from custom_components.surveillance_station.manager import DATA_MANAGER, VodManager
 from homeassistant.components import mqtt as mqtt_mod
 from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE, EVENT_HOMEASSISTANT_STOP
@@ -1455,6 +1456,39 @@ async def test_camera_list_reread_regularly(hass: HomeAssistant, bridge: Frigate
     with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601):
         await bridge.handle(review("new", rid="b"))
     assert client.cameras.await_count == 2
+
+
+async def test_a_review_waits_for_the_camera_list_being_read(hass: HomeAssistant, bridge: FrigateBridge, client: MagicMock) -> None:
+    """The mute switches list the cameras at setup, as deferred reviews are replayed: a review
+    handled meanwhile waits for that listing (one for both) rather than finding no camera."""
+    listed = asyncio.Event()
+    cameras = client.cameras.return_value
+
+    async def slow() -> list[Camera]:
+        await listed.wait()
+        return cameras
+
+    client.cameras.side_effect = slow
+    names = hass.async_create_task(bridge.camera_names())
+    replayed = hass.async_create_task(bridge.handle(Queued(review("new"), received_at=T + 1)))
+    await asyncio.sleep(0)
+    listed.set()
+    assert await names == ["Drive Way", "Front Door"]
+    await replayed
+    client.create_bookmark.assert_awaited_once()
+    assert client.cameras.await_count == 1 and "unknown_camera" not in bridge.stats()["ignored"]
+
+
+async def test_camera_listeners_are_told_the_cameras_already_listed(hass: HomeAssistant, bridge: FrigateBridge) -> None:
+    await bridge.camera_names()
+    told: list[list[str]] = []
+    remove = bridge.async_on_cameras(told.append)
+    assert told == [["Drive Way", "Front Door"]]
+    remove()
+    remove()
+    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601):
+        await bridge.camera_names()
+    assert len(told) == 1
 
 
 async def test_waits_for_mqtt(hass: HomeAssistant, bridge: FrigateBridge) -> None:

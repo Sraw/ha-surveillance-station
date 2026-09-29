@@ -33,7 +33,8 @@ def detection(**changes) -> dict:
     }
 
 
-async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> None:
+async def notifier(hass: HomeAssistant, tmp_path: Path, **inputs) -> list:
+    """The blueprint as an automation, with these inputs; the notifications it sends."""
     hass.config.config_dir = str(tmp_path)
     await hass.config.async_set_time_zone("UTC")
     target = tmp_path / "blueprints/automation/surveillance_station"
@@ -74,12 +75,17 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
             "automation": {
                 "use_blueprint": {
                     "path": "surveillance_station/detection_notification.yaml",
-                    "input": {"notify_device": phone.id, "cameras": ["Drive Way"], "objects": ["Person"]},
+                    "input": {"notify_device": phone.id, **inputs},
                 }
             }
         },
     )
     await hass.async_block_till_done()
+    return sent
+
+
+async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> None:
+    sent = await notifier(hass, tmp_path, cameras=["Drive Way"], objects=["Person"])
     for data in (
         detection(camera="Backyard"),  # another camera
         detection(objects=["Animal"]),  # other objects
@@ -115,3 +121,26 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
         "clickAction": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
         "url": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
     }
+
+
+async def test_mute_buttons(hass: HomeAssistant, tmp_path: Path) -> None:
+    """Hours as set (a quarter of an hour too); no camera button for a camera without a key, whose
+    id would be "Mute all"'s."""
+    sent = await notifier(hass, tmp_path, mute_hours=0.25)
+    hass.bus.async_fire(DETECTION_EVENT, detection())
+    hass.bus.async_fire(DETECTION_EVENT, detection(review_id="r2", camera="!!", camera_key=""))
+    await hass.async_block_till_done()
+    assert [call.data["data"]["actions"] for call in sent] == [
+        [
+            {"action": "SS_MUTE:e:900:", "title": "Mute all 0.25 h"},
+            {"action": "SS_MUTE:e:900:driveway", "title": "Mute Drive Way 0.25 h"},
+        ],
+        [{"action": "SS_MUTE:e:900:", "title": "Mute all 0.25 h"}],
+    ]
+
+
+async def test_without_mute_buttons(hass: HomeAssistant, tmp_path: Path) -> None:
+    sent = await notifier(hass, tmp_path, mute_buttons=False)
+    hass.bus.async_fire(DETECTION_EVENT, detection())
+    await hass.async_block_till_done()
+    assert len(sent) == 1 and "actions" not in sent[0].data["data"]

@@ -102,8 +102,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         await drain_transcodes()
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _drain)
+    # Cached for a month: every URL of these files carries the version
+    # (the resource, the extra-JS URL, each card's imports).
     await hass.http.async_register_static_paths(
-        [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), False)]
+        [StaticPathConfig(STATIC_URL, str(Path(__file__).parent / "frontend"), True)]
     )
     if _storage_resources(hass) is None:
         # YAML-mode resources can't be edited from here: load it everywhere.
@@ -205,6 +207,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         options = entry.options
         mute = MuteRules(hass, entry.entry_id)
         await mute.async_load()
+        # Its timer, also if setup fails after this (unloading stops it too).
+        entry.async_on_unload(mute.stop)
         bridge = FrigateBridge(
             hass,
             entry.entry_id,
@@ -240,15 +244,17 @@ async def _logout(client: SurveillanceStationClient) -> None:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
-    # First, so that no bookmark is being made while the client logs out; its
-    # state written now, before a reload reads it (or a removal deletes it).
     # Whether there are switches to unload is what setup did, not what the
-    # options say now (a reload is made after they changed).
-    if (bridge := hass.data.get(DATA_FRIGATE, {}).pop(entry.entry_id, None)) is not None:
-        bridge.stop()
+    # options say now (a reload is made after they changed). Those first: if
+    # they cannot go, the entry stays loaded, its bridge still running. Then
+    # the bridge, so that no bookmark is being made while the client logs
+    # out; its state written now, before a reload reads it (or a removal
+    # deletes it).
+    if (bridge := hass.data.get(DATA_FRIGATE, {}).get(entry.entry_id)) is not None:
         if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-            hass.data[DATA_FRIGATE][entry.entry_id] = bridge
             return False
+        hass.data[DATA_FRIGATE].pop(entry.entry_id)
+        bridge.stop()
         try:
             await bridge.async_flush()
         except Exception:  # noqa: BLE001 - never a failed unload for it

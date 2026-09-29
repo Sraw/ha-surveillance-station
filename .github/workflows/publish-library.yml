@@ -1,10 +1,14 @@
 name: Publish synology-ss-playback
 
 # Push a tag `synology-ss-vX.Y.Z` (X.Y.Z = version in synology_ss/pyproject.toml)
-# to build the library and upload it to PyPI. Uses PyPI Trusted Publishing
-# (OIDC): no API token is stored in GitHub. The publisher is configured on
-# PyPI (project synology-ss-playback -> Publishing): owner Sraw, repository
-# ha-surveillance-station, workflow publish-library.yml, environment pypi.
+# on a commit already on main to test, build and upload the library to PyPI.
+# A version can be uploaded to PyPI only once, hence the checks before the
+# build. Uses PyPI Trusted Publishing (OIDC): no API token is stored in GitHub.
+# The publisher is configured on PyPI (project synology-ss-playback ->
+# Publishing): owner Sraw, repository ha-surveillance-station, workflow
+# publish-library.yml, environment pypi.
+# Actions are pinned to commit SHAs: the upload job can mint a PyPI token, so
+# a moved tag or branch must not change what runs with it.
 
 on:
   push:
@@ -19,17 +23,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          # Full history, so the ancestry check below can walk main back to this commit.
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.14"
       - name: Tag matches pyproject version
         run: |
           version=$(python -c "import tomllib;print(tomllib.load(open('synology_ss/pyproject.toml','rb'))['project']['version'])")
           test "synology-ss-v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != pyproject version ${version}"; exit 1; }
-      - run: pip install build
+      - name: Tagged commit is on main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main || { echo "tag ${GITHUB_REF_NAME} is not on main"; exit 1; }
+      # No pip cache (unlike ci.yml): this run would restore a cache written by
+      # ci.yml's runs on main, and what it builds goes to PyPI.
+      - run: pip install -r requirements_test.txt
+      - name: Library tests
+        run: python -m pytest -p no:cacheprovider synology_ss/tests
+        env:
+          # Same as ci.yml's test job: the library from its source tree.
+          PYTHONPATH: ${{ github.workspace }}/synology_ss/src
+          PYTHONDONTWRITEBYTECODE: "1"
+      - run: pip install build==1.6.1
       - run: python -m build synology_ss
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist
           path: synology_ss/dist/
@@ -43,8 +64,8 @@ jobs:
     permissions:
       id-token: write # Trusted Publishing
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1

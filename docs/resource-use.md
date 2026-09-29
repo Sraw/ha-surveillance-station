@@ -2,7 +2,8 @@
 
 # Resource use
 
-Every buffer has a cap, and the only thing kept on disk is thumbnails:
+Every buffer has a cap, and apart from small state in HA's storage the only
+thing kept on disk is thumbnails:
 
 | Where | What | Bound |
 |---|---|---|
@@ -21,6 +22,8 @@ Every buffer has a cap, and the only thing kept on disk is thumbnails:
 | HA memory | recordings lists (the library's, per entry) | one lookup at a time per camera and exact time range, whose answer every waiting request shares, as do requests for that same range in the next 2 s; at most 64 kept. Windows that slide with the time (the card's polls) seldom repeat, so this mostly merges lookups made at once |
 | HA memory | Frigate bookmarks' thumbnails (Frigate's snapshots, 180 px) of reviews that are over | `FRIGATE_THUMB_CACHE_BYTES` = 8 MB, LRU; 4 made at a time; a review still going on is asked again (its snapshot may change) |
 | HA memory | the bookmark list of each entry, indexed by camera and kind for the event list | re-read after a minute (at once after HA made or changed a bookmark); one fetch at a time, whose result (or error, kept 5 s) every waiting request shares |
+| HA storage | mute rules, `.storage/surveillance_station.mute.<entry id>` | 64 per entry (`MUTE_RULES_MAX`; beyond, the oldest timed ones go first); each ends by itself, none lasts more than 10 years |
+| Browser disk | the cards' scripts | `public, max-age=2678400` (a month): each URL carries the release (`?v=`), so a new release is fetched afresh |
 | Browser disk | thumbnails | `private, max-age=172800, immutable` (a thumbnail of a past moment never changes, and its URL stays the same all day and across HA restarts); a Frigate bookmark's snapshot `private, max-age=3600` (Frigate may pick a better one while the review goes on) |
 | Browser disk | segments | none: served `Cache-Control: no-store` (the URLs are per-session, so a cached copy would never be used again) |
 

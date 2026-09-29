@@ -193,7 +193,7 @@
       "fields": {
         "camera": {
           "name": "摄像头",
-          "description": "Surveillance Station 或 Frigate 的摄像头名；不填为所有摄像头。"
+          "description": "Surveillance Station 或 Frigate 的摄像头名（Surveillance Station 已不再列出的摄像头用它原来的名字）；不填为所有摄像头。"
         },
         "objects": {
           "name": "对象",
