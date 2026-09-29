@@ -1,0 +1,35 @@
+mute:
+  fields:
+    duration:
+      required: false
+      example: "02:00:00"
+      selector:
+        duration:
+    camera:
+      required: false
+      example: Drive Way
+      selector:
+        text:
+    objects:
+      required: false
+      example: person
+      selector:
+        select:
+          options: [person, car, animal]
+          multiple: true
+          custom_value: true
+unmute:
+  fields:
+    camera:
+      required: false
+      example: Drive Way
+      selector:
+        text:
+    objects:
+      required: false
+      example: person
+      selector:
+        select:
+          options: [person, car, animal]
+          multiple: true
+          custom_value: true

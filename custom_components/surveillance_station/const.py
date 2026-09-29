@@ -186,6 +186,12 @@ CONF_FRIGATE_QUIET_KINDS = "frigate_quiet_kinds"
 DEFAULT_FRIGATE_QUIET_MINUTES = 5
 FRIGATE_QUIET_KINDS = ["Car", "Animal"]
 DEFAULT_FRIGATE_QUIET_KINDS = ["Animal"]
+# Muting notifications: the kinds that get a switch, and the id of the mute
+# buttons on a notification (the blueprint builds them, the integration
+# answers them: SS_MUTE:<entry id>:<seconds>:<camera key, empty for all>).
+MUTE_KINDS = ["Person", "Car", "Animal"]
+MUTE_ACTION_PREFIX = "SS_MUTE"
+MUTE_ACTION_MAX_SECONDS = 7 * 86400
 # Bookmarks whose thumbnail is another moment than their start (the frame a
 # detector picked, where the object shows best), remembered across restarts.
 BOOKMARK_FRAMES_MAX = 20_000

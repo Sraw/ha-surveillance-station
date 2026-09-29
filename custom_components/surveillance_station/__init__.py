@@ -27,6 +27,7 @@ from homeassistant.const import (
     CONF_SSL,
     CONF_USERNAME,
     EVENT_HOMEASSISTANT_STOP,
+    Platform,
 )
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -57,6 +58,8 @@ from .const import (
 from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, FrigateThumbnailView, store_key as frigate_store_key
 from .frigate_api import FrigateAPI
 from .manager import DATA_MANAGER, VodManager
+from .mute import MuteRules, store_key as mute_store_key
+from .mute_services import async_setup_services
 from .views import (
     LargeImageView,
     LiveStreamView,
@@ -69,6 +72,8 @@ from .views import (
 _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+PLATFORMS = [Platform.SWITCH]
 
 type SurveillanceStationConfigEntry = ConfigEntry[SurveillanceStationClient]
 
@@ -89,6 +94,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.http.register_view(FrigateImageView(hass, manager))
     hass.http.register_view(FrigateThumbnailView(hass, manager))
     websocket.async_register(hass)
+    async_setup_services(hass)
 
     async def _drain(_: Event) -> None:
         # A running GPU transcode must not be killed by the loop's teardown
@@ -197,6 +203,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         _LOGGER.exception("Could not register the timeline card's Lovelace resource")
     if entry.options.get(CONF_FRIGATE):
         options = entry.options
+        mute = MuteRules(hass, entry.entry_id)
+        await mute.async_load()
         bridge = FrigateBridge(
             hass,
             entry.entry_id,
@@ -209,10 +217,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             set(options.get(CONF_FRIGATE_QUIET_KINDS, DEFAULT_FRIGATE_QUIET_KINDS)),
             options.get(CONF_FRIGATE_CAMERAS) or {},
             FrigateAPI(async_get_clientsession(hass), url) if (url := options.get(CONF_FRIGATE_URL)) else None,
+            mute,
         )
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
         # In the background: MQTT may still be starting.
         entry.async_create_background_task(hass, bridge.start(), "surveillance_station frigate setup")
+        # The mute switches.
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
@@ -231,12 +242,22 @@ async def _logout(client: SurveillanceStationClient) -> None:
 async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConfigEntry) -> bool:
     # First, so that no bookmark is being made while the client logs out; its
     # state written now, before a reload reads it (or a removal deletes it).
+    # Whether there are switches to unload is what setup did, not what the
+    # options say now (a reload is made after they changed).
     if (bridge := hass.data.get(DATA_FRIGATE, {}).pop(entry.entry_id, None)) is not None:
         bridge.stop()
+        if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+            hass.data[DATA_FRIGATE][entry.entry_id] = bridge
+            return False
         try:
             await bridge.async_flush()
         except Exception:  # noqa: BLE001 - never a failed unload for it
             _LOGGER.warning("Could not save the Frigate bridge's state", exc_info=True)
+        bridge.mute.stop()
+        try:
+            await bridge.mute.async_flush()
+        except Exception:  # noqa: BLE001 - never a failed unload for it
+            _LOGGER.warning("Could not save the mute rules", exc_info=True)
     hass.data[DATA_MANAGER].drop_entry(entry.entry_id)
     # Closed rather than logged out: a handler still running can't log it in
     # again (a DSM session nobody would end).
@@ -254,6 +275,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: SurveillanceStationConf
         await manager.disk_large.drop_entry(entry.entry_id)
         await manager.forget_frames(entry.entry_id)
     await Store(hass, 1, frigate_store_key(entry.entry_id)).async_remove()
+    await Store(hass, 1, mute_store_key(entry.entry_id)).async_remove()
     if any(e.entry_id != entry.entry_id for e in hass.config_entries.async_entries(DOMAIN)):
         return
     if (resources := _storage_resources(hass)) is None:

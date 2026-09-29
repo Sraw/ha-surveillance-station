@@ -1,11 +1,10 @@
 # Self-assessment against the HA integration quality scale. This integration
-# has no entities, devices or actions: it serves HLS views, WebSocket commands
-# and a Lovelace card, so the entity rules are exempt.
+# is mostly HLS views, WebSocket commands and a Lovelace card; its only
+# entities are the mute switches (one device), and its only actions mute and
+# unmute notifications.
 rules:
   # Bronze
-  action-setup:
-    status: exempt
-    comment: No actions.
+  action-setup: done
   appropriate-polling:
     status: exempt
     comment: Nothing is polled; every NAS call answers a card request.
@@ -16,9 +15,7 @@ rules:
   dependency-transparency:
     status: todo
     comment: synology-ss-playback is built from this repo, not yet on PyPI.
-  docs-actions:
-    status: exempt
-    comment: No actions.
+  docs-actions: done
   docs-conditions:
     status: exempt
     comment: No conditions.
@@ -28,24 +25,16 @@ rules:
   docs-triggers:
     status: exempt
     comment: No triggers.
-  entity-event-setup:
-    status: exempt
-    comment: No entities.
-  entity-unique-id:
-    status: exempt
-    comment: No entities.
-  has-entity-name:
-    status: exempt
-    comment: No entities.
+  entity-event-setup: done
+  entity-unique-id: done
+  has-entity-name: done
   runtime-data: done
   test-before-configure: done
   test-before-setup: done
   unique-config-entry: done
 
   # Silver
-  action-exceptions:
-    status: exempt
-    comment: No actions; WebSocket commands return translated error codes.
+  action-exceptions: done
   config-entry-unloading: done
   docs-configuration-parameters:
     status: exempt
@@ -53,23 +42,19 @@ rules:
   docs-installation-parameters: done
   entity-unavailable:
     status: exempt
-    comment: No entities.
+    comment: The switches show local rules, not the NAS's state.
   integration-owner:
     status: todo
     comment: codeowners is set once the repository is published.
   log-when-unavailable: done
-  parallel-updates:
-    status: exempt
-    comment: No entity platforms.
+  parallel-updates: done
   reauthentication-flow: done
   test-coverage:
     status: todo
     comment: 86 % (2026-09-25); the fetch-cancellation and cache-eviction paths lack tests.
 
   # Gold
-  devices:
-    status: exempt
-    comment: No devices.
+  devices: done
   diagnostics: done
   discovery-update-info:
     status: exempt
@@ -89,27 +74,23 @@ rules:
     comment: No devices.
   entity-category:
     status: exempt
-    comment: No entities.
+    comment: The switches are controls, with no category.
   entity-device-class:
     status: exempt
-    comment: No entities.
+    comment: Plain switches.
   entity-disabled-by-default:
     status: exempt
-    comment: No entities.
-  entity-translations:
-    status: exempt
-    comment: No entities.
+    comment: Four switches and one per camera, each one wanted.
+  entity-translations: done
   exception-translations: done
-  icon-translations:
-    status: exempt
-    comment: No entities or actions.
+  icon-translations: done
   reconfiguration-flow: done
   repair-issues:
     status: exempt
     comment: Nothing the user can repair beyond reauth.
   stale-devices:
     status: exempt
-    comment: No devices.
+    comment: One device per entry, removed with it.
 
   # Platinum
   async-dependency: done

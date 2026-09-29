@@ -49,6 +49,25 @@ blueprint:
       default: Detections
       selector:
         text:
+    mute_buttons:
+      name: Mute buttons
+      description: >-
+        Two buttons on the notification (Android): mute every camera, or this
+        one, for the hours below. Muting is the integration's (the
+        surveillance_station.mute action, and its switches).
+      default: true
+      selector:
+        boolean:
+    mute_hours:
+      name: Mute hours
+      description: How long the mute buttons mute for.
+      default: 1
+      selector:
+        number:
+          min: 0.25
+          max: 168
+          step: 0.25
+          unit_of_measurement: h
     time_format:
       name: Time format
       description: strftime format of the time in the message.
@@ -68,10 +87,15 @@ variables:
   objects: !input objects
   severities: !input severities
   time_format: !input time_format
+  mute_buttons: !input mute_buttons
+  mute_hours: !input mute_hours
   channel: !input channel
   detection: "{{ trigger.event.data }}"
 
 conditions:
+  # Muted in the integration (the switches, the mute action, a notification's button).
+  - condition: template
+    value_template: "{{ not (detection.muted | default(false)) }}"
   - condition: template
     value_template: "{{ not cameras or detection.camera in cameras }}"
   - condition: template
@@ -90,11 +114,18 @@ actions:
     # Android stack them all under one collapsed entry); Android's channel and icon, and high priority with no TTL (at
     # normal priority an idle phone in Doze holds it for minutes); and the
     # link (Android: clickAction, iOS: url), left out without a dashboard
-    # path: tapping then opens the app.
+    # path: tapping then opens the app. The mute buttons are answered by the
+    # integration (their id: SS_MUTE:<entry>:<seconds>:<camera key, or none>).
     data: >-
       {% set o = detection.objects %}
       {% set d = {'image': detection.image, 'tag': detection.review_id, 'group': detection.review_id,
                   'channel': channel, 'ttl': 0, 'priority': 'high',
                   'notification_icon': 'mdi:walk' if 'Person' in o else 'mdi:car' if 'Car' in o
                                        else 'mdi:paw' if 'Animal' in o else 'mdi:cctv'} %}
+      {% set secs = (mute_hours * 3600) | int %}
+      {% set h = '%g' | format(mute_hours) %}
+      {% set prefix = 'SS_MUTE:' ~ detection.entry_id ~ ':' ~ secs ~ ':' %}
+      {% set d = dict(d, actions=[{'action': prefix, 'title': 'Mute all ' ~ h ~ ' h'},
+                                  {'action': prefix ~ detection.camera_key, 'title': 'Mute ' ~ detection.camera ~ ' ' ~ h ~ ' h'}])
+                 if mute_buttons else d %}
       {{ dict(d, clickAction=detection.url, url=detection.url) if detection.url else d }}

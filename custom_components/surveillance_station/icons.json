@@ -1,0 +1,44 @@
+{
+  "entity": {
+    "switch": {
+      "mute_all": {
+        "default": "mdi:bell-outline",
+        "state": {
+          "on": "mdi:bell-off"
+        }
+      },
+      "mute_camera": {
+        "default": "mdi:cctv",
+        "state": {
+          "on": "mdi:cctv-off"
+        }
+      },
+      "mute_person": {
+        "default": "mdi:walk",
+        "state": {
+          "on": "mdi:account-off"
+        }
+      },
+      "mute_car": {
+        "default": "mdi:car",
+        "state": {
+          "on": "mdi:car-off"
+        }
+      },
+      "mute_animal": {
+        "default": "mdi:paw",
+        "state": {
+          "on": "mdi:paw-off"
+        }
+      }
+    }
+  },
+  "services": {
+    "mute": {
+      "service": "mdi:bell-off"
+    },
+    "unmute": {
+      "service": "mdi:bell-ring"
+    }
+  }
+}

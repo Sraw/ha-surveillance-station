@@ -26,7 +26,7 @@ T = 1_790_000_000
 
 def detection(**changes) -> dict:
     return {
-        "camera": "Drive Way", "objects": ["Person", "Car"], "severity": "alert", "start": T, "review_id": "r1",
+        "entry_id": "e", "camera": "Drive Way", "camera_key": "driveway", "muted": False, "objects": ["Person", "Car"], "severity": "alert", "start": T, "review_id": "r1",
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
         "url": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
         **changes,
@@ -83,6 +83,7 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
     for data in (
         detection(camera="Backyard"),  # another camera
         detection(objects=["Animal"]),  # other objects
+        detection(review_id="r4", muted=True),  # muted in the integration
         detection(url=None, review_id="r2", objects=["Car", "Person"]),
         detection(review_id="r3", severity="detection"),
     ):
@@ -97,12 +98,20 @@ async def test_notification_blueprint(hass: HomeAssistant, tmp_path: Path) -> No
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
         "tag": "r2", "group": "r2", "channel": "Detections", "notification_icon": "mdi:walk",
         "ttl": 0, "priority": "high",
+        "actions": [
+            {"action": "SS_MUTE:e:3600:", "title": "Mute all 1 h"},
+            {"action": "SS_MUTE:e:3600:driveway", "title": "Mute Drive Way 1 h"},
+        ],
         # no link: tapping opens the app
     }
     assert sent[1].data["data"] == {
         "image": "/api/surveillance_station/thumbnail/e/6/1790000002-large.jpg?exp=1&sig=s",
         "tag": "r3", "group": "r3", "channel": "Detections", "notification_icon": "mdi:walk",
         "ttl": 0, "priority": "high",
+        "actions": [
+            {"action": "SS_MUTE:e:3600:", "title": "Mute all 1 h"},
+            {"action": "SS_MUTE:e:3600:driveway", "title": "Mute Drive Way 1 h"},
+        ],
         "clickAction": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
         "url": "/ss-playback/playback?ss_camera=6&ss_time=1789999997",
     }

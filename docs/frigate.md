@@ -46,8 +46,8 @@ How it works:
   `camera`, `camera_id`, `objects` (as named: `["Person", "Animal"]`),
   `labels` (Frigate's: `["person", "dog"]`), `zones`, `severity`, `start`,
   `review_id`, `bookmark_id`, `image` (signed, see below), `thumbnail` (SS's
-  frame, 320 px) and `url` (the card at that moment, if a dashboard path is
-  set).
+  frame, 320 px), `url` (the card at that moment, if a dashboard path is
+  set), `entry_id`, `camera_key` and `muted` (see *Muting notifications*).
 - **The image**, with the options' **Frigate URL** set (Frigate's API as HA
   reaches it, e.g. `http://frigate:5000`, the internal port): Frigate's
   snapshot of the review's foremost object (a person before a car before an
@@ -198,6 +198,43 @@ actions:
         ttl: 0            # Android: deliver now; at normal priority an idle
         priority: high    # phone (Doze) held one for 8 minutes
 ```
+
+## Muting notifications
+
+A mute is a rule: a camera (or every camera), a kind (or every kind: Person,
+Car, Animal, or a Frigate label's name) and an end (or none, until lifted).
+Muting is only about being told: the detection is still bookmarked and its
+event still fires, with **`muted: true`**, for an automation to respect (the
+blueprint does, so nothing is sent). A review is muted when **every** kind in
+it is covered by a rule for its camera, so muting animals doesn't silence a
+person who joins a dog's review. The rules are kept across restarts.
+
+- **Actions** `surveillance_station.mute` (`duration`, `camera`, `objects`,
+  all optional; no duration: until unmuted) and `surveillance_station.unmute`
+  (`camera`, `objects`; with neither, everything). `camera` takes the SS name
+  or Frigate's (`drive_way`); several `objects` are a rule each; a camera with
+  objects mutes just those there. `unmute` lifts every rule that has the given
+  camera and/or objects, whatever else it covers. E.g. the driveway's people
+  for 2 hours: `camera: drive_way`, `objects: [person]`, `duration: "02:00:00"`.
+- **Switches** (device *Surveillance Station*): *Mute all notifications*, one
+  per kind and one per camera. On mutes until turned off; a switch shows the
+  rule for exactly its own scope (a camera muted for 2 hours by the action is
+  on, with `muted_until`), while a detection is also muted by rules that
+  switch doesn't show (all muted, the camera's switch off). A camera renamed
+  in SS gets a new switch (rules name cameras by their name, ignoring case,
+  spaces and punctuation).
+- **Buttons on the notification** (the blueprint's *Mute buttons*, Android):
+  *Mute all 1 h* and *Mute <camera> 1 h*, the hours being its *Mute hours*.
+  They fire the companion app's `mobile_app_notification_action` with the id
+  `SS_MUTE:<entry id>:<seconds>:<camera key, empty for all>`, which the
+  integration answers.
+
+**After updating, re-import the blueprint** (Blueprints → the three dots →
+Re-import blueprint): the mute is honoured by the automation, and the copy
+imported earlier has neither the `muted` condition nor the buttons.
+
+A hand-written automation on the event should check `muted`, e.g. the
+condition `{{ not trigger.event.data.muted }}`.
 
 The card follows such a link also when it is already on screen (HA navigates
 in place, without reloading): `?ss_camera=&ss_time=` selects the camera and

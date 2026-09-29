@@ -64,6 +64,12 @@
     },
     "cannot_connect": {
       "message": "无法连接 Surveillance Station：{error}"
+    },
+    "no_frigate": {
+      "message": "没有条目在记录 Frigate 检测，没有可静音的通知。"
+    },
+    "unknown_camera": {
+      "message": "没有名为 {camera} 的摄像头（Surveillance Station 或 Frigate 的名字均可）。"
     }
   },
   "options": {
@@ -128,6 +134,59 @@
         "auto": "自动",
         "gpu": "只用 GPU",
         "cpu": "只用 CPU"
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "mute_all": {
+        "name": "静音所有通知"
+      },
+      "mute_camera": {
+        "name": "静音 {camera}"
+      },
+      "mute_person": {
+        "name": "静音人"
+      },
+      "mute_car": {
+        "name": "静音车"
+      },
+      "mute_animal": {
+        "name": "静音动物"
+      }
+    }
+  },
+  "services": {
+    "mute": {
+      "name": "静音通知",
+      "description": "静音检测通知（书签仍会创建，事件仍会触发，带 muted: true）。摄像头和对象都给时，只静音该摄像头的这些对象。",
+      "fields": {
+        "duration": {
+          "name": "时长",
+          "description": "静音多久；不填则一直静音，直到解除。"
+        },
+        "camera": {
+          "name": "摄像头",
+          "description": "Surveillance Station 或 Frigate 的摄像头名；不填为所有摄像头。"
+        },
+        "objects": {
+          "name": "对象",
+          "description": "要静音的种类（人、车、动物，或 Frigate 标签）；不填为所有种类。"
+        }
+      }
+    },
+    "unmute": {
+      "name": "取消静音",
+      "description": "解除静音规则：给定摄像头和/或对象的所有规则；什么都不给则解除全部。",
+      "fields": {
+        "camera": {
+          "name": "摄像头",
+          "description": "Surveillance Station 或 Frigate 的摄像头名；不填为所有摄像头。"
+        },
+        "objects": {
+          "name": "对象",
+          "description": "要取消静音的种类（人、车、动物，或 Frigate 标签）；不填为所有种类。"
+        }
       }
     }
   }

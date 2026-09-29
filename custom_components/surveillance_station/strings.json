@@ -64,6 +64,12 @@
     },
     "cannot_connect": {
       "message": "Cannot reach Surveillance Station: {error}"
+    },
+    "no_frigate": {
+      "message": "No entry bookmarks Frigate detections, so there are no notifications to mute."
+    },
+    "unknown_camera": {
+      "message": "No camera called {camera} (a Surveillance Station or Frigate camera name)."
     }
   },
   "options": {
@@ -128,6 +134,59 @@
         "auto": "Automatic",
         "gpu": "GPU only",
         "cpu": "CPU only"
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "mute_all": {
+        "name": "Mute all notifications"
+      },
+      "mute_camera": {
+        "name": "Mute {camera}"
+      },
+      "mute_person": {
+        "name": "Mute person"
+      },
+      "mute_car": {
+        "name": "Mute car"
+      },
+      "mute_animal": {
+        "name": "Mute animal"
+      }
+    }
+  },
+  "services": {
+    "mute": {
+      "name": "Mute notifications",
+      "description": "Mute detection notifications (the bookmark is still made and the event still fires, with muted: true). With a camera and objects, only those objects on that camera.",
+      "fields": {
+        "duration": {
+          "name": "Duration",
+          "description": "How long to mute; without it, until unmuted."
+        },
+        "camera": {
+          "name": "Camera",
+          "description": "A Surveillance Station or Frigate camera name; without it, every camera."
+        },
+        "objects": {
+          "name": "Objects",
+          "description": "Kinds to mute (person, car, animal, or a Frigate label); without them, every kind."
+        }
+      }
+    },
+    "unmute": {
+      "name": "Unmute notifications",
+      "description": "Lift the mute rules for the given camera and/or objects; without any, all of them.",
+      "fields": {
+        "camera": {
+          "name": "Camera",
+          "description": "A Surveillance Station or Frigate camera name; without it, every camera."
+        },
+        "objects": {
+          "name": "Objects",
+          "description": "Kinds to unmute (person, car, animal, or a Frigate label); without them, every kind."
+        }
       }
     }
   }

@@ -352,7 +352,10 @@ async def test_options_without_the_camera_step(
             del setup_integration.runtime_data
     before = mock_client.cameras.await_count
     flow = await hass.config_entries.options.async_init(setup_integration.entry_id)
-    with patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)):
+    with (
+        patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)),
+        patch("custom_components.surveillance_station.switch._list_cameras", AsyncMock(return_value=None)),
+    ):
         result = await hass.config_entries.options.async_configure(
             flow["flow_id"], {CONF_FRIGATE: frigate, CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_OBJECTS: ["person"]}
         )
