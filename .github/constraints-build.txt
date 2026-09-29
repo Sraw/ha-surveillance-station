@@ -1,0 +1,4 @@
+# The build backend publish-library.yml's `python -m build` installs (via
+# PIP_CONSTRAINT): pinned, so a new setuptools release can't change what goes
+# to PyPI unseen. Must satisfy synology_ss/pyproject.toml's build-system.requires.
+setuptools==84.0.0

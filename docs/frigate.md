@@ -230,15 +230,22 @@ person who joins a dog's review. The rules are kept across restarts.
   leave it off. Turning one kind off on a muted camera leaves every other
   kind there muted, those without a switch included; turning it on again
   shows *all kinds* on again, and turning *all kinds* off lifts them all.
-  *All kinds* lasts as long as the longest of what mutes all of it (its own
-  rule, *Mute all*, or its kinds together, until the first of them ends).
+  *All kinds* lasts as long as the longest of what mutes all of it: *Mute
+  all*, or its own rule together with the rules of the kinds it leaves out
+  (until the first of them ends).
   With *Mute all* on, every other switch shows on but is
   `locked` (turning it is refused; likewise a camera's kind while that kind is
   muted for every camera). The attributes `camera`, `kind` and `locked` are
-  what the mute card lays the switches out by. A camera removed or renamed in
-  SS loses its switches the next time SS lists its cameras (a renamed one
-  gets new ones: rules name cameras by their name, ignoring case, spaces and
-  punctuation); its rules stay until they end or are unmuted.
+  what the mute card lays the switches out by. A camera's *all kinds* shown
+  off has **`others_muted: true`** while the camera's rules still mute kinds
+  that have no switch (its three kinds turned off one by one after it was
+  on leave Bicycle, Package, ... muted; so does the action with such
+  objects), which the mute card shows as "other kinds · muted"; turn *all kinds* on then off, or `unmute` with that `camera`, to
+  lift them. A camera removed or renamed in SS loses its switches once two
+  of SS's camera listings in a row lack it (a listing without any camera
+  removes nothing); a renamed one gets new ones (rules name cameras by their
+  name, ignoring case, spaces and punctuation). Its rules stay until they
+  end or are unmuted.
 - **Buttons on the notification** (the blueprint's *Mute buttons*, Android):
   *Mute all 1 h* and *Mute <camera> 1 h*, the hours being its *Mute hours*.
   They fire the companion app's `mobile_app_notification_action` with the id

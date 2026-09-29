@@ -3,7 +3,7 @@
 # Resource use
 
 Every buffer has a cap, and apart from small state in HA's storage the only
-thing kept on disk is thumbnails:
+things kept on disk are thumbnails and notification images:
 
 | Where | What | Bound |
 |---|---|---|

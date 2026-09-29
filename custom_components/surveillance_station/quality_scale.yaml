@@ -73,7 +73,8 @@ rules:
     status: exempt
     comment: >-
       One device per entry, made with it; a camera SS lists later gets its
-      switches on that device then, and one it no longer lists loses them.
+      switches on that device then, and one missing from two listings in a row
+      loses them.
   entity-category:
     status: exempt
     comment: The switches are controls, with no category.

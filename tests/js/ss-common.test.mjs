@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
   audioCodecOf, codecOf, esc, findBox, hour12Of, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText,
+  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText, partlyMuted,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -455,6 +455,23 @@ describe("mute card helpers", () => {
       assert.equal(ends("not a time"), "");
       assert.equal(muteText("de").kinds.person, "Person");
     });
+
+    test("a device that moves to another time zone gets its times in the new one", () => {
+      process.env.TZ = "America/Los_Angeles";
+      assert.equal(ends("2026-09-29T20:00:00+00:00"), "until 13:00");
+      process.env.TZ = "UTC";
+      assert.equal(ends("2026-09-29T20:00:00+00:00"), "until 20:00");
+    });
+
+    test("a language tag Intl doesn't know: the browser's times and 12 / 24 h, no error", () => {
+      process.env.TZ = "UTC";
+      const system = { time_format: "system" };
+      for (const language of ["en_US", ""]) {
+        const odd = { language, time_format: "language" };
+        assert.equal(hour12Of(odd), hour12Of(system));
+        assert.equal(ends("2026-09-29T20:05:00+00:00", odd), ends("2026-09-29T20:05:00+00:00", system));
+      }
+    });
   });
 
   test("hour12Of: the profile's choice, else the language's (or the browser's)", () => {
@@ -476,6 +493,30 @@ describe("mute card helpers", () => {
     assert.equal(kindLabel(muteText("zh"), "car"), "车");
     assert.equal(kindLabel(muteText("en"), "bicycle"), "Bicycle");
     assert.equal(kindLabel(muteText("en"), "title"), "Title");
+    // Nor what every object inherits.
+    assert.equal(kindLabel(muteText("en"), "constructor"), "Constructor");
+    assert.equal(kindLabel(muteText("zh"), "toString"), "ToString");
+  });
+
+  test("a camera partly muted: its kinds on, and other kinds when its all-kinds switch says so", () => {
+    const partly = (kinds, others) => {
+      const states = {
+        "switch.cam": { state: "off", attributes: { camera: "Gate", kind: null, locked: false, ...(others === undefined ? {} : { others_muted: others }) } },
+        "switch.person": sw("Gate", "person", kinds.includes("person") ? "on" : "off"),
+        "switch.car": sw("Gate", "car", kinds.includes("car") ? "on" : "off"),
+      };
+      const h = { entities: Object.fromEntries(Object.keys(states).map((id) => [id, ours("d1")])), states };
+      const [camera] = muteGroups(h)[0].cameras; // the attribute changes nothing in the layout: the row is updated in place
+      assert.deepEqual(camera, { name: "Gate", all: "switch.cam", kinds: { person: "switch.person", car: "switch.car" } });
+      return (language) => partlyMuted(muteText(language), states, camera);
+    };
+    assert.equal(partly(["person", "car"])("en"), "Person, Car · muted");
+    assert.equal(partly([], true)("en"), "other kinds · muted");
+    assert.equal(partly(["car"], true)("en"), "Car, other kinds · muted");
+    assert.equal(partly(["car"], true)("zh"), "车, 其他类型 · 已静音");
+    assert.equal(partly([], false)("en"), "");
+    assert.equal(partly([])("en"), "");
+    assert.equal(partlyMuted(muteText("en"), undefined, { all: "switch.gone", kinds: { person: "switch.gone2" } }), "");
   });
 
   test("fillText fills every place, and a name's $ stays as it is", () => {

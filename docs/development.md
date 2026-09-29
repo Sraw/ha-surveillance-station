@@ -51,11 +51,15 @@ a reload that bypasses the browser's cache, or once `manifest.json`'s
    runs the library tests, builds it and uploads it to PyPI (Trusted Publishing,
    no token; the tag must match the version and be on a commit already on
    `main`). Then pin the new version in `manifest.json`'s
-   `requirements`. (Manual fallback: `python -m build synology_ss` + `twine upload`.)
+   `requirements`. (Manual fallback: `PIP_CONSTRAINT=.github/constraints-build.txt
+   python -m build synology_ss` + `twine upload`; the constraints file pins the
+   build backend the workflow uses.)
    Set required reviewers on the repository's `pypi` environment (Settings →
    Environments → pypi) so the upload waits for an approval.
-2. Bump `manifest.json`'s `version`, tag `vX.Y.Z` and create a GitHub release
-   (HACS offers releases).
+2. Bump `manifest.json`'s `version` and `CARD_VERSION` in
+   `frontend/ss-timeline-card.js` to the same version (the cards are cached by
+   it; `tests/test_init.py` fails when they differ), tag `vX.Y.Z` and create a
+   GitHub release (HACS offers releases).
 
 ## Tests
 

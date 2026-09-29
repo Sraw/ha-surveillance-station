@@ -8,7 +8,9 @@ muted (the kinds without a switch too); turning one kind of it off leaves every
 other kind muted. What a wider mute covers shows on but is ``locked`` (turning it
 raises an error) until that mute is lifted: everything muted locks every other
 switch, a kind muted for every camera locks that kind on each camera. A
-detection is also muted by rules a switch does not show as its own.
+detection is also muted by rules a switch does not show as its own; a camera's
+all-kinds shown off says so (``others_muted``) while that camera's rules still
+mute kinds without a switch.
 """
 
 from __future__ import annotations
@@ -45,20 +47,34 @@ async def async_setup_entry(
     registry = er.async_get(hass)
     per_camera = f"{entry.entry_id}_{CAMERA_ID_PREFIX}"
     known: set[str] = set()
+    # Per-camera switches (unique ids) the last listing had no camera for.
+    absent: set[str] = set()
 
     @callback
     def add_cameras(names: list[str]) -> None:
+        nonlocal absent
         # Unloading: the switches go before the bridge stops (see async_unload_entry).
         if bridge.stopped or entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS:
             return
         listed = {key: name for name in names if (key := camera_key(name))}  # a name of only symbols has no key to mute by
+        # A listing without cameras is likelier SS answering oddly (the library
+        # skips what it cannot read) than every camera gone: nothing is removed.
+        if not listed:
+            return
         # A camera SS no longer lists (removed, or renamed: a new key) loses its
-        # switches; its rules stay (unmute takes its old name).
+        # switches once two listings in a row lack it, so that one short listing
+        # costs no entity_id, area or disabled flag; its rules stay (unmute takes its old name).
         wanted = {scope.unique_id(entry.entry_id) for key in listed for scope in camera_scopes(key)}
-        for item in er.async_entries_for_config_entry(registry, entry.entry_id):
-            if item.domain == "switch" and item.unique_id.startswith(per_camera) and item.unique_id not in wanted:
-                registry.async_remove(item.entity_id)
-        known.intersection_update(listed)
+        stale = {
+            item.unique_id: item.entity_id
+            for item in er.async_entries_for_config_entry(registry, entry.entry_id)
+            if item.domain == "switch" and item.unique_id.startswith(per_camera) and item.unique_id not in wanted
+        }
+        for unique_id in stale.keys() & absent:
+            registry.async_remove(stale[unique_id])
+        absent = stale.keys() - absent
+        # Kept while its switches are: adding them again would clash with them.
+        known.difference_update({key for key in known - listed.keys() if CameraScope(key).unique_id(entry.entry_id) not in absent})
         new = []
         for key, name in listed.items():
             if key not in known:
@@ -104,6 +120,10 @@ class Scope:
         """Everything, or a kind for every camera: that rule."""
         mute.remove(lambda r: r.camera == self.camera and r.kind == self.kind)
 
+    def attributes(self, mute: MuteRules, on: bool) -> dict[str, Any]:
+        """What the switch says beyond its scope and state."""
+        return {}
+
 
 class AllScope(Scope):
     translation_key = unique_suffix = "mute_all"
@@ -135,6 +155,13 @@ class CameraScope(Scope):
     def turn_off(self, mute: MuteRules) -> None:
         """Whatever mutes the camera, its kinds included."""
         mute.remove(lambda r: r.camera == self.camera)
+
+    def attributes(self, mute: MuteRules, on: bool) -> dict[str, Any]:
+        """others_muted: shown off while the camera's rules still mute kinds that have no switch
+        (its kinds turned off one by one after it was on, or the mute action for such objects),
+        which no switch would show otherwise; turning it on then off lifts them."""
+        others = not on and any(r.camera == self.camera and r.kind not in MUTE_KINDS for r in mute.rules())  # kind None too
+        return {"others_muted": others}
 
 
 class CameraKindScope(Scope):
@@ -198,6 +225,7 @@ class MuteSwitch(SwitchEntity):
             "kind": self._scope.kind.lower() if self._scope.kind else None,
             "locked": self._locked(),
             "muted_until": None if until is None else dt_util.utc_from_timestamp(until).isoformat(),
+            **self._scope.attributes(self._mute, on),
         }
 
     @callback

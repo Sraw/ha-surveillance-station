@@ -53,8 +53,15 @@ check((await row(cam)).sub.includes("muted"), `partial status: "${(await row(cam
 await page.screenshot({ path: "mute-card-2.png" });
 await toggleSw((await kindsOf())[1]);
 check((await row(cam)).on, "every kind on shows all kinds on");
+// Its kinds off one by one: the kinds without a switch there (Bicycle, Package, ...) stay muted, and the row says so.
+for (const k of await kindsOf()) await toggleSw(k);
+check(!(await row(cam)).on && (await kindsOf()).every((r) => !r.on) && (await row(cam)).sub.includes("other kinds"),
+  `every kind off: other kinds still muted ("${(await row(cam)).sub}")`);
 await toggle(cam);
-check(!(await row(cam)).on && (await kindsOf()).length === 3 && (await kindsOf()).every((r) => !r.on), "all kinds off lifts them all");
+check((await row(cam)).on, "all kinds on again");
+await toggle(cam);
+check(!(await row(cam)).on && (await kindsOf()).length === 3 && (await kindsOf()).every((r) => !r.on) && (await row(cam)).sub === "",
+  `all kinds off lifts them all, other kinds too ("${(await row(cam)).sub}")`);
 
 // A kind for every camera locks that kind's camera rows.
 const person = all.find((r) => r.name === "Person" && r.kind);

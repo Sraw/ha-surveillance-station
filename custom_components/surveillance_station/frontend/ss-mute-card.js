@@ -17,7 +17,7 @@
  */
 
 const MUTE_TAG = "ss-mute-card";
-const { esc, labelAttrs, fillText, kindLabel, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups } = await import(
+const { esc, labelAttrs, fillText, kindLabel, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups, partlyMuted } = await import(
   new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href
 );
 // Off and on, as icons.json has them for the switches. The kinds are listed in
@@ -137,13 +137,13 @@ class SSMuteCard extends HTMLElement {
       const on = s?.state === "on";
       const unavailable = !s || s.state === "unavailable";
       const locked = !unavailable && s.attributes.locked === true; // covered by a wider mute
-      // A camera partly muted says which of its kinds are.
-      const partial = r.kinds && !on ? Object.entries(r.kinds).filter(([, id]) => this._hass.states[id]?.state === "on").map(([k]) => kindLabel(this._text, k)) : [];
+      // A camera partly muted says which of its kinds are (other kinds: those without a switch there).
+      const partial = r.kinds && !on ? partlyMuted(this._text, this._hass.states, { all: r.id, kinds: r.kinds }) : "";
       r.el.classList.toggle("on", on);
       r.el.classList.toggle("locked", locked);
       r.el.classList.toggle("unavailable", unavailable);
       r.icon.setAttribute("icon", r.icons[on ? 1 : 0]);
-      r.sub.textContent = partial.length ? `${partial.join(", ")} · ${this._text.muted}` : muteEnds(s, this._text, this._hass.locale);
+      r.sub.textContent = partial || muteEnds(s, this._text, this._hass.locale);
       r.sw.checked = on; // also puts back a switch whose call was refused
       r.sw.disabled = locked || unavailable;
     }
@@ -157,12 +157,13 @@ class SSMuteCard extends HTMLElement {
   }
 
   _kindRows(kinds, text, row, camera) {
-    return [...Object.keys(KIND_ICONS), ...Object.keys(kinds).filter((k) => !KIND_ICONS[k])]
+    const known = (k) => Object.hasOwn(KIND_ICONS, k); // own keys only: a label such as "constructor" would find Object's
+    return [...Object.keys(KIND_ICONS), ...Object.keys(kinds).filter((k) => !known(k))]
       .filter((k) => kinds[k])
       .map((k) => {
         const label = kindLabel(text, k);
         const aria = camera == null ? fillText(text.muteKind, { kind: label }) : fillText(text.muteCameraKind, { kind: label, camera });
-        return row({ id: kinds[k], label, aria, icons: KIND_ICONS[k] ?? OTHER_KIND_ICONS, cls: "kind" });
+        return row({ id: kinds[k], label, aria, icons: known(k) ? KIND_ICONS[k] : OTHER_KIND_ICONS, cls: "kind" });
       })
       .join("");
   }

@@ -58,6 +58,26 @@ export function setLabel(el, text) {
   el.setAttribute("aria-label", text);
 }
 
+// The date formats, one per time zone, language and options: a format keeps
+// the zone it was made in, and a device can move to another while the page
+// stays open. Every Intl.DateTimeFormat of hour12Of and muteEnds comes from
+// here, so a language tag Intl doesn't know gets the browser's in both,
+// instead of throwing halfway through a card update.
+const dateFormats = new Map();
+function dateFormat(language, opts) {
+  const key = `${new Intl.DateTimeFormat().resolvedOptions().timeZone}|${language}|${JSON.stringify(opts)}`;
+  let f = dateFormats.get(key);
+  if (!f) {
+    try {
+      f = new Intl.DateTimeFormat(language, opts);
+    } catch (e) {
+      f = new Intl.DateTimeFormat(undefined, opts); // the browser's
+    }
+    dateFormats.set(key, f);
+  }
+  return f;
+}
+
 /**
  * Whether times read 12 h, as the user's HA profile says (hass.locale.time_format:
  * "12", "24", "language" or "system").
@@ -66,7 +86,7 @@ export function hour12Of(locale) {
   const f = locale?.time_format;
   if (f === "12" || f === "24") return f === "12";
   const lang = f === "system" ? undefined : locale?.language;
-  return Boolean(new Intl.DateTimeFormat(lang, { hour: "numeric" }).resolvedOptions().hour12);
+  return Boolean(dateFormat(lang, { hour: "numeric" }).resolvedOptions().hour12);
 }
 
 /**
@@ -283,13 +303,13 @@ const MUTE_TEXT = {
   en: {
     title: "Notifications", everything: "Everything", byKind: "By kind", cameras: "Cameras", forever: "forever",
     until: "until {t}", muteFor: "Mute {n} h", unmuteAll: "Unmute all", none: "No Surveillance Station mute switches found.",
-    muted: "muted", kinds: { person: "Person", car: "Car", animal: "Animal" }, kindsOf: "Kinds on {camera}",
+    muted: "muted", otherKinds: "other kinds", kinds: { person: "Person", car: "Car", animal: "Animal" }, kindsOf: "Kinds on {camera}",
     muteAll: "Mute everything", muteKind: "Mute {kind} on every camera", muteCamera: "Mute {camera}", muteCameraKind: "Mute {kind} on {camera}",
   },
   zh: {
     title: "通知", everything: "全部", byKind: "按类型", cameras: "摄像头", forever: "永久",
     until: "至 {t}", muteFor: "静音 {n} 小时", unmuteAll: "全部取消静音", none: "未找到 Surveillance Station 的静音开关。",
-    muted: "已静音", kinds: { person: "人", car: "车", animal: "动物" }, kindsOf: "{camera}的类型",
+    muted: "已静音", otherKinds: "其他类型", kinds: { person: "人", car: "车", animal: "动物" }, kindsOf: "{camera}的类型",
     muteAll: "全部静音", muteKind: "静音所有摄像头的{kind}", muteCamera: "静音{camera}", muteCameraKind: "静音{camera}的{kind}",
   },
 };
@@ -297,25 +317,25 @@ const MUTE_TEXT = {
 /** The mute card's texts for a UI language (English for the ones it has none of). */
 export const muteText = (language) => MUTE_TEXT[String(language ?? "").toLowerCase().startsWith("zh") ? "zh" : "en"];
 
-/** A kind's name in the card's texts; one it has no name for (a Frigate label's) capitalized. */
-export const kindLabel = (text, kind) => text.kinds[kind] ?? kind[0].toUpperCase() + kind.slice(1);
+/**
+ * A kind's name in the card's texts; one it has no name for (a Frigate label's) capitalized.
+ * Own names only: a label such as "constructor" must not find the object's inherited function.
+ */
+export const kindLabel = (text, kind) => (Object.hasOwn(text.kinds, kind) ? text.kinds[kind] : kind[0].toUpperCase() + kind.slice(1));
 
 /** A text with its {name} places filled in (a function, so a "$&" in a camera's name stays as it is). */
 export const fillText = (template, values) => template.replace(/\{(\w+)\}/g, (_, k) => values[k]);
 
-const endFormats = new Map();
-function endFormat(language, opts) {
-  const key = `${language}|${JSON.stringify(opts)}`;
-  let f = endFormats.get(key);
-  if (!f) {
-    try {
-      f = new Intl.DateTimeFormat(language, opts);
-    } catch (e) {
-      f = new Intl.DateTimeFormat(undefined, opts); // a language tag Intl doesn't know
-    }
-    endFormats.set(key, f);
-  }
-  return f;
+/**
+ * What is still muted on a camera whose *all kinds* switch is off (`camera`:
+ * muteGroups' `all` and `kinds`): its kinds whose switches are on, and "other
+ * kinds" when the switch says others_muted (kinds without a switch there, left
+ * muted when its kinds were turned off one by one). "" when nothing is.
+ */
+export function partlyMuted(text, states, camera) {
+  const names = Object.entries(camera.kinds).filter(([, id]) => states?.[id]?.state === "on").map(([k]) => kindLabel(text, k));
+  if (states?.[camera.all]?.attributes?.others_muted === true) names.push(text.otherKinds);
+  return names.length ? `${names.join(", ")} · ${text.muted}` : "";
 }
 
 /**
@@ -335,7 +355,7 @@ export function muteEnds(state, text, locale, now = Date.now()) {
   if (t.toDateString() !== today.toDateString()) {
     Object.assign(opts, { month: "short", day: "numeric" }, t.getFullYear() !== today.getFullYear() ? { year: "numeric" } : {});
   }
-  return fillText(text.until, { t: endFormat(locale?.language || undefined, opts).format(t) });
+  return fillText(text.until, { t: dateFormat(locale?.language || undefined, opts).format(t) });
 }
 
 /** The hours the card's buttons mute everything for: its `durations` that are positive numbers (default 1 and 8). */

@@ -200,6 +200,13 @@ def press(hass: HomeAssistant, entry: MockConfigEntry, seconds: int, camera: str
     hass.bus.async_fire("mobile_app_notification_action", {"action": f"SS_MUTE:{entry.entry_id}:{seconds}:{camera}"})
 
 
+async def listing(hass: HomeAssistant, bridge: FrigateBridge, later: int) -> None:
+    """SS lists its cameras again: the later-th listing after the first (each one due after the one before)."""
+    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601 * later):
+        await bridge.camera_names()
+    await hass.async_block_till_done()
+
+
 async def detect(hass: HomeAssistant, bridge: FrigateBridge, **kwargs) -> list:
     events = async_capture_events(hass, DETECTION_EVENT)
     with patch("custom_components.surveillance_station.frigate.time.time", return_value=T + 2):
@@ -669,9 +676,12 @@ async def test_a_camera_gone_from_ss_loses_its_switches_not_its_rules(
     front = switches(hass, mock_config_entry)["mute_camera_frontdoor"]
     frigate.mute.add("frontdoor", None, None)
     client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=10, name="Front Porch", enabled=True)]
-    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601):  # the list is due
-        await frigate.camera_names()
-    await hass.async_block_till_done()
+    await listing(hass, frigate, 1)
+    # Missing from one listing: kept (that listing may have been short).
+    ids = switches(hass, mock_config_entry)
+    assert "mute_camera_frontdoor" in ids and "mute_camera_kind_frontdoor_car" in ids and "mute_camera_frontporch" in ids
+    assert hass.states.get(front).state == "on"
+    await listing(hass, frigate, 2)
     ids = switches(hass, mock_config_entry)
     assert not any("frontdoor" in i for i in ids) and "mute_camera_frontporch" in ids and "mute_camera_kind_frontporch_car" in ids
     assert "mute_camera_driveway" in ids and hass.states.get(front) is None
@@ -686,13 +696,35 @@ async def test_a_camera_gone_from_ss_loses_its_switches_not_its_rules(
         await hass.services.async_call(DOMAIN, "unmute", {"camera": "Front Door"}, blocking=True)
     with pytest.raises(ServiceValidationError):
         await hass.services.async_call(DOMAIN, "mute", {"camera": "Front Door"}, blocking=True)
-    # Back in SS: its switches again.
+    # Back in SS: its switches again at once; Front Porch's go after two listings without it.
     client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=10, name="Front Door", enabled=True)]
-    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 1202):
-        await frigate.camera_names()
-    await hass.async_block_till_done()
+    await listing(hass, frigate, 3)
+    ids = switches(hass, mock_config_entry)
+    assert "mute_camera_frontdoor" in ids and "mute_camera_frontporch" in ids
+    assert hass.states.get(ids["mute_camera_kind_frontdoor_person"]).state == "off"
+    await listing(hass, frigate, 4)
     ids = switches(hass, mock_config_entry)
     assert "mute_camera_frontdoor" in ids and "mute_camera_frontporch" not in ids
+
+
+async def test_a_short_listing_once_or_one_without_cameras_removes_no_switch(
+    hass: HomeAssistant, frigate: FrigateBridge, client: MagicMock, mock_config_entry: MockConfigEntry
+) -> None:
+    """The library skips cameras it cannot read and lists none when SS's answer has none."""
+    await frigate.camera_names()
+    await hass.async_block_till_done()
+    before = switches(hass, mock_config_entry)
+    client.cameras.return_value = []
+    await listing(hass, frigate, 1)
+    await listing(hass, frigate, 2)
+    assert switches(hass, mock_config_entry) == before
+    assert all(hass.states.get(e).state == "off" for i, e in before.items() if i.startswith("mute_camera"))
+    client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True)]
+    await listing(hass, frigate, 3)
+    assert switches(hass, mock_config_entry) == before
+    await listing(hass, frigate, 4)
+    ids = switches(hass, mock_config_entry)
+    assert not any("frontdoor" in i for i in ids) and "mute_camera_kind_driveway_car" in ids
 
 
 async def test_switches_come_once_ss_answers(hass: HomeAssistant, mock_config_entry: MockConfigEntry, client: MagicMock) -> None:
@@ -797,3 +829,68 @@ async def test_cameras_are_resolved_in_every_entry_at_once(hass: HomeAssistant, 
     finally:
         del hass.data[DATA_FRIGATE]["other"]
     assert frigate.mute.rules() == [MuteRule("driveway", None, None)]
+
+
+async def test_a_camera_off_says_its_rules_still_mute_other_kinds(
+    hass: HomeAssistant, frigate: FrigateBridge, mock_config_entry: MockConfigEntry
+) -> None:
+    """Kinds without a switch muted on a camera shown off: others_muted, until all kinds is turned on then off, or unmute."""
+    await frigate.camera_names()
+    await hass.async_block_till_done()
+    ids = switches(hass, mock_config_entry)
+    cam = ids["mute_camera_driveway"]
+    kind = {k: ids[f"mute_camera_kind_driveway_{k}"] for k in ("person", "car", "animal")}
+
+    def others(entity: str = cam) -> bool:
+        return hass.states.get(entity).attributes["others_muted"]
+
+    assert not others()
+    await turn(hass, True, cam)
+    assert not others()  # on: nothing hidden
+    for entity in kind.values():
+        await turn(hass, False, entity)
+    assert [hass.states.get(e).state for e in (cam, *kind.values())] == ["off"] * 4
+    assert frigate.mute.is_muted("driveway", ["Bicycle"]) and others() and not others(ids["mute_camera_frontdoor"])
+    await turn(hass, True, cam)
+    await turn(hass, False, cam)
+    assert frigate.mute.rules() == [] and not others()
+    # The action for objects without a switch; unmute lifts them.
+    await hass.services.async_call(DOMAIN, "mute", {"camera": "drive_way", "objects": ["bicycle"]}, blocking=True)
+    await hass.async_block_till_done()
+    assert others()
+    await hass.services.async_call(DOMAIN, "unmute", {"camera": "drive_way"}, blocking=True)
+    await hass.async_block_till_done()
+    assert not others()
+    # A kind with a switch shows on its own.
+    await turn(hass, True, kind["car"])
+    assert not others()
+    assert "others_muted" not in hass.states.get(kind["car"]).attributes
+    assert "others_muted" not in hass.states.get(ids["mute_all"]).attributes
+
+
+async def test_a_button_for_a_camera_without_a_key_is_ignored(
+    hass: HomeAssistant, frigate: FrigateBridge, client: MagicMock, mock_config_entry: MockConfigEntry, caplog
+) -> None:
+    """Such a camera has no button; a made-up one must not mute a camera no switch shows."""
+    client.cameras.return_value = [*client.cameras.return_value, Camera(id=9, name="!!", enabled=True)]
+    await listing(hass, frigate, 1)
+    assert "" in frigate.camera_keys()
+    caplog.set_level("DEBUG", logger="custom_components.surveillance_station.mute_services")
+    press(hass, mock_config_entry, 3600, "!!")
+    await hass.async_block_till_done()
+    assert frigate.mute.rules() == [] and "its camera has no key" in caplog.text
+
+
+async def test_the_same_rule_again_is_no_change(hass: HomeAssistant) -> None:
+    """Not saved, rescheduled or told, though replacing it would move it to the end."""
+    rules = MuteRules(hass, "e")
+    changes = []
+    rules.async_add_listener(lambda: changes.append(1))
+    rules.add("driveway", None, None)
+    rules.add(None, "Person", None)
+    rules.add("driveway", None, None)
+    rules.replace(lambda r: r.kind == "Person", [MuteRule(None, "Person", None)])
+    assert len(changes) == 2 and rules.rules() == [MuteRule("driveway", None, None), MuteRule(None, "Person", None)]
+    rules.add("driveway", None, time.time() + 60)
+    assert len(changes) == 3
+    rules.stop()

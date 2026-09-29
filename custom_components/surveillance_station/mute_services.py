@@ -115,6 +115,10 @@ def _notification_action(hass: HomeAssistant, event: Event) -> None:
     if bridge is None or not 0 < seconds_int <= MUTE_ACTION_MAX_SECONDS:
         return
     key = camera_key(camera) if camera else None
+    if key == "":
+        # A camera of only symbols has no button of its own; a rule for key "" no switch would show.
+        _LOGGER.debug("Ignoring the notification action %r: its camera has no key", action)
+        return
     # Only a camera the entry knows (any event on the bus may say anything).
     if key is not None and key not in bridge.camera_keys():
         return

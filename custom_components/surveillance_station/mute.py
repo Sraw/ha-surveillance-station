@@ -16,6 +16,7 @@ Rules are kept across restarts and dropped when they end.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -185,7 +186,8 @@ class MuteRules:
         while len(rules) > MUTE_RULES_MAX:
             older = [r for r in rules if not any(r is a for a in added)] or rules
             rules.remove(next((r for r in older if r.until is not None), older[0]))
-        if rules == self._rules:
+        # The same rules in another order (one replaced by an equal one goes last) are no change.
+        if Counter(rules) == Counter(self._rules):
             return
         self._rules = rules
         self._changed()
