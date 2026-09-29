@@ -37,7 +37,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.24.0";
+const CARD_VERSION = "0.24.1";
 // What this card shares with the time-lapse card, loaded as that card is:
 // with this card's version, so a release never runs against a stale cached copy.
 const {
