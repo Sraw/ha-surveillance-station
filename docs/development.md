@@ -39,8 +39,11 @@ synology-ss-playback`.
 
 ## Releasing
 
-1. Library changed: bump `synology_ss/pyproject.toml`, build and upload it to
-   PyPI, then pin the new version in `manifest.json`'s `requirements`.
+1. Library changed: bump `synology_ss/pyproject.toml`, push, then tag
+   `synology-ss-vX.Y.Z` and push the tag: `.github/workflows/publish-library.yml`
+   builds and uploads it to PyPI (Trusted Publishing, no token; the tag must
+   match the version). Then pin the new version in `manifest.json`'s
+   `requirements`. (Manual fallback: `python -m build synology_ss` + `twine upload`.)
 2. Bump `manifest.json`'s `version`, tag `vX.Y.Z` and create a GitHub release
    (HACS offers releases).
 

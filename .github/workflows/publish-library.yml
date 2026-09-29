@@ -1,0 +1,50 @@
+name: Publish synology-ss-playback
+
+# Push a tag `synology-ss-vX.Y.Z` (X.Y.Z = version in synology_ss/pyproject.toml)
+# to build the library and upload it to PyPI. Uses PyPI Trusted Publishing
+# (OIDC): no API token is stored in GitHub. The publisher is configured on
+# PyPI (project synology-ss-playback -> Publishing): owner Sraw, repository
+# ha-surveillance-station, workflow publish-library.yml, environment pypi.
+
+on:
+  push:
+    tags: ["synology-ss-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Tag matches pyproject version
+        run: |
+          version=$(python -c "import tomllib;print(tomllib.load(open('synology_ss/pyproject.toml','rb'))['project']['version'])")
+          test "synology-ss-v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != pyproject version ${version}"; exit 1; }
+      - run: pip install build
+      - run: python -m build synology_ss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: synology_ss/dist/
+
+  publish:
+    name: upload to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: pypi
+    permissions:
+      id-token: write # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
