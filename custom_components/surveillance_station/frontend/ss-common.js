@@ -71,7 +71,11 @@ function dateFormat(language, opts) {
     try {
       f = new Intl.DateTimeFormat(language, opts);
     } catch (e) {
-      f = new Intl.DateTimeFormat(undefined, opts); // the browser's
+      try {
+        f = new Intl.DateTimeFormat(undefined, opts); // the browser's language
+      } catch (e2) {
+        f = new Intl.DateTimeFormat(undefined, { ...opts, timeZone: undefined }); // and its zone, for one Intl doesn't know
+      }
     }
     dateFormats.set(key, f);
   }
@@ -339,24 +343,33 @@ export function partlyMuted(text, states, camera) {
 }
 
 /**
- * How long a mute switch's mute lasts, as text in the browser's time zone and
- * the user's 12 / 24 h setting: "forever" (on without muted_until: until
- * lifted), "until 20:00" today, with the day (and year) otherwise, "" when off.
+ * How long a mute switch's mute lasts, as text in `timeZone` (default: the
+ * browser's; see serverZone) and the user's 12 / 24 h setting: "forever" (on
+ * without muted_until: until lifted), "until 20:00" today, with the day (and
+ * year) otherwise, "" when off.
  */
-export function muteEnds(state, text, locale, now = Date.now()) {
+export function muteEnds(state, text, locale, now = Date.now(), timeZone = undefined) {
   if (state?.state !== "on") return "";
   const until = state.attributes?.muted_until;
   if (until == null) return text.forever;
   const t = new Date(until);
   if (Number.isNaN(t.getTime())) return "";
-  const today = new Date(now);
+  // The days as year-month-day in the zone: the same day is the same text, and the year its first four.
+  const day = (d) => dateFormat("en-CA", { year: "numeric", month: "2-digit", day: "2-digit", timeZone }).format(d);
   // h23, not hour12: false, which some browsers show as 24:00 at midnight.
-  const opts = { hour: "numeric", minute: "2-digit", hourCycle: hour12Of(locale) ? "h12" : "h23" };
-  if (t.toDateString() !== today.toDateString()) {
-    Object.assign(opts, { month: "short", day: "numeric" }, t.getFullYear() !== today.getFullYear() ? { year: "numeric" } : {});
+  const opts = { hour: "numeric", minute: "2-digit", hourCycle: hour12Of(locale) ? "h12" : "h23", timeZone };
+  const [ends, today] = [day(t), day(new Date(now))];
+  if (ends !== today) {
+    Object.assign(opts, { month: "short", day: "numeric" }, ends.slice(0, 4) !== today.slice(0, 4) ? { year: "numeric" } : {});
   }
   return fillText(text.until, { t: dateFormat(locale?.language || undefined, opts).format(t) });
 }
+
+/**
+ * The time zone HA's profile asks times in: the server's when it says "server"
+ * (hass.locale.time_zone), else undefined: the browser's.
+ */
+export const serverZone = (hass) => (hass?.locale?.time_zone === "server" ? hass.config?.time_zone : undefined);
 
 /** The hours the card's buttons mute everything for: its `durations` that are positive numbers (default 1 and 8). */
 export function muteDurations(durations) {

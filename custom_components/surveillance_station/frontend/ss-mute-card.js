@@ -17,7 +17,7 @@
  */
 
 const MUTE_TAG = "ss-mute-card";
-const { esc, labelAttrs, fillText, kindLabel, muteText, muteEnds, muteDurations, muteSwitchIds, muteGroups, partlyMuted } = await import(
+const { esc, labelAttrs, fillText, kindLabel, muteText, muteEnds, serverZone, muteDurations, muteSwitchIds, muteGroups, partlyMuted } = await import(
   new URL(`./ss-common.js${new URL(import.meta.url).search}`, import.meta.url).href
 );
 // Off and on, as icons.json has them for the switches. The kinds are listed in
@@ -143,7 +143,7 @@ class SSMuteCard extends HTMLElement {
       r.el.classList.toggle("locked", locked);
       r.el.classList.toggle("unavailable", unavailable);
       r.icon.setAttribute("icon", r.icons[on ? 1 : 0]);
-      r.sub.textContent = partial || muteEnds(s, this._text, this._hass.locale);
+      r.sub.textContent = partial || muteEnds(s, this._text, this._hass.locale, Date.now(), serverZone(this._hass));
       r.sw.checked = on; // also puts back a switch whose call was refused
       r.sw.disabled = locked || unavailable;
     }

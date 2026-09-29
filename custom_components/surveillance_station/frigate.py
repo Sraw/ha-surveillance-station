@@ -74,6 +74,7 @@ from .const import (
     FRIGATE_ANNOUNCE_MAX_AGE,
     FRIGATE_BOOKMARK_LOOKBACK,
     FRIGATE_BOOKMARK_SLACK,
+    FRIGATE_CAMERAS_RETRY,
     FRIGATE_CAMERAS_TTL,
     FRIGATE_DECIDED_MAX,
     FRIGATE_EVENT_WAIT_SECONDS,
@@ -258,6 +259,8 @@ class FrigateBridge:
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
         self._cameras_by_name: dict[str, tuple[int, str]] = {}  # SS name -> (SS id, SS name)
         self._cameras_at = -math.inf  # when SS last listed them
+        self._cameras_failed_at = -math.inf  # when a listing last failed (and how, until one works)
+        self._cameras_error: SSError | None = None
         self._camera_listing: SharedJobs[None, None] = SharedJobs(hass, "cameras")
         self._camera_listeners: list[Callable[[list[str]], None]] = []  # told the SS camera names
         self._unknown: set[str] = set()  # Frigate cameras warned about
@@ -548,7 +551,7 @@ class FrigateBridge:
                 # before making one again. And the camera may have been
                 # replaced in SS (same name, new id): list the cameras again.
                 self.manager.forget_bookmarks(self.entry_id)
-                self._cameras_at = -math.inf
+                self._cameras_at = self._cameras_failed_at = -math.inf
                 item = replace(item, maybe_made=True)
                 transient = _transient(err)
                 if not transient:
@@ -854,6 +857,11 @@ class FrigateBridge:
         # renamed), and every FRIGATE_CAMERAS_TTL anyway, or right after a
         # failure (replaced: same name, new id).
         due = age > FRIGATE_CAMERAS_TTL or (self._lookup(frigate_camera) is None and age > 60)
+        if due and self._cameras_error is not None and _monotonic() - self._cameras_failed_at < FRIGATE_CAMERAS_RETRY:
+            # SS just failed to list them: not asked again for every review and search.
+            if not stale_ok:
+                raise self._cameras_error
+            due = False
         await self._refresh_cameras(due, stale_ok)
         return self._lookup(frigate_camera)
 
@@ -864,7 +872,8 @@ class FrigateBridge:
             return
         try:
             await self._list_cameras()
-        except SSError:
+        except SSError as err:
+            self._cameras_failed_at, self._cameras_error = _monotonic(), err
             if not stale_ok:
                 raise
 
@@ -881,6 +890,7 @@ class FrigateBridge:
     async def _read_cameras(self) -> None:
         cameras = await self.client.cameras()
         self._cameras_at = _monotonic()
+        self._cameras_error = None
         self._set_cameras(cameras)
 
     async def ss_camera(self, frigate_camera: str) -> tuple[int, str] | None:

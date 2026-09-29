@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
   audioCodecOf, codecOf, esc, findBox, hour12Of, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, muteGroups, muteSwitchIds, muteText, partlyMuted,
+  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, serverZone, muteGroups, muteSwitchIds, muteText, partlyMuted,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -435,6 +435,22 @@ describe("mute card helpers", () => {
       assert.equal(ends("2026-09-30T03:00:00+00:00"), "until 20:00");
       assert.equal(ends("2026-09-30T07:30:00+00:00"), "until Sep 30, 00:30");
       assert.equal(ends("2027-01-02T20:00:00+00:00"), "until Jan 2, 2027, 12:00");
+    });
+
+    test("in the server's time zone when the profile says so, the day taken there", () => {
+      process.env.TZ = "America/Los_Angeles";
+      const at = (until, zone) => muteEnds(sw(null, null, "on", until), muteText("en"), en24, now, zone);
+      // 12:00 UTC is 21:00 in Tokyo, 05:00 in the browser's Los Angeles.
+      assert.equal(at("2026-09-29T14:00:00+00:00", "Asia/Tokyo"), "until 23:00");
+      assert.equal(at("2026-09-29T20:00:00+00:00", "Asia/Tokyo"), "until Sep 30, 05:00");
+      assert.equal(at("2026-09-29T20:00:00+00:00", undefined), "until 13:00");
+      assert.equal(at("2026-12-31T20:00:00+00:00", "Asia/Tokyo"), "until Jan 1, 2027, 05:00");
+      process.env.TZ = "UTC";
+      assert.equal(at("2026-09-29T20:00:00+00:00", "Nowhere/Land"), "until 20:00"); // a zone Intl doesn't know: the browser's
+      assert.equal(serverZone({ locale: { time_zone: "server" }, config: { time_zone: "Asia/Tokyo" } }), "Asia/Tokyo");
+      assert.equal(serverZone({ locale: { time_zone: "local" }, config: { time_zone: "Asia/Tokyo" } }), undefined);
+      assert.equal(serverZone({}), undefined);
+      assert.equal(serverZone(undefined), undefined);
     });
 
     test("12 or 24 h as the user's profile says", () => {

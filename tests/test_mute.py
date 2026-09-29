@@ -15,7 +15,7 @@ from pytest_homeassistant_custom_component.common import (
     async_fire_time_changed,
     flush_store,
 )
-from synology_ss_playback import Bookmark, Camera, SSConnectionError
+from synology_ss_playback import Bookmark, Camera, SSConnectionError, SSError
 
 from custom_components.surveillance_station import async_unload_entry
 from custom_components.surveillance_station.const import CONF_FRIGATE, CONF_FRIGATE_OBJECTS, CONF_FRIGATE_TOPIC, DETECTION_EVENT, DOMAIN
@@ -806,6 +806,33 @@ async def test_a_failed_setup_leaves_no_mute_timer(
         async_fire_time_changed(hass)
         await hass.async_block_till_done()
     assert hass_storage[key]["data"]["rules"] == stored
+
+
+async def test_a_failed_setup_takes_the_bridge_away_too(hass: HomeAssistant, mock_config_entry: MockConfigEntry, client: MagicMock) -> None:
+    """Its rules are stopped, so the mute actions must not find it and report a mute that does nothing."""
+    with patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock(side_effect=RuntimeError("boom"))):
+        assert not await set_up(hass, mock_config_entry)
+    assert mock_config_entry.entry_id not in hass.data.get(DATA_FRIGATE, {})
+    with pytest.raises(ServiceValidationError):
+        await hass.services.async_call(DOMAIN, "mute", {}, blocking=True)
+
+
+async def test_ss_failing_to_list_cameras_is_not_asked_again_at_once(hass: HomeAssistant, frigate: FrigateBridge, client: MagicMock) -> None:
+    await frigate.camera_names()
+    client.cameras.side_effect = SSConnectionError("x", "List", None)
+    asked = client.cameras.await_count
+    later = time.monotonic() + 601  # the list is due
+    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=later):
+        for _ in range(3):  # a review each time: it fails as it did, without another listing
+            with pytest.raises(SSError):
+                await frigate.ss_camera("drive_way")
+        assert client.cameras.await_count == asked + 1
+        assert await frigate.resolve_camera("Drive Way") == "driveway"  # the list as it was
+        assert client.cameras.await_count == asked + 1
+    client.cameras.side_effect = None
+    with patch("custom_components.surveillance_station.frigate._monotonic", return_value=later + 61):  # a minute on: asked again
+        assert await frigate.ss_camera("drive_way") == (6, "Drive Way")
+        assert client.cameras.await_count == asked + 2
 
 
 async def test_cameras_are_resolved_in_every_entry_at_once(hass: HomeAssistant, frigate: FrigateBridge) -> None:

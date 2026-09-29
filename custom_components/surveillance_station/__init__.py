@@ -222,6 +222,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
         # Its mute rules' timer, also if setup fails after this (unloading stops it too).
         entry.async_on_unload(bridge.mute.stop)
         hass.data.setdefault(DATA_FRIGATE, {})[entry.entry_id] = bridge
+        # Not there for the mute actions once setup failed after this (an unload has taken it already).
+
+        def drop_bridge() -> None:
+            hass.data[DATA_FRIGATE].pop(entry.entry_id, None)
+
+        entry.async_on_unload(drop_bridge)
         # In the background: MQTT may still be starting.
         entry.async_create_background_task(hass, bridge.start(), "surveillance_station frigate setup")
         # The mute switches.
