@@ -681,7 +681,9 @@ async def test_a_camera_gone_from_ss_loses_its_switches_not_its_rules(
     ids = switches(hass, mock_config_entry)
     assert "mute_camera_frontdoor" in ids and "mute_camera_kind_frontdoor_car" in ids and "mute_camera_frontporch" in ids
     assert hass.states.get(front).state == "on"
-    await listing(hass, frigate, 2)
+    await listing(hass, frigate, 2)  # a second one soon after does not settle it
+    assert "mute_camera_frontdoor" in switches(hass, mock_config_entry)
+    await listing(hass, frigate, 4)  # half an hour after the first without it
     ids = switches(hass, mock_config_entry)
     assert not any("frontdoor" in i for i in ids) and "mute_camera_frontporch" in ids and "mute_camera_kind_frontporch_car" in ids
     assert "mute_camera_driveway" in ids and hass.states.get(front) is None
@@ -698,11 +700,11 @@ async def test_a_camera_gone_from_ss_loses_its_switches_not_its_rules(
         await hass.services.async_call(DOMAIN, "mute", {"camera": "Front Door"}, blocking=True)
     # Back in SS: its switches again at once; Front Porch's go after two listings without it.
     client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True), Camera(id=10, name="Front Door", enabled=True)]
-    await listing(hass, frigate, 3)
+    await listing(hass, frigate, 5)
     ids = switches(hass, mock_config_entry)
     assert "mute_camera_frontdoor" in ids and "mute_camera_frontporch" in ids
     assert hass.states.get(ids["mute_camera_kind_frontdoor_person"]).state == "off"
-    await listing(hass, frigate, 4)
+    await listing(hass, frigate, 8)
     ids = switches(hass, mock_config_entry)
     assert "mute_camera_frontdoor" in ids and "mute_camera_frontporch" not in ids
 
@@ -722,7 +724,9 @@ async def test_a_short_listing_once_or_one_without_cameras_removes_no_switch(
     client.cameras.return_value = [Camera(id=6, name="Drive Way", enabled=True)]
     await listing(hass, frigate, 3)
     assert switches(hass, mock_config_entry) == before
-    await listing(hass, frigate, 4)
+    await listing(hass, frigate, 4)  # a second short one, but soon after
+    assert switches(hass, mock_config_entry) == before
+    await listing(hass, frigate, 6)
     ids = switches(hass, mock_config_entry)
     assert not any("frontdoor" in i for i in ids) and "mute_camera_kind_driveway_car" in ids
 

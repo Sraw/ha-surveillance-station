@@ -28,7 +28,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from . import SurveillanceStationConfigEntry
+from . import SurveillanceStationConfigEntry, frigate as frigate_mod
 from .const import DOMAIN, FRIGATE_CAMERAS_TTL, MUTE_KINDS
 from .frigate import DATA_FRIGATE, FrigateBridge, camera_key
 from .mute import MuteRule, MuteRules
@@ -36,6 +36,8 @@ from .mute import MuteRule, MuteRules
 PARALLEL_UPDATES = 0
 # Every per-camera switch's unique id starts with this (after the entry id).
 CAMERA_ID_PREFIX = "mute_camera_"
+# A camera's switches go once SS has not listed it for this many seconds, over two listings at least.
+CAMERA_GONE_AFTER = 1800
 
 
 async def async_setup_entry(
@@ -47,8 +49,8 @@ async def async_setup_entry(
     registry = er.async_get(hass)
     per_camera = f"{entry.entry_id}_{CAMERA_ID_PREFIX}"
     known: set[str] = set()
-    # Per-camera switches (unique ids) the last listing had no camera for.
-    absent: set[str] = set()
+    # Per-camera switches (unique ids) the last listing had no camera for: since when (monotonic).
+    absent: dict[str, float] = {}
 
     @callback
     def add_cameras(names: list[str]) -> None:
@@ -62,17 +64,19 @@ async def async_setup_entry(
         if not listed:
             return
         # A camera SS no longer lists (removed, or renamed: a new key) loses its
-        # switches once two listings in a row lack it, so that one short listing
-        # costs no entity_id, area or disabled flag; its rules stay (unmute takes its old name).
+        # switches once two listings in a row, CAMERA_GONE_AFTER apart, lack it, so that a short
+        # listing costs no entity_id, area or disabled flag; its rules stay (unmute takes its old name).
         wanted = {scope.unique_id(entry.entry_id) for key in listed for scope in camera_scopes(key)}
         stale = {
             item.unique_id: item.entity_id
             for item in er.async_entries_for_config_entry(registry, entry.entry_id)
             if item.domain == "switch" and item.unique_id.startswith(per_camera) and item.unique_id not in wanted
         }
-        for unique_id in stale.keys() & absent:
+        now = frigate_mod._monotonic()
+        gone = {uid for uid in stale.keys() & absent.keys() if now - absent[uid] >= CAMERA_GONE_AFTER}
+        for unique_id in gone:
             registry.async_remove(stale[unique_id])
-        absent = stale.keys() - absent
+        absent = {uid: absent.get(uid, now) for uid in stale.keys() - gone}
         # Kept while its switches are: adding them again would clash with them.
         known.difference_update({key for key in known - listed.keys() if CameraScope(key).unique_id(entry.entry_id) not in absent})
         new = []
