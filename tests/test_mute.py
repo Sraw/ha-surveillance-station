@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -199,16 +200,30 @@ async def test_switches(hass: HomeAssistant, frigate: FrigateBridge, mock_config
     registry = er.async_get(hass)
     ids = {e.unique_id: e.entity_id for e in er.async_entries_for_config_entry(registry, mock_config_entry.entry_id)}
     assert set(ids) == {f"{mock_config_entry.entry_id}_{k}" for k in (
-        "mute_all", "mute_person", "mute_car", "mute_animal", "mute_camera_driveway", "mute_camera_frontdoor"
+        "mute_all", "mute_person", "mute_car", "mute_animal", "mute_camera_driveway", "mute_camera_frontdoor",
+        *(f"mute_camera_kind_{c}_{k}" for c in ("driveway", "frontdoor") for k in ("person", "car", "animal")),
     )}
     everything = ids[f"{mock_config_entry.entry_id}_mute_all"]
     camera = ids[f"{mock_config_entry.entry_id}_mute_camera_driveway"]
     person = ids[f"{mock_config_entry.entry_id}_mute_person"]
     assert hass.states.get(everything).state == "off"
+    # One kind on one camera: only that kind, only there.
+    driveway_car = ids[f"{mock_config_entry.entry_id}_mute_camera_kind_driveway_car"]
+    await hass.services.async_call("switch", "turn_on", {"entity_id": driveway_car}, blocking=True)
+    assert hass.states.get(driveway_car).state == "on" and hass.states.get(camera).state == "off"
+    assert frigate.mute.is_muted("driveway", ["Car"]) and not frigate.mute.is_muted("driveway", ["Person"])
+    assert not frigate.mute.is_muted("frontdoor", ["Car"])
+    await hass.services.async_call("switch", "turn_off", {"entity_id": driveway_car}, blocking=True)
+    assert not frigate.mute.is_muted("driveway", ["Car"])
     await hass.services.async_call("switch", "turn_on", {"entity_id": camera}, blocking=True)
     assert hass.states.get(camera).state == "on" and hass.states.get(camera).attributes["muted_until"] is None
     assert hass.states.get(everything).state == "off"
     assert frigate.mute.is_muted("driveway", ["Person"]) and not frigate.mute.is_muted("frontdoor", ["Person"])
+    # The scope is in the attributes, for the mute card.
+    assert hass.states.get(everything).attributes["camera"] is None and hass.states.get(everything).attributes["kind"] is None
+    assert hass.states.get(camera).attributes["camera"] == "Drive Way" and hass.states.get(camera).attributes["kind"] is None
+    assert hass.states.get(driveway_car).attributes["camera"] == "Drive Way" and hass.states.get(driveway_car).attributes["kind"] == "car"
+    assert hass.states.get(person).attributes["camera"] is None and hass.states.get(person).attributes["kind"] == "person"
     # A timed mute from the action shows on the switch too, and ends by itself.
     await hass.services.async_call(DOMAIN, "mute", {"objects": ["person"], "duration": {"minutes": 5}}, blocking=True)
     state = hass.states.get(person)
@@ -284,6 +299,96 @@ async def test_a_full_list_drops_timed_rules_first(hass: HomeAssistant) -> None:
     assert not any(r.camera == "later" for r in rules.rules())
 
 
+async def test_switches_follow_the_hierarchy(hass: HomeAssistant, frigate: FrigateBridge, mock_config_entry: MockConfigEntry) -> None:
+    await frigate.camera_names()
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    ids = {e.unique_id: e.entity_id for e in er.async_entries_for_config_entry(registry, mock_config_entry.entry_id)}
+    entry = mock_config_entry.entry_id
+    everything, person = ids[f"{entry}_mute_all"], ids[f"{entry}_mute_person"]
+    cam = ids[f"{entry}_mute_camera_driveway"]
+    kind = {k: ids[f"{entry}_mute_camera_kind_driveway_{k}"] for k in ("person", "car", "animal")}
+
+    async def turn(on: bool, entity: str) -> None:
+        await hass.services.async_call("switch", "turn_on" if on else "turn_off", {"entity_id": entity}, blocking=True)
+        await hass.async_block_till_done()
+
+    def states(*entities: str) -> list[str]:
+        return [hass.states.get(e).state for e in entities]
+
+    # All kinds of a camera shows every kind on; a kind turned off leaves the others muted and all-kinds off.
+    await turn(True, cam)
+    assert states(cam, *kind.values()) == ["on"] * 4
+    await turn(False, kind["car"])
+    assert states(cam, *kind.values()) == ["off", "on", "off", "on"]
+    assert frigate.mute.is_muted("driveway", ["Person", "Animal"]) and not frigate.mute.is_muted("driveway", ["Car"])
+    # Every kind on shows all-kinds on; all-kinds off lifts them all.
+    await turn(True, kind["car"])
+    assert states(cam, *kind.values()) == ["on"] * 4
+    await turn(False, cam)
+    assert states(cam, *kind.values()) == ["off"] * 4 and frigate.mute.rules() == []
+    # A kind muted for every camera shows on for each camera, locked.
+    await turn(True, person)
+    assert states(kind["person"], kind["car"]) == ["on", "off"]
+    assert hass.states.get(kind["person"]).attributes["locked"] and not hass.states.get(kind["car"]).attributes["locked"]
+    with pytest.raises(ServiceValidationError):
+        await turn(False, kind["person"])
+    assert states(cam) == ["off"]
+    await turn(False, person)
+    assert states(kind["person"]) == ["off"] and not hass.states.get(kind["person"]).attributes["locked"]
+    # Everything muted: all the others show on but are locked, and are free when it is lifted.
+    await turn(True, everything)
+    assert states(person, cam, *kind.values()) == ["on"] * 5
+    assert all(hass.states.get(e).attributes["locked"] for e in (person, cam, *kind.values()))
+    assert hass.states.get(cam).attributes["mute_ends"] == "forever"
+    with pytest.raises(ServiceValidationError):
+        await turn(True, cam)
+    await turn(False, everything)
+    assert states(person, cam, *kind.values()) == ["off"] * 5
+    assert not any(hass.states.get(e).attributes["locked"] for e in (person, cam, *kind.values()))
+
+
+async def test_switches_and_timed_mutes(hass: HomeAssistant, frigate: FrigateBridge, mock_config_entry: MockConfigEntry, freezer) -> None:
+    await frigate.camera_names()
+    await hass.async_block_till_done()
+    registry = er.async_get(hass)
+    ids = {e.unique_id: e.entity_id for e in er.async_entries_for_config_entry(registry, mock_config_entry.entry_id)}
+    entry = mock_config_entry.entry_id
+    everything, cam = ids[f"{entry}_mute_all"], ids[f"{entry}_mute_camera_driveway"]
+    kind = {k: ids[f"{entry}_mute_camera_kind_driveway_{k}"] for k in ("person", "car", "animal")}
+
+    async def turn(on: bool, entity: str) -> None:
+        await hass.services.async_call("switch", "turn_on" if on else "turn_off", {"entity_id": entity}, blocking=True)
+        await hass.async_block_till_done()
+
+    def rules() -> dict:
+        return {(r.camera, r.kind): r.until for r in frigate.mute.rules()}
+
+    # Turning a switch on over a timed mute makes it last until turned off.
+    await hass.services.async_call(DOMAIN, "mute", {"duration": {"hours": 1}}, blocking=True)
+    assert hass.states.get(everything).attributes["muted_until"] is not None
+    await turn(True, everything)
+    assert hass.states.get(everything).attributes["muted_until"] is None
+    assert hass.states.get(everything).attributes["mute_ends"] == "forever"
+    await turn(False, everything)
+    assert hass.states.get(everything).attributes["mute_ends"] is None
+    await hass.services.async_call(DOMAIN, "mute", {"camera": "drive_way", "duration": {"hours": 1}}, blocking=True)
+    assert hass.states.get(kind["car"]).attributes["muted_until"] is not None
+    await turn(True, kind["car"])
+    assert hass.states.get(kind["car"]).attributes["muted_until"] is None
+    await turn(False, cam)
+    assert rules() == {}
+    # Splitting a timed camera mute keeps its end, but never shortens a longer kind mute.
+    now = time.time()
+    await hass.services.async_call(DOMAIN, "mute", {"camera": "drive_way", "duration": {"hours": 2}}, blocking=True)
+    await turn(True, kind["person"])
+    await turn(False, kind["car"])
+    assert rules() == {("driveway", "Person"): None, ("driveway", "Animal"): pytest.approx(now + 7200, abs=5)}
+    assert hass.states.get(cam).state == "off"
+    assert hass.states.get(kind["animal"]).attributes["muted_until"] is not None
+    assert hass.states.get(kind["animal"]).attributes["mute_ends"] not in (None, "forever")
+
+
 async def test_button_for_an_unknown_camera_is_ignored(hass: HomeAssistant, frigate: FrigateBridge, mock_config_entry: MockConfigEntry) -> None:
     await frigate.camera_names()
     hass.bus.async_fire("mobile_app_notification_action", {"action": f"SS_MUTE:{mock_config_entry.entry_id}:60:Front Door"})
@@ -298,7 +403,7 @@ async def test_cameras_without_a_key_get_no_switch(hass: HomeAssistant, frigate:
     await frigate.camera_names()
     await hass.async_block_till_done()
     ids = {e.unique_id for e in er.async_entries_for_config_entry(er.async_get(hass), mock_config_entry.entry_id)}
-    assert {i for i in ids if "mute_camera" in i} == {f"{mock_config_entry.entry_id}_mute_camera_{k}" for k in ("driveway", "frontdoor")}
+    assert {i for i in ids if "mute_camera" in i and "mute_camera_kind" not in i} == {f"{mock_config_entry.entry_id}_mute_camera_{k}" for k in ("driveway", "frontdoor")}
     assert await frigate.resolve_camera("!!") is None
 
 

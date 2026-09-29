@@ -217,12 +217,17 @@ person who joins a dog's review. The rules are kept across restarts.
   camera and/or objects, whatever else it covers. E.g. the driveway's people
   for 2 hours: `camera: drive_way`, `objects: [person]`, `duration: "02:00:00"`.
 - **Switches** (device *Surveillance Station*): *Mute all notifications*, one
-  per kind and one per camera. On mutes until turned off; a switch shows the
-  rule for exactly its own scope (a camera muted for 2 hours by the action is
-  on, with `muted_until`), while a detection is also muted by rules that
-  switch doesn't show (all muted, the camera's switch off). A camera renamed
-  in SS gets a new switch (rules name cameras by their name, ignoring case,
-  spaces and punctuation).
+  per kind, one per camera (*all kinds*), and one per kind on each camera. On
+  mutes until turned off; a timed mute from the action shows on, with
+  `muted_until` (and `mute_ends`, the same for display: a local time, or
+  `forever`). The switches follow the hierarchy: a camera's *all kinds* shows
+  its kinds on; turning one of them off leaves the camera's other kinds muted
+  and *all kinds* off; all its kinds on shows *all kinds* on, and turning that
+  off lifts them all. With *Mute all* on, every other switch shows on but is
+  `locked` (turning it is refused; likewise a camera's kind while that kind is
+  muted for every camera). A camera
+  renamed in SS gets new switches (rules name cameras by their name, ignoring
+  case, spaces and punctuation).
 - **Buttons on the notification** (the blueprint's *Mute buttons*, Android):
   *Mute all 1 h* and *Mute <camera> 1 h*, the hours being its *Mute hours*.
   They fire the companion app's `mobile_app_notification_action` with the id

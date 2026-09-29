@@ -265,3 +265,58 @@ export function audioCodecOf(moov) {
   if (aot === 31) aot = 32 + (((moov[k] & 7) << 3) | (moov[k + 1] >> 5)); // the escape: 6 more bits
   return `mp4a.40.${aot || 2}`;
 }
+
+// ---- The mute card ---------------------------------------------------------------
+
+const MUTE_TEXT = {
+  en: {
+    title: "Notifications", everything: "Everything", allCameras: "All cameras", allKinds: "All kinds", cameras: "Cameras", forever: "forever",
+    until: "until {t}", muteFor: "Mute {n} h", unmuteAll: "Unmute all", none: "No Surveillance Station mute switches found.",
+    muted: "muted", person: "Person", car: "Car", animal: "Animal",
+  },
+  zh: {
+    title: "通知", everything: "全部", allCameras: "所有摄像头", allKinds: "所有类型", cameras: "摄像头", forever: "永久",
+    until: "至 {t}", muteFor: "静音 {n} 小时", unmuteAll: "全部取消静音", none: "未找到 Surveillance Station 的静音开关。",
+    muted: "已静音", person: "人", car: "车", animal: "动物",
+  },
+};
+
+/** The mute card's texts for a UI language (English for the ones it has none of). */
+export const muteText = (language) => MUTE_TEXT[String(language ?? "").toLowerCase().startsWith("zh") ? "zh" : "en"];
+
+/** How long a mute switch's mute lasts, as text: "forever", "until 2026-09-29 20:00", "" when off. */
+export function muteEnds(state, text) {
+  const ends = state?.attributes?.mute_ends;
+  if (!ends) return "";
+  return ends === "forever" ? text.forever : text.until.replace("{t}", ends);
+}
+
+/**
+ * The mute switches among hass.states, laid out for the card: one group per
+ * device (a Surveillance Station entry) with `all` (everything), `kinds`
+ * (kind -> entity id, for every camera) and `cameras` (by name, each with `all`
+ * and `kinds`). A mute switch is one with the mute_ends attribute; the
+ * integration says which camera and kind it is for in `camera` and `kind`.
+ */
+export function muteGroups(hass) {
+  const groups = new Map();
+  for (const [id, state] of Object.entries(hass?.states ?? {})) {
+    const attrs = state?.attributes;
+    if (!id.startsWith("switch.") || !attrs || !("mute_ends" in attrs) || !("camera" in attrs)) continue;
+    const device = hass.entities?.[id]?.device_id ?? "";
+    if (!groups.has(device)) groups.set(device, { device, all: null, kinds: {}, cameras: [] });
+    const group = groups.get(device);
+    if (attrs.camera == null) {
+      if (attrs.kind == null) group.all = id;
+      else group.kinds[attrs.kind] = id;
+      continue;
+    }
+    let camera = group.cameras.find((c) => c.name === attrs.camera);
+    if (!camera) group.cameras.push((camera = { name: attrs.camera, all: null, kinds: {} }));
+    if (attrs.kind == null) camera.all = id;
+    else camera.kinds[attrs.kind] = id;
+  }
+  const out = [...groups.values()];
+  for (const g of out) g.cameras.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}

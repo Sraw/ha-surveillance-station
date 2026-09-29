@@ -30,6 +30,24 @@
         "state": {
           "on": "mdi:paw-off"
         }
+      },
+      "mute_camera_person": {
+        "default": "mdi:walk",
+        "state": {
+          "on": "mdi:account-off"
+        }
+      },
+      "mute_camera_car": {
+        "default": "mdi:car",
+        "state": {
+          "on": "mdi:car-off"
+        }
+      },
+      "mute_camera_animal": {
+        "default": "mdi:paw",
+        "state": {
+          "on": "mdi:paw-off"
+        }
       }
     }
   },

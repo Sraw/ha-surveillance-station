@@ -59,6 +59,9 @@
     }
   },
   "exceptions": {
+    "mute_locked": {
+      "message": "更大范围的静音已包含这一项，请先关闭那个。"
+    },
     "invalid_auth": {
       "message": "Surveillance Station 拒绝了登录。请重新输入密码以继续。"
     },
@@ -144,6 +147,15 @@
       },
       "mute_camera": {
         "name": "静音 {camera}"
+      },
+      "mute_camera_person": {
+        "name": "静音 {camera} 的人"
+      },
+      "mute_camera_car": {
+        "name": "静音 {camera} 的车"
+      },
+      "mute_camera_animal": {
+        "name": "静音 {camera} 的动物"
       },
       "mute_person": {
         "name": "静音人"

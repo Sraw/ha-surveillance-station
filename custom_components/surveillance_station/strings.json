@@ -59,6 +59,9 @@
     }
   },
   "exceptions": {
+    "mute_locked": {
+      "message": "A wider mute already covers this one. Turn that off first."
+    },
     "invalid_auth": {
       "message": "Surveillance Station rejected the login. Re-enter the password to continue."
     },
@@ -144,6 +147,15 @@
       },
       "mute_camera": {
         "name": "Mute {camera}"
+      },
+      "mute_camera_person": {
+        "name": "Mute {camera} person"
+      },
+      "mute_camera_car": {
+        "name": "Mute {camera} car"
+      },
+      "mute_camera_animal": {
+        "name": "Mute {camera} animal"
       },
       "mute_person": {
         "name": "Mute person"

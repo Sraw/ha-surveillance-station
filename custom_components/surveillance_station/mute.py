@@ -99,15 +99,22 @@ class MuteRules:
 
     def add(self, camera: str | None, kind: str | None, until: float | None) -> None:
         """Mute; replaces the rule for the same camera and kind (a new end, or none)."""
+        self.replace(lambda r: False, [MuteRule(camera, kind, until)])
+
+    def replace(self, matches: Callable[[MuteRule], bool], add: list[MuteRule]) -> None:
+        """Drop the rules ``matches`` says yes to and add ``add`` (each replacing the rule of its camera and kind), as one change."""
         now = time.time()
-        if self._stopped or (until is not None and not now < until <= now + MUTE_MAX_SECONDS):
+        if self._stopped:
             return
-        rule = MuteRule(camera, kind, until)
-        rules = [*(r for r in self._rules if (r.camera, r.kind) != (camera, kind) and r.active(now)), rule]
+        rules = [r for r in self._rules if r.active(now) and not matches(r)]
+        added = [r for r in add if r.until is None or now < r.until <= now + MUTE_MAX_SECONDS]
+        rules = [r for r in rules if (r.camera, r.kind) not in {(a.camera, a.kind) for a in added}] + added
         # Bounded (a runaway script): the oldest timed rules go first, those
-        # lasting until lifted (a switch turned on) only when there are no others.
+        # lasting until lifted (a switch turned on) only when there are no others;
+        # never the ones just added.
         while len(rules) > MUTE_RULES_MAX:
-            rules.remove(next((r for r in rules[:-1] if r.until is not None), rules[0]))
+            older = [r for r in rules if not any(r is a for a in added)] or rules
+            rules.remove(next((r for r in older if r.until is not None), older[0]))
         self._rules = rules
         self._changed()
 

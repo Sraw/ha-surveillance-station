@@ -37,7 +37,7 @@
  */
 
 const CARD_TAG = "ss-timeline-card";
-const CARD_VERSION = "0.20.0";
+const CARD_VERSION = "0.22.2";
 // What this card shares with the time-lapse card, loaded as that card is:
 // with this card's version, so a release never runs against a stale cached copy.
 const {
@@ -3678,6 +3678,9 @@ async function register() {
   // The time-lapse card rides along (same version, no resource of its own).
   import(new URL(`./ss-timelapse-card.js?v=${CARD_VERSION}`, import.meta.url).href).catch((e) =>
     console.error("ss-timelapse-card failed to load", e)
+  );
+  import(new URL(`./ss-mute-card.js?v=${CARD_VERSION}`, import.meta.url).href).catch((e) =>
+    console.error("ss-mute-card failed to load", e)
   );
 }
 register();

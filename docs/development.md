@@ -21,7 +21,8 @@
 | `…/websocket.py` | `surveillance_station/cameras`, `/recordings`, `/bookmarks` (a time range, for the timeline), `/bookmark_page` (newest first, cursor-paged, for the event list), `/live` (a single-use URL for a camera's stream: live, or the recordings from a time), `/vod`, `/vod_runs` (HLS, for browsers without MSE), `/timelapse_days`, `/timelapse` (a time-lapse session: one camera, one day) |
 | `…/frontend/ss-timeline-card.js` | `custom:ss-timeline-card`, registered by the integration as a Lovelace resource. No dependencies |
 | `…/frontend/ss-timelapse-card.js` | `custom:ss-timelapse-card`, loaded by the timeline card (same version, no resource of its own) |
-| `…/frontend/ss-common.js` | What the two cards share: MSE and the MP4 init-segment parsers, SS's stream message parser, the timeline ticks, the veil, control labels, per-viewer preferences. Each card imports it with its own `?v=` version query, so a release never mixes a new card with a stale cached copy |
+| `…/frontend/ss-mute-card.js` | `custom:ss-mute-card`, loaded by the timeline card (same version, no resource of its own): the mute switches as a hierarchy (everything, a kind, a camera, one kind on a camera), found by their `mute_ends` attribute; `tests/browser/mute-card.mjs` drives it |
+| `…/frontend/ss-common.js` | What the cards share: MSE and the MP4 init-segment parsers, SS's stream message parser, the timeline ticks, the veil, control labels, per-viewer preferences. Each card imports it with its own `?v=` version query, so a release never mixes a new card with a stale cached copy |
 
 ## Deploying a checkout
 

@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
   audioCodecOf, codecOf, esc, findBox, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml,
+  sliderKey, ticksOf, veilHtml, muteEnds, muteGroups, muteText,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -373,5 +373,45 @@ describe("the veil", () => {
   test("Retry only where asked for", () => {
     assert.match(veilHtml(true), /data-act="retry"/);
     assert.doesNotMatch(veilHtml(), /button/);
+  });
+});
+
+// ---- The mute card ---------------------------------------------------------------
+
+describe("mute card helpers", () => {
+  const sw = (camera, kind, state = "off", mute_ends = null) => ({ state, attributes: { camera, kind, mute_ends } });
+  const hass = {
+    entities: { "switch.a": { device_id: "d1" }, "switch.b": { device_id: "d1" }, "switch.c": { device_id: "d1" }, "switch.d": { device_id: "d1" },
+      "switch.e": { device_id: "d1" }, "switch.x": { device_id: "d2" } },
+    states: {
+      "switch.a": sw(null, null),
+      "switch.b": sw(null, "person"),
+      "switch.c": sw("Front Door", null, "on", "forever"),
+      "switch.d": sw("Front Door", "car"),
+      "switch.e": sw("Backyard", null),
+      "switch.x": sw(null, null),
+      "switch.other": { state: "on", attributes: {} }, // not a mute switch
+      "light.k": { state: "on", attributes: { camera: null, kind: null, mute_ends: null } },
+    },
+  };
+
+  test("groups the mute switches by device, camera and kind", () => {
+    const groups = muteGroups(hass);
+    assert.equal(groups.length, 2);
+    const g = groups.find((x) => x.device === "d1");
+    assert.equal(g.all, "switch.a");
+    assert.deepEqual(g.kinds, { person: "switch.b" });
+    assert.deepEqual(g.cameras.map((c) => c.name), ["Backyard", "Front Door"]);
+    assert.deepEqual(g.cameras[1], { name: "Front Door", all: "switch.c", kinds: { car: "switch.d" } });
+    assert.deepEqual(muteGroups({}), []);
+  });
+
+  test("says how long a mute lasts, in the UI language", () => {
+    const en = muteText("en-GB");
+    assert.equal(muteEnds(sw(null, null, "on", "forever"), en), "forever");
+    assert.equal(muteEnds(sw(null, null, "on", "2026-09-29 20:00"), en), "until 2026-09-29 20:00");
+    assert.equal(muteEnds(sw(null, null), en), "");
+    assert.equal(muteEnds(sw(null, null, "on", "forever"), muteText("zh-Hans")), "永久");
+    assert.equal(muteText("de").person, "Person");
   });
 });
