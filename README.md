@@ -8,10 +8,47 @@ recording at that moment.
 
 ![The timeline card: live video, the timeline with its bookmarks, the events list](https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/live.png)
 
-<p>
-  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/grid.png" alt="The camera grid, all cameras in step" width="62%">
-  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/phone.png" alt="The compact phone layout" width="24%">
-  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/mute.png" alt="The mute card" width="12%">
+## Why this exists: SS stores, Frigate detects
+
+The idea is a clean split of jobs. **Surveillance Station is the recorder**: it
+keeps every camera's original stream on the NAS, for as long as you set.
+**Frigate is the detector**: it looks at the cameras and says what happened.
+This integration joins them, so a Frigate detection becomes a bookmark on SS's
+own recording, and you watch it all in one place in HA.
+
+Why that is better than letting SS detect, or letting Frigate record:
+
+- **More accurate detection.** Frigate runs real object-detection models (on a
+  Coral, GPU or OpenVINO) with per-camera zones, masks, score thresholds and
+  labels, so "a person at the front door" is not "something moved".
+- **More flexible.** Detection is tuned per camera, and the detector, the model
+  and Frigate itself can be changed or upgraded whenever you like, without
+  touching a single recording. Frigate's smart search ("white car", "similar to
+  this one") comes with it.
+- **SS just stores.** Nothing here asks SS to do what it is worse at, and
+  Frigate does not have to be your archive: it can watch a cheap low-resolution
+  stream while SS keeps the full-quality one.
+- **Recording never depends on detection.** If Frigate, MQTT or HA is down or
+  being rebuilt, SS keeps recording. Detections that were missed are put back
+  as bookmarks when everything is up again.
+- **Full quality, one archive.** Playback is SS's original H.265/H.264, never
+  transcoded. Bookmarks are in SS, so DS cam and the SS client see them too,
+  not only HA.
+- **Detections you can act on.** Each one is an HA event, and the ready-made
+  blueprint turns it into a phone notification with Frigate's snapshot that
+  opens the recording at that moment.
+
+You can also use the card without Frigate, as a live and recorded viewer for SS.
+
+## Screenshots
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/grid.png" alt="The camera grid, all cameras in step" width="100%">
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/phone.png" alt="The compact phone layout" width="48%">
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/mute.png" alt="The mute card" width="48%">
 </p>
 
 <sub>The pictures of the cameras in these screenshots are drawn, not recorded.</sub>
