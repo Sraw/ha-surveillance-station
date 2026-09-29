@@ -6,6 +6,16 @@ integration plays it back in HA on a scrubbable timeline, and can turn
 **Frigate** detections into SS bookmarks and phone notifications that open the
 recording at that moment.
 
+![The timeline card: live video, the timeline with its bookmarks, the events list](https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/live.png)
+
+<p>
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/grid.png" alt="The camera grid, all cameras in step" width="62%">
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/phone.png" alt="The compact phone layout" width="24%">
+  <img src="https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/mute.png" alt="The mute card" width="12%">
+</p>
+
+<sub>The pictures of the cameras in these screenshots are drawn, not recorded.</sub>
+
 ## Features
 
 - **Live and recorded video on one timeline**: live is about 1 s behind real
@@ -14,6 +24,8 @@ recording at that moment.
   transcoded, so it is full quality and costs HA almost no CPU.
 - **Camera grid in step**: watch several cameras side by side, all following
   the same moment; one camera has the sound, jumps and speed apply to all.
+- **Snapshots**: one button saves the picture on screen — a camera's frame,
+  or the whole grid — as a JPEG, live or in playback.
 - **Events**: SS bookmarks are pins on the timeline and a list with
   thumbnails, filterable by kind (Person, Car, Animal, …). Tap one to play it.
 - **Frigate detections** (optional): each Frigate review becomes an SS

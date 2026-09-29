@@ -5,8 +5,8 @@ import { chromium } from "playwright";
 import fs from "fs";
 export const base = process.env.HA_URL; // run.sh requires it
 const token = fs.readFileSync("/token", "utf8").trim().split(/\s+/)[0];
-// path: a dashboard view holding the card (DASHBOARD, default /ss-playback/playback).
-export async function open({ w = 1400, h = 900, mobile = false, path = process.env.DASHBOARD ?? "/ss-playback/playback", prefs = null, tag = "ss-timeline-card" } = {}) {
+// path: a dashboard view holding the card (DASHBOARD, default /ss-playback/playback); init: a script run in the page before it loads.
+export async function open({ w = 1400, h = 900, mobile = false, path = process.env.DASHBOARD ?? "/ss-playback/playback", prefs = null, tag = "ss-timeline-card", init = null } = {}) {
   const browser = await chromium.launch({ executablePath: "/usr/bin/google-chrome", headless: false,
     args: ["--ozone-platform=wayland", "--no-sandbox", "--autoplay-policy=no-user-gesture-required"] });
   const ctx = await browser.newContext({ viewport: { width: w, height: h }, deviceScaleFactor: mobile ? 2 : 1, hasTouch: mobile, isMobile: mobile });
@@ -21,6 +21,7 @@ export async function open({ w = 1400, h = 900, mobile = false, path = process.e
     if (!sessionStorage.getItem("t")) { sessionStorage.setItem("t", "1"); for (const k of Object.keys(localStorage)) if (k.startsWith("ss-timeline-card.")) localStorage.removeItem(k);
       for (const [k, v] of Object.entries(prefs ?? {})) localStorage.setItem("ss-timeline-card." + k, JSON.stringify(v)); }
   }, [token, base, prefs]);
+  if (init) await page.addInitScript(init);
   await page.goto(base + path);
   const card = page.locator(tag);
   await card.waitFor({ state: "attached", timeout: 30000 });

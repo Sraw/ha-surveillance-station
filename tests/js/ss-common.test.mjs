@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, test } from "node:test";
 import {
   audioCodecOf, codecOf, esc, findBox, hour12Of, kindTest, labelAttrs, liveViewEnd, prefsFor, readStreamMsg, setSliderValue, setVeil,
-  sliderKey, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, serverZone, muteGroups, muteSwitchIds, muteText, partlyMuted,
+  sliderKey, snapshotName, snapshotLayout, ticksOf, veilHtml, fillText, kindLabel, muteDurations, muteEnds, serverZone, muteGroups, muteSwitchIds, muteText, partlyMuted,
 } from "../../custom_components/surveillance_station/frontend/ss-common.js";
 
 // ---- MP4 boxes -----------------------------------------------------------------
@@ -547,5 +547,35 @@ describe("mute card helpers", () => {
 
   test("fillText fills every place, and a name's $ stays as it is", () => {
     assert.equal(fillText("Mute {kind} on {camera}", { kind: "Car", camera: "Cam $& 1" }), "Mute Car on Cam $& 1");
+  });
+});
+
+describe("snapshots", () => {
+  test("the file is named for the camera and the time, without what a file name can't hold", () => {
+    const t = new Date(2026, 8, 29, 14, 22, 5).getTime() / 1000;
+    assert.equal(snapshotName("Front Door", t), "Front Door 2026-09-29 14-22-05.jpg");
+    assert.equal(snapshotName('a/b:c*d?"e<f>g|h\\i  j', t), "a b c d e f g h i j 2026-09-29 14-22-05.jpg");
+    assert.equal(snapshotName("///", t), "Snapshot 2026-09-29 14-22-05.jpg");
+    assert.equal(snapshotName(undefined, t), "Snapshot 2026-09-29 14-22-05.jpg");
+  });
+
+  test("one picture is as it is", () => {
+    assert.deepEqual(snapshotLayout([{ w: 1920, h: 1080 }], 1), { width: 1920, height: 1080, tiles: [{ x: 0, y: 0, w: 1920, h: 1080 }] });
+  });
+
+  test("a grid: tiles as big as the biggest picture, the others fitted and centred", () => {
+    const l = snapshotLayout([{ w: 1920, h: 1080 }, { w: 640, h: 480 }, null], 2, 10000);
+    assert.equal(l.width, 3840);
+    assert.equal(l.height, 2160);
+    assert.deepEqual(l.tiles[0], { x: 0, y: 0, w: 1920, h: 1080 });
+    assert.deepEqual(l.tiles[1], { x: 1920 + 240, y: 0, w: 1440, h: 1080 });
+    assert.deepEqual(l.tiles[2], { x: 0, y: 1080, w: 0, h: 0 });
+  });
+
+  test("it is scaled down to the width allowed, never up", () => {
+    const l = snapshotLayout([{ w: 3840, h: 2160 }, { w: 3840, h: 2160 }, { w: 3840, h: 2160 }], 3, 3840);
+    assert.equal(l.width, 3840);
+    assert.deepEqual(l.tiles[0], { x: 0, y: 0, w: 1280, h: 720 });
+    assert.deepEqual(snapshotLayout([], 2), { width: 0, height: 0, tiles: [] });
   });
 });

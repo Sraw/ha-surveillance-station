@@ -115,7 +115,8 @@ the card were verified against a live HA 2026.9 + SS setup:
   its first frame; Live, a past time, Live again before anything landed);
   notification deep links; grid / one-camera modes and the overlay menu;
   the event list beside and under the video, kind chips, smart search;
-  audio the browser refuses; the time-lapse card (first frame, seeks, veil,
+  audio the browser refuses; the snapshot button (a JPEG of one camera, of the grid; the
+  rig's Chrome sometimes loses the page reading a 4K frame back, so `snapshot.mjs` retries a scenario); the time-lapse card (first frame, seeks, veil,
   zoom, pan and skips, also on a phone).
 
 ## Surveillance Station API notes (verified on SS 9.x, DSM 7)
@@ -247,3 +248,11 @@ arrived as 8 + 2 or 3 + 7 s) and the few seconds buffered ran out. Before 0.8
 recordings were HLS everywhere, played by hls.js: a seek waited for a 10 s
 segment to be downloaded from SS and remuxed by HA (1-3 s), grid followers
 were kept in step by seeking into those segments.
+
+## Screenshots
+
+`docs/images/*.png` (the README's) are made by `tests/browser/screenshots.mjs`
+(`tests/browser/run.sh screenshots.mjs [live grid phone mute]`, writing to
+`tests/browser/shots/`, to be copied over and removed). It drives the real card on a real installation, but
+decodes no video and draws the camera pictures and the events' thumbnails itself,
+so that nothing of a home is published. The scenes are in that script.

@@ -41,7 +41,7 @@ const CARD_VERSION = "0.23.0";
 // What this card shares with the time-lapse card, loaded as that card is:
 // with this card's version, so a release never runs against a stale cached copy.
 const {
-  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, hour12Of, sliderKey, setSliderValue, kindTest, veilHtml, VEIL_CSS, setVeil,
+  MSE, BLANK_POSTER, esc, prefsFor, labelAttrs, setLabel, snapshotName, snapshotLayout, hour12Of, sliderKey, setSliderValue, kindTest, veilHtml, VEIL_CSS, setVeil,
   ticksOf, liveViewEnd, readStreamMsg, findBox, codecOf, audioCodecOf,
 } = await import(new URL(`./ss-common.js?v=${CARD_VERSION}`, import.meta.url).href);
 // After giving up on a stream, it is tried again this often while visible.
@@ -2248,6 +2248,7 @@ class SSTimelineCard extends HTMLElement {
       `<button class="icon ${cls}" data-skip="${d}" ${labelAttrs(`${d < 0 ? "Back" : "Forward"} ${Math.abs(d)} s`)}>${icon(i)}</button>`;
     // Before the cameras are known: the grid (see _buildPlayers).
     const solo = labelAttrs("One camera (the chips switch it)");
+    const snap = labelAttrs("Save a snapshot (JPEG)");
     const events = prefs.get("events", true);
     root.innerHTML = `
       <style>${STYLE}</style>
@@ -2268,6 +2269,7 @@ class SSTimelineCard extends HTMLElement {
                   ${skip(-30, "mdi:rewind-30")}${skip(-10, "mdi:rewind-10")}${skip(10, "mdi:fast-forward-10")}${skip(30, "mdi:fast-forward-30")}
                   <span class="fsclock"></span>
                   <button class="icon" data-act="solo" ${solo}>${icon("mdi:view-grid-outline")}</button>
+                  <button class="icon" data-act="snap" ${snap}>${icon("mdi:camera-outline")}</button>
                   <button class="icon" data-act="fs" ${labelAttrs("Exit fullscreen")}>${icon("mdi:fullscreen-exit")}</button>
                 </div>
               </div>
@@ -2296,6 +2298,7 @@ class SSTimelineCard extends HTMLElement {
                 </span>
               </span>
               <button class="icon" data-act="mute" ${labelAttrs("Sound")} aria-pressed="false">${icon("mdi:volume-off")}</button>
+              <button class="icon" data-act="snap" ${snap}>${icon("mdi:camera-outline")}</button>
               <button class="icon" data-act="fs" ${labelAttrs("Fullscreen")}>${icon("mdi:fullscreen")}</button>
             </div>
             <div class="tlbar">
@@ -2846,6 +2849,7 @@ class SSTimelineCard extends HTMLElement {
       ["mute", { run: () => this._toggleMute() }],
       ["solo", { run: () => this._toggleGrid() }],
       ["fs", { run: () => this._toggleFullscreen() }],
+      ["snap", { run: () => this._snapshot() }],
       ["pan-back", { run: () => this._pan(-0.5) }],
       ["pan-fwd", { run: () => this._pan(0.5) }],
     ]);
@@ -2965,6 +2969,60 @@ class SSTimelineCard extends HTMLElement {
     if (!Number.isFinite(t)) return;
     this._jumpBox.hidden = true;
     this._goTo(t);
+  }
+
+  /**
+   * Save the picture on screen as a JPEG: the one camera's frame, or the grid's
+   * cameras in its layout (their names on, when the video shows them). The
+   * file is named for the camera (the leader's, in a grid) and its time.
+   */
+  async _snapshot() {
+    const players = this._shown.map((id) => this._players.get(id)).filter(Boolean);
+    const size = (p) => (p.video.readyState >= 2 && p.video.videoWidth ? { w: p.video.videoWidth, h: p.video.videoHeight } : null);
+    const sizes = players.map(size);
+    const say = (text) => {
+      const warn = this.shadowRoot.querySelector(".warn");
+      warn.textContent = text;
+      setTimeout(() => warn.textContent === text && (warn.textContent = ""), 4000);
+    };
+    if (!sizes.some(Boolean)) return say("There is no picture to save yet.");
+    const grid = players.length > 1;
+    const { width, height, tiles } = snapshotLayout(sizes, grid ? Number(this._stage.style.getPropertyValue("--cols")) || 2 : 1, grid ? 3840 : Infinity);
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, width, height);
+    try {
+      players.forEach((p, i) => tiles[i].w && ctx.drawImage(p.video, tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h));
+      if (grid && !this._stage.classList.contains("nonames")) {
+        const font = Math.max(14, Math.round(height / (players.length > 4 ? 30 : 22)));
+        ctx.font = `${font}px sans-serif`;
+        ctx.textBaseline = "top";
+        players.forEach((p, i) => {
+          if (!tiles[i].w) return;
+          const name = this._cameraName(p.cameraId);
+          const [x, y] = [tiles[i].x + font / 2, tiles[i].y + font / 2];
+          ctx.fillStyle = "rgba(0,0,0,0.55)";
+          ctx.fillRect(x - font / 4, y - font / 8, ctx.measureText(name).width + font / 2, font * 1.3);
+          ctx.fillStyle = "#fff";
+          ctx.fillText(name, x, y);
+        });
+      }
+    } catch (e) {
+      return say("This picture can't be saved from here.");
+    }
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (!blob) return say("This picture can't be saved from here.");
+    const leader = this._leader;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = snapshotName(grid ? "Cameras" : this._cameraName(leader.cameraId), leader.wall());
+    document.body.append(a); // Firefox ignores a click on one that is not in the page
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   }
 
   _toggleMute() {

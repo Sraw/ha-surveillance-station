@@ -417,3 +417,42 @@ export function muteGroups(hass, ids = muteSwitchIds(hass)) {
   for (const g of out) g.cameras.sort((a, b) => a.name.localeCompare(b.name));
   return out;
 }
+
+/**
+ * A snapshot's file name: "Front Door 2026-09-29 14-22-05.jpg", the time as
+ * the viewer's clock has it. What no file name may hold (and any run of
+ * blanks) is one space.
+ */
+export function snapshotName(label, t) {
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  const day = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  const clean = String(label ?? "").replace(/[\u0000-\u001f\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim();
+  return `${clean || "Snapshot"} ${day}.jpg`;
+}
+
+/**
+ * How a snapshot of several cameras is laid out: `sizes` are the pictures
+ * ({w, h}, or null for a camera with none yet), `cols` the grid's columns.
+ * A tile is as big as the biggest picture (so none is scaled up), the whole
+ * at most `maxWidth` wide (a one-camera snapshot is the picture as it is); each picture is fitted in its tile, centred.
+ * Returns {width, height, tiles: [{x, y, w, h}]} (a tile with no picture has
+ * w = h = 0).
+ */
+export function snapshotLayout(sizes, cols, maxWidth = 3840) {
+  if (!sizes.length) return { width: 0, height: 0, tiles: [] };
+  const have = sizes.filter(Boolean);
+  const [tileW, tileH] = have.length ? [Math.max(...have.map((s) => s.w)), Math.max(...have.map((s) => s.h))] : [1920, 1080];
+  const across = Math.max(1, Math.min(cols, sizes.length));
+  const scale = Math.min(1, maxWidth / (across * tileW));
+  const tw = Math.round(tileW * scale);
+  const th = Math.round(tileH * scale);
+  const tiles = sizes.map((size, i) => {
+    const [tx, ty] = [(i % across) * tw, Math.floor(i / across) * th];
+    if (!size) return { x: tx, y: ty, w: 0, h: 0 };
+    const fit = Math.min(tw / size.w, th / size.h);
+    const [w, h] = [Math.round(size.w * fit), Math.round(size.h * fit)];
+    return { x: tx + Math.round((tw - w) / 2), y: ty + Math.round((th - h) / 2), w, h };
+  });
+  return { width: across * tw, height: Math.ceil(sizes.length / across) * th, tiles };
+}

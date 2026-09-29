@@ -66,6 +66,15 @@ viewer's choice is remembered in the browser and wins over the options.
   Android / the companion app, ignored where the browser doesn't allow it).
   On an iPhone, which has no element fullscreen, the leader's own video player
   goes fullscreen instead.
+- **Snapshot**: the camera button (in the control bar, and in the fullscreen
+  one) downloads the picture on screen as a JPEG named for the camera and its
+  time (`Front Door 2026-09-29 14-22-05.jpg`; live, the time it is). One camera
+  is saved at the camera's own resolution, without the overlays; the grid is
+  saved as one picture in the grid's layout, at most 3840 px wide, with the
+  camera names on when the video shows them (`Cameras 2026-09-29 14-22-05.jpg`).
+  A camera without a picture yet (loading, or a gap in the recordings) is a
+  black tile. Zoom is not part of it. Some app WebViews ignore a download; the
+  browser saves it.
 - **Zoom**: pinch or double-tap (single view) zooms up to 8x, drag pans,
   double-tap resets; the mouse wheel zooms in fullscreen. At 1x vertical
   swipes still scroll the page (`touch-action: pan-y`).
