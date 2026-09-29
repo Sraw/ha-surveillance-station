@@ -415,6 +415,16 @@ describe("mute card helpers", () => {
     assert.deepEqual(g.cameras.map((c) => c.name), ["Backyard", "Front Door"]);
     assert.deepEqual(g.cameras[1], { name: "Front Door", all: "switch.c", kinds: { car: "switch.d" } });
     assert.deepEqual(muteGroups({}), []);
+    // A camera's switches sit on its own device, under the entry's: one group, the entry's.
+    const cams = {
+      devices: { hub: { via_device_id: null }, cam1: { via_device_id: "hub" }, cam2: { via_device_id: "hub" } },
+      entities: { "switch.h": ours("hub"), "switch.c1": ours("cam1"), "switch.c2": ours("cam2") },
+      states: { "switch.h": sw(null, null), "switch.c1": sw("A", null), "switch.c2": sw("B", null) },
+    };
+    const [hub, ...rest] = muteGroups(cams);
+    assert.equal(rest.length, 0);
+    assert.equal(hub.device, "hub");
+    assert.deepEqual(hub.cameras.map((c) => c.name), ["A", "B"]);
     // Only the ids given: the card passes the ones it took from hass.entities.
     assert.deepEqual(muteGroups(hass, ["switch.e"]), [{ device: "d1", all: null, kinds: {}, cameras: [{ name: "Backyard", all: "switch.e", kinds: {} }] }]);
   });

@@ -15,29 +15,26 @@ mute kinds without a switch.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
-from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from . import SurveillanceStationConfigEntry, frigate as frigate_mod
-from .const import DOMAIN, FRIGATE_CAMERAS_TTL, MUTE_KINDS
-from .frigate import DATA_FRIGATE, FrigateBridge, camera_key
+from . import SurveillanceStationConfigEntry
+from .const import DOMAIN, MUTE_KINDS
+from .device import hub_device_info
+from .frigate import DATA_FRIGATE
 from .mute import MuteRule, MuteRules
 
 PARALLEL_UPDATES = 0
-# Every per-camera switch's unique id starts with this (after the entry id).
+# Every per-camera switch's unique id starts with this (after the entry id), then id_<camera id>
+# (kind_id_<camera id>_<kind> for a kind's): device.py moves 0.22's, which had the camera's key, to these.
 CAMERA_ID_PREFIX = "mute_camera_"
-# A camera's switches go once SS has not listed it for this many seconds, over two listings at least.
-CAMERA_GONE_AFTER = 1800
 
 
 async def async_setup_entry(
@@ -46,64 +43,30 @@ async def async_setup_entry(
     bridge = hass.data[DATA_FRIGATE][entry.entry_id]
     mute = bridge.mute
     async_add_entities([MuteSwitch(entry, mute, scope) for scope in (AllScope(), *(KindScope(kind) for kind in MUTE_KINDS))])
-    registry = er.async_get(hass)
-    per_camera = f"{entry.entry_id}_{CAMERA_ID_PREFIX}"
-    known: set[str] = set()
-    # Per-camera switches (unique ids) the last listing had no camera for: since when (monotonic).
-    absent: dict[str, float] = {}
+    # The cameras' switches (by id); dropped when the camera's device goes, so that it gets them again if it returns.
+    switches: dict[int, list[MuteSwitch]] = {}
 
     @callback
-    def add_cameras(names: list[str]) -> None:
-        nonlocal absent
-        # Unloading: the switches go before the bridge stops (see async_unload_entry).
-        if bridge.stopped or entry.state is ConfigEntryState.UNLOAD_IN_PROGRESS:
-            return
-        listed = {key: name for name in names if (key := camera_key(name))}  # a name of only symbols has no key to mute by
-        # A listing without cameras is likelier SS answering oddly (the library
-        # skips what it cannot read) than every camera gone: nothing is removed.
-        if not listed:
-            return
-        # A camera SS no longer lists (removed, or renamed: a new key) loses its
-        # switches once two listings in a row, CAMERA_GONE_AFTER apart, lack it, so that a short
-        # listing costs no entity_id, area or disabled flag; its rules stay (unmute takes its old name).
-        wanted = {scope.unique_id(entry.entry_id) for key in listed for scope in camera_scopes(key)}
-        stale = {
-            item.unique_id: item.entity_id
-            for item in er.async_entries_for_config_entry(registry, entry.entry_id)
-            if item.domain == "switch" and item.unique_id.startswith(per_camera) and item.unique_id not in wanted
-        }
-        now = frigate_mod._monotonic()
-        gone = {uid for uid in stale.keys() & absent.keys() if now - absent[uid] >= CAMERA_GONE_AFTER}
-        for unique_id in gone:
-            registry.async_remove(stale[unique_id])
-        absent = {uid: absent.get(uid, now) for uid in stale.keys() - gone}
-        # Kept while its switches are: adding them again would clash with them.
-        known.difference_update({key for key in known - listed.keys() if CameraScope(key).unique_id(entry.entry_id) not in absent})
-        new = []
-        for key, name in listed.items():
-            if key not in known:
-                known.add(key)
-                new.extend(MuteSwitch(entry, mute, scope, camera_name=name) for scope in camera_scopes(key))
+    def add_cameras(cameras: dict[int, str], gone: set[int]) -> None:
+        for camera_id in gone:
+            switches.pop(camera_id, None)
+        new: list[MuteSwitch] = []
+        for camera_id, name in cameras.items():
+            if camera_id in switches:  # listed again, perhaps renamed
+                for switch in switches[camera_id]:
+                    switch.rename(name)
+                continue
+            info = bridge.devices.camera_device_info(camera_id, name)
+            switches[camera_id] = [MuteSwitch(entry, mute, scope, camera_name=name, device_info=info) for scope in camera_scopes(camera_id)]
+            new += switches[camera_id]
         if new:
             async_add_entities(new)
 
-    entry.async_on_unload(bridge.async_on_cameras(add_cameras))
-    entry.async_create_background_task(hass, _list_cameras(bridge), "surveillance_station mute switches")
-
-
-async def _list_cameras(bridge: FrigateBridge) -> None:
-    """Until SS has answered with its cameras (reviews list them too, as they come).
-
-    Asked again after a minute, then less and less often while SS stays down.
-    """
-    wait = 60
-    while not await bridge.camera_names():
-        await asyncio.sleep(wait)
-        wait = min(2 * wait, FRIGATE_CAMERAS_TTL)
+    entry.async_on_unload(bridge.devices.async_on_change(add_cameras))
 
 
 class Scope:
-    """What a switch mutes: every camera or one (camera, a camera key), every kind or one (kind)."""
+    """What a switch mutes: every camera or one (camera, its SS id), every kind or one (kind)."""
 
     camera: str | None = None
     kind: str | None = None
@@ -147,10 +110,10 @@ class CameraScope(Scope):
 
     translation_key = "mute_camera"
 
-    def __init__(self, camera: str) -> None:
+    def __init__(self, camera: int) -> None:
         self.camera = camera
         self.wider = AllScope()
-        self.unique_suffix = f"{CAMERA_ID_PREFIX}{camera}"
+        self.unique_suffix = f"{CAMERA_ID_PREFIX}id_{camera}"
 
     def turn_on(self, mute: MuteRules) -> None:
         """One rule for the camera in place of its kinds'."""
@@ -171,12 +134,11 @@ class CameraScope(Scope):
 class CameraKindScope(Scope):
     """One kind on one camera."""
 
-    def __init__(self, camera: str, kind: str) -> None:
+    def __init__(self, camera: int, kind: str) -> None:
         self.camera, self.kind = camera, kind
         self.wider = KindScope(kind)
         self.translation_key = f"mute_camera_{kind.lower()}"
-        # Camera keys have no underscore, so this cannot clash with another camera's.
-        self.unique_suffix = f"{CAMERA_ID_PREFIX}kind_{camera}_{kind.lower()}"
+        self.unique_suffix = f"{CAMERA_ID_PREFIX}kind_id_{camera}_{kind.lower()}"
 
     def turn_off(self, mute: MuteRules) -> None:
         """The camera's all-kinds rule leaves the kind out, keeping its end, so every other kind stays muted."""
@@ -185,7 +147,7 @@ class CameraKindScope(Scope):
         mute.replace(lambda r: r.camera == self.camera and r.kind == self.kind, narrowed)
 
 
-def camera_scopes(camera: str) -> list[Scope]:
+def camera_scopes(camera: int) -> list[Scope]:
     """A camera's switches: all kinds, and each kind."""
     return [CameraScope(camera), *(CameraKindScope(camera, kind) for kind in MUTE_KINDS)]
 
@@ -195,18 +157,27 @@ class MuteSwitch(SwitchEntity):
     _attr_should_poll = False
 
     def __init__(
-        self, entry: SurveillanceStationConfigEntry, mute: MuteRules, scope: Scope, camera_name: str | None = None
+        self,
+        entry: SurveillanceStationConfigEntry,
+        mute: MuteRules,
+        scope: Scope,
+        camera_name: str | None = None,
+        device_info: DeviceInfo | None = None,
     ) -> None:
         self._mute = mute
         self._scope = scope
         self._camera_name = camera_name
         self._attr_translation_key = scope.translation_key
-        if camera_name is not None:
-            self._attr_translation_placeholders = {"camera": camera_name}
         self._attr_unique_id = scope.unique_id(entry.entry_id)
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)}, name="Surveillance Station", manufacturer="Synology"
-        )
+        self._attr_device_info = device_info or hub_device_info(entry.entry_id)
+
+    @callback
+    def rename(self, name: str) -> None:
+        """The camera is called ``name`` now (the mute card shows the attribute)."""
+        if name != self._camera_name:
+            self._camera_name = name
+            if self.hass is not None:
+                self._rules_changed()
 
     def _locked(self) -> bool:
         """With everything muted, or the kind muted for every camera, the narrower switches are shown on but cannot be turned."""

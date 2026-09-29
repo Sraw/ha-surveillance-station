@@ -398,7 +398,9 @@ export function muteGroups(hass, ids = muteSwitchIds(hass)) {
   for (const id of ids) {
     const attrs = hass.states?.[id]?.attributes;
     if (!attrs || !("camera" in attrs) || !("locked" in attrs)) continue;
-    const device = hass.entities?.[id]?.device_id ?? "";
+    // A camera's switches sit on the camera's device, under the entry's: a group is an entry's.
+    const own = hass.entities?.[id]?.device_id ?? "";
+    const device = hass.devices?.[own]?.via_device_id ?? own;
     if (!groups.has(device)) groups.set(device, { device, all: null, kinds: {}, cameras: [] });
     const group = groups.get(device);
     if (attrs.camera == null) {

@@ -1,6 +1,7 @@
 # Self-assessment against the HA integration quality scale. This integration
-# is mostly HLS views, WebSocket commands and a Lovelace card; its only
-# entities are the mute switches (one device), and its only actions mute and
+# is mostly HLS views, WebSocket commands and a Lovelace card; its
+# entities are the mute switches, a detection event and a "muted until" sensor per
+# camera (one device each, under the entry's), and its only actions mute and
 # unmute notifications.
 rules:
   # Bronze
@@ -70,17 +71,16 @@ rules:
   docs-troubleshooting: done
   docs-use-cases: done
   dynamic-devices:
-    status: exempt
+    status: done
     comment: >-
-      One device per entry, made with it; a camera SS lists later gets its
-      switches on that device then, and one missing from two listings half an
-      hour apart loses them.
+      A camera SS lists later gets its device and entities then, and one
+      missing from two listings half an hour apart loses them.
   entity-category:
     status: exempt
     comment: The switches are controls, with no category.
   entity-device-class:
-    status: exempt
-    comment: Plain switches.
+    status: done
+    comment: Switches, an event (motion) and a timestamp sensor, each with the class it has.
   entity-disabled-by-default:
     status: exempt
     comment: >-
@@ -94,8 +94,8 @@ rules:
     status: exempt
     comment: Nothing the user can repair beyond reauth.
   stale-devices:
-    status: exempt
-    comment: One device per entry, removed with it.
+    status: done
+    comment: A camera SS stops listing loses its device (see dynamic-devices), or the user removes it.
 
   # Platinum
   async-dependency: done

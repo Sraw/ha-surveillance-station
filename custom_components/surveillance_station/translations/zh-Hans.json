@@ -73,6 +73,9 @@
     },
     "unknown_camera": {
       "message": "没有名为 {camera} 的摄像头（Surveillance Station 或 Frigate 的名字均可）。"
+    },
+    "not_a_camera_device": {
+      "message": "该设备不是 Surveillance Station 的摄像头。"
     }
   },
   "options": {
@@ -146,16 +149,16 @@
         "name": "静音所有通知"
       },
       "mute_camera": {
-        "name": "静音 {camera}"
+        "name": "静音"
       },
       "mute_camera_person": {
-        "name": "静音 {camera} 的人"
+        "name": "静音人"
       },
       "mute_camera_car": {
-        "name": "静音 {camera} 的车"
+        "name": "静音车"
       },
       "mute_camera_animal": {
-        "name": "静音 {camera} 的动物"
+        "name": "静音动物"
       },
       "mute_person": {
         "name": "静音人"
@@ -165,6 +168,16 @@
       },
       "mute_animal": {
         "name": "静音动物"
+      }
+    },
+    "event": {
+      "detection": {
+        "name": "检测"
+      }
+    },
+    "sensor": {
+      "mute_ends": {
+        "name": "静音至"
       }
     }
   },
@@ -184,6 +197,10 @@
         "objects": {
           "name": "对象",
           "description": "要静音的种类（人、车、动物，或 Frigate 标签）；不填为所有种类。"
+        },
+        "device_id": {
+          "name": "摄像头设备",
+          "description": "Surveillance Station 摄像头（设备）；同时填了摄像头名则两者都算。"
         }
       }
     },
@@ -193,11 +210,15 @@
       "fields": {
         "camera": {
           "name": "摄像头",
-          "description": "Surveillance Station 或 Frigate 的摄像头名（Surveillance Station 已不再列出的摄像头用它原来的名字）；不填为所有摄像头。"
+          "description": "Surveillance Station 或 Frigate 的摄像头名；不填为所有摄像头。"
         },
         "objects": {
           "name": "对象",
           "description": "要取消静音的种类（人、车、动物，或 Frigate 标签）；不填为所有种类。"
+        },
+        "device_id": {
+          "name": "摄像头设备",
+          "description": "Surveillance Station 摄像头（设备）；同时填了摄像头名则两者都算。"
         }
       }
     }

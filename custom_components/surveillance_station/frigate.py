@@ -50,7 +50,7 @@ import logging
 import math
 import re
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
 from synology_ss_playback import Bookmark, Camera, SSAuthError, SSConnectionError, SSError, SurveillanceStationClient
@@ -102,6 +102,9 @@ from .frigate_queue import Queued, ReviewQueue
 from .manager import VodManager
 from .mute import MuteRules
 from .shared import SharedJobs
+
+if TYPE_CHECKING:
+    from .device import CameraDevices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -258,11 +261,13 @@ class FrigateBridge:
         self._store: Store[dict[str, Any]] = Store(hass, 1, store_key(entry_id))
         self._cameras: dict[str, tuple[int, str]] = {}  # camera_key -> (SS id, SS name)
         self._cameras_by_name: dict[str, tuple[int, str]] = {}  # SS name -> (SS id, SS name)
+        self._names_by_id: dict[int, str] = {}
         self._cameras_at = -math.inf  # when SS last listed them
         self._cameras_failed_at = -math.inf  # when a listing last failed (and how, until one works)
         self._cameras_error: SSError | None = None
         self._camera_listing: SharedJobs[None, None] = SharedJobs(hass, "cameras")
-        self._camera_listeners: list[Callable[[list[str]], None]] = []  # told the SS camera names
+        self.devices: CameraDevices | None = None  # the cameras' devices (set up with the entry)
+        self._camera_listeners: list[Callable[[dict[int, str]], None]] = []  # told the SS cameras (id -> name)
         self._unknown: set[str] = set()  # Frigate cameras warned about
         self._tracked: OrderedDict[str, _Tracked] = OrderedDict()
         # Waiting for SS: the latest message of each review. Those that failed
@@ -908,37 +913,52 @@ class FrigateBridge:
     def _set_cameras(self, cameras: list[Camera]) -> None:
         self._cameras = {camera_key(c.name): (c.id, c.name) for c in cameras}
         self._cameras_by_name = {c.name: (c.id, c.name) for c in cameras}
+        self._names_by_id = {c.id: c.name for c in cameras}
+        # The rules of 0.22, which name a camera by key, learn which camera that was.
+        self.mute.async_name_cameras({key: camera[0] for key, camera in self._cameras.items()})
         for listener in list(self._camera_listeners):
-            listener(self._camera_names())
+            listener(self._camera_ids())
 
     def _camera_names(self) -> list[str]:
         """The SS cameras' names, as last listed."""
         return list(self._cameras_by_name)
+
+    def _camera_ids(self) -> dict[int, str]:
+        """The SS cameras' names by id, as last listed."""
+        return dict(self._names_by_id)
 
     async def camera_names(self) -> list[str]:
         """The SS cameras' names: listed again after a while; if SS fails, as they were."""
         await self._refresh_cameras(_monotonic() - self._cameras_at > FRIGATE_CAMERAS_TTL, stale_ok=True)
         return self._camera_names()
 
-    async def resolve_camera(self, name: str) -> str | None:
-        """The camera key (as detections name their camera) of the SS or Frigate camera called ``name``."""
+    async def resolve_camera(self, name: str) -> int | None:
+        """The SS id of the SS or Frigate camera called ``name``."""
         found = await self._find_camera(name, stale_ok=True)  # SS not answering: the list as it was
-        return (camera_key(found[1]) or None) if found else None
+        return found[0] if found else None
 
-    def camera_keys(self) -> set[str]:
-        """The SS cameras, as detections name them (as last listed)."""
-        return set(self._cameras)
+    def camera_of_key(self, key: str) -> int | None:
+        """The SS id of the camera with this ``camera_key`` (as a notification's buttons name it), as last listed."""
+        return found[0] if (found := self._cameras.get(key)) else None
+
+    def camera_ids(self) -> set[int]:
+        """The SS cameras' ids, as last listed."""
+        return set(self._names_by_id)
+
+    def forget_camera(self, camera_id: int) -> None:
+        """A camera that is gone from SS: its mute rules go too."""
+        self.mute.remove(lambda r: r.camera == camera_id)
 
     @property
     def stopped(self) -> bool:
         return self._stopped
 
     @callback
-    def async_on_cameras(self, listener: Callable[[list[str]], None]) -> Callable[[], None]:
-        """Told the SS cameras' names each time they are listed (and now, if they have been)."""
+    def async_on_cameras(self, listener: Callable[[dict[int, str]], None]) -> Callable[[], None]:
+        """Told the SS cameras (names by id) each time they are listed (and now, if they have been)."""
         self._camera_listeners.append(listener)
-        if self._cameras_by_name:
-            listener(self._camera_names())
+        if self._names_by_id:
+            listener(self._camera_ids())
 
         @callback
         def remove() -> None:
@@ -984,7 +1004,7 @@ class FrigateBridge:
             # Its bookmark and camera as announced; what was seen as its latest message says.
             latest = replace(detection, after=seen.after, objects=seen.objects, zones=seen.zones, frame=seen.frame)
             # Muted: still an event (an automation may want it), but marked as one.
-            muted = self.mute.is_muted(camera_key(latest.camera_name), kinds(latest.objects))
+            muted = self.mute.is_muted(latest.camera_id, kinds(latest.objects))
             self.hass.bus.async_fire(DETECTION_EVENT, self._payload(latest, muted))
             # A review counts as announced (or not) once; again: its later notifications.
             self._counts["announced_again" if again else "announced"] += 1

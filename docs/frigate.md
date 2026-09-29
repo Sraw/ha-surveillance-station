@@ -212,15 +212,18 @@ person who joins a dog's review. The rules are kept across restarts.
 
 - **Actions** `surveillance_station.mute` (`duration`, `camera`, `objects`,
   all optional; no duration: until unmuted) and `surveillance_station.unmute`
-  (`camera`, `objects`; with neither, everything). `camera` takes the SS name
-  or Frigate's (`drive_way`); several `objects` are a rule each; a camera with
+  (`camera`, `device_id`, `objects`; with no camera, every camera; with neither
+  `camera` nor `device_id` and no objects, everything). `camera` takes the SS
+  name or Frigate's (`drive_way`); `device_id` is a camera's device (the
+  action's device picker offers them); given both, the call is about both.
+  Several `objects` are a rule each; a camera with
   objects mutes just those there. `mute` sets the end of the rules it names,
   also when that is sooner than before. `unmute` lifts every rule that has the given
-  camera and/or objects, whatever else it covers; for a camera SS no longer
-  lists (removed, renamed), its old name still works. E.g. the driveway's people
+  camera and/or objects, whatever else it covers. E.g. the driveway's people
   for 2 hours: `camera: drive_way`, `objects: [person]`, `duration: "02:00:00"`.
-- **Switches** (device *Surveillance Station*): *Mute all notifications*, one
-  per kind, one per camera (*all kinds*), and one per kind on each camera. On
+- **Switches**: *Mute all notifications* and one per kind, on the device
+  *Surveillance Station*; and on each camera's own device (below), *Mute*
+  (all kinds) and one per kind. On
   mutes until turned off; a timed mute from the action shows on, with
   `muted_until` (UTC, ISO 8601; `null` when off, or on until turned off). A
   switch shows on exactly when every detection it is about is muted, so the
@@ -241,11 +244,25 @@ person who joins a dog's review. The rules are kept across restarts.
   that have no switch (its three kinds turned off one by one after it was
   on leave Bicycle, Package, ... muted; so does the action with such
   objects), which the mute card shows as "other kinds · muted"; turn *all kinds* on then off, or `unmute` with that `camera`, to
-  lift them. A camera removed or renamed in SS loses its switches once two
-  of SS's camera listings in a row lack it (a listing without any camera
-  removes nothing); a renamed one gets new ones (rules name cameras by their
-  name, ignoring case, spaces and punctuation). Its rules stay until they
-  end or are unmuted.
+  lift them. Rules name a camera by its SS id, so a rename in SS changes
+  nothing here but the device's name. A camera SS stops listing loses its
+  device, its entities and its rules once two of SS's camera listings half
+  an hour apart lack it (a listing without any camera removes nothing); it
+  can also be deleted by hand from its device page then.
+- **Upgrading from 0.22 and back**: the rules (and the switches' unique ids)
+  named cameras by a key made of their name; they now name them by SS id, and
+  are converted when SS first lists its cameras (a rule whose camera SS has
+  not listed for half an hour is dropped). Entity ids are kept. The rules are
+  stored in a new format that 0.22 cannot read: going back to 0.22 ignores
+  them, and a rule changed there is lost on the way forward again.
+- **Camera devices**: each SS camera is a device of its own, under the
+  *Surveillance Station* one, with its mute switches, a **Detection** event
+  entity (`detection`, motion class; attributes `review_id`, `bookmark_id`,
+  `objects`, `labels`, `zones`, `severity`, `muted`, `frigate_camera`, `start`;
+  it fires also for muted detections) and a **Muted until** timestamp sensor
+  (the end of the camera's *all kinds* mute; unknown when it is not muted, or
+  until lifted, with `forever: true`). With a dashboard set as the entry's
+  link, the device page's *Visit* opens it on that camera.
 - **Buttons on the notification** (the blueprint's *Mute buttons*, Android):
   *Mute all 1 h* and *Mute <camera> 1 h*, the hours being its *Mute hours*.
   They fire the companion app's `mobile_app_notification_action` with the id
@@ -254,7 +271,8 @@ person who joins a dog's review. The rules are kept across restarts.
   pressed on an old notification while everything is muted until turned
   off, or a camera for longer, it leaves that mute as it is (a kind turned
   off on that camera is muted for the button's hours). A camera whose name
-  is only symbols has no key, and no button of its own.
+  is only symbols has no key, and no button of its own. The buttons of a
+  notification sent before a camera was renamed no longer find it.
 
 **After updating, re-import the blueprint** (Blueprints → the three dots →
 Re-import blueprint): the mute is honoured by the automation, and the copy

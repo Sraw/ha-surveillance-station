@@ -355,7 +355,7 @@ async def test_options_without_the_camera_step(
     flow = await hass.config_entries.options.async_init(setup_integration.entry_id)
     with (
         patch("custom_components.surveillance_station.FrigateBridge.start", AsyncMock(return_value=None)),
-        patch("custom_components.surveillance_station.switch._list_cameras", AsyncMock(return_value=None)),
+        patch("custom_components.surveillance_station.list_cameras", AsyncMock(return_value=None)),
     ):
         result = await hass.config_entries.options.async_configure(
             flow["flow_id"], {CONF_FRIGATE: frigate, CONF_FRIGATE_TOPIC: "frigate", CONF_FRIGATE_OBJECTS: ["person"]}
@@ -1481,9 +1481,9 @@ async def test_a_review_waits_for_the_camera_list_being_read(hass: HomeAssistant
 
 async def test_camera_listeners_are_told_the_cameras_already_listed(hass: HomeAssistant, bridge: FrigateBridge) -> None:
     await bridge.camera_names()
-    told: list[list[str]] = []
+    told: list[dict[int, str]] = []
     remove = bridge.async_on_cameras(told.append)
-    assert told == [["Drive Way", "Front Door"]]
+    assert told == [{6: "Drive Way", 10: "Front Door"}]
     remove()
     remove()
     with patch("custom_components.surveillance_station.frigate._monotonic", return_value=time.monotonic() + 601):

@@ -73,6 +73,9 @@
     },
     "unknown_camera": {
       "message": "No camera called {camera} (a Surveillance Station or Frigate camera name)."
+    },
+    "not_a_camera_device": {
+      "message": "That device is not a Surveillance Station camera."
     }
   },
   "options": {
@@ -146,16 +149,16 @@
         "name": "Mute all notifications"
       },
       "mute_camera": {
-        "name": "Mute {camera}"
+        "name": "Mute"
       },
       "mute_camera_person": {
-        "name": "Mute {camera} person"
+        "name": "Mute person"
       },
       "mute_camera_car": {
-        "name": "Mute {camera} car"
+        "name": "Mute car"
       },
       "mute_camera_animal": {
-        "name": "Mute {camera} animal"
+        "name": "Mute animal"
       },
       "mute_person": {
         "name": "Mute person"
@@ -165,6 +168,16 @@
       },
       "mute_animal": {
         "name": "Mute animal"
+      }
+    },
+    "event": {
+      "detection": {
+        "name": "Detection"
+      }
+    },
+    "sensor": {
+      "mute_ends": {
+        "name": "Muted until"
       }
     }
   },
@@ -184,6 +197,10 @@
         "objects": {
           "name": "Objects",
           "description": "Kinds to mute (person, car, animal, or a Frigate label); without them, every kind."
+        },
+        "device_id": {
+          "name": "Camera device",
+          "description": "A Surveillance Station camera (its device); with a camera name too, both."
         }
       }
     },
@@ -193,11 +210,15 @@
       "fields": {
         "camera": {
           "name": "Camera",
-          "description": "A Surveillance Station or Frigate camera name (for a camera Surveillance Station no longer lists, its old name); without it, every camera."
+          "description": "A Surveillance Station or Frigate camera name; without it, every camera."
         },
         "objects": {
           "name": "Objects",
           "description": "Kinds to unmute (person, car, animal, or a Frigate label); without them, every kind."
+        },
+        "device_id": {
+          "name": "Camera device",
+          "description": "A Surveillance Station camera (its device); with a camera name too, both."
         }
       }
     }

@@ -10,6 +10,13 @@ mute:
       example: Drive Way
       selector:
         text:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: surveillance_station
+          model: Surveillance Station camera
+          multiple: true
     objects:
       required: false
       example: person
@@ -25,6 +32,13 @@ unmute:
       example: Drive Way
       selector:
         text:
+    device_id:
+      required: false
+      selector:
+        device:
+          integration: surveillance_station
+          model: Surveillance Station camera
+          multiple: true
     objects:
       required: false
       example: person

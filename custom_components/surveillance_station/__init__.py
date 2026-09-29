@@ -31,7 +31,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import Event, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import config_validation as cv, device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
@@ -55,6 +55,7 @@ from .const import (
     DOMAIN,
     STATIC_URL,
 )
+from .device import CameraDevices, camera_id_of, hub_device_info, list_cameras
 from .frigate import DATA_FRIGATE, FrigateBridge, FrigateImageView, FrigateThumbnailView, store_key as frigate_store_key
 from .frigate_api import FrigateAPI
 from .manager import DATA_MANAGER, VodManager
@@ -73,7 +74,7 @@ _LOGGER = logging.getLogger(__name__)
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-PLATFORMS = [Platform.SWITCH]
+PLATFORMS = [Platform.EVENT, Platform.SENSOR, Platform.SWITCH]
 
 type SurveillanceStationConfigEntry = ConfigEntry[SurveillanceStationClient]
 
@@ -228,9 +229,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: SurveillanceStationConfi
             hass.data[DATA_FRIGATE].pop(entry.entry_id, None)
 
         entry.async_on_unload(drop_bridge)
+        # The entry's device, which the cameras' are under; then the cameras' as SS lists them.
+        dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, **hub_device_info(entry.entry_id))
+        bridge.devices = devices = CameraDevices(hass, entry, bridge)
+        entry.async_on_unload(devices.async_start())
         # In the background: MQTT may still be starting.
         entry.async_create_background_task(hass, bridge.start(), "surveillance_station frigate setup")
-        # The mute switches.
+        entry.async_create_background_task(hass, list_cameras(bridge), "surveillance_station cameras")
+        # The cameras' entities.
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -266,6 +272,26 @@ async def async_unload_entry(hass: HomeAssistant, entry: SurveillanceStationConf
         await entry.runtime_data.close()
     except Exception:  # noqa: BLE001 - never a failed unload for it
         _LOGGER.debug("Closing the Surveillance Station client failed", exc_info=True)
+    return True
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, entry: SurveillanceStationConfigEntry, device_entry: dr.DeviceEntry
+) -> bool:
+    """A camera SS no longer lists can be deleted by hand (its mute rules go too); no other device can.
+
+    Not before SS has listed its cameras once (its answering oddly must not cost
+    a rule). Without the Frigate bridge (detections off) the camera devices
+    left behind can all go: nothing lists them then.
+    """
+    camera_id = camera_id_of(entry.entry_id, device_entry)
+    if camera_id is None:
+        return False
+    if (bridge := hass.data.get(DATA_FRIGATE, {}).get(entry.entry_id)) is None:
+        return True
+    if not bridge.camera_ids() or camera_id in bridge.camera_ids():
+        return False
+    bridge.devices.forget(camera_id)
     return True
 
 

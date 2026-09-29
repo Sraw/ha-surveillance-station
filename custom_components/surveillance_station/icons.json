@@ -49,6 +49,11 @@
           "on": "mdi:paw-off"
         }
       }
+    },
+    "sensor": {
+      "mute_ends": {
+        "default": "mdi:bell-sleep"
+      }
     }
   },
   "services": {
