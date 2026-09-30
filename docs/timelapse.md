@@ -28,7 +28,9 @@ player does; its boundaries are whole seconds of video (4 minutes at 240x).
 
 Recordings are played as SS stored them: a camera's own stream, ~4-5 Mbps,
 only re-muxed. A time-lapse can't be, because SS writes it at a far higher
-bitrate. Measured on one NAS (SS 9.3):
+bitrate. Measured on one NAS (SS 9.3), with 4K main streams (see
+[Assumed setup](../README.md#assumed-setup); a lower resolution scales the
+numbers down):
 
 - **One frame per 8 s.** At the default 240x and 30 fps a task keeps a frame
   every 240 / 30 = 8 s of real time: a day is ~10,800 frames, 6 minutes of

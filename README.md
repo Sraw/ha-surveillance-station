@@ -8,6 +8,14 @@ recording at that moment.
 
 ![The timeline card: live video, the timeline with its bookmarks, the events list](https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/docs/images/live.png)
 
+## Assumed setup
+
+The docs assume a common setup: each camera offers a **main stream** at high
+resolution (4K H.265 here), which SS records, and a **sub stream** at a lower
+resolution, which Frigate watches. The numbers you'll find here (bitrates,
+sizes, decoder and GPU load) are for a 4K main stream; with a lower
+resolution they are smaller, but the reasoning is the same.
+
 ## Why this exists: SS stores, Frigate detects
 
 The idea is a clean split of jobs. **Surveillance Station is the recorder**: it
