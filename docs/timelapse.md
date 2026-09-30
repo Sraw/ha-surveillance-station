@@ -24,9 +24,38 @@ sooner). A day is the parts of the files that fall between the NAS's
 midnights, found by mapping wall time linearly across each file as SS's own
 player does; its boundaries are whole seconds of video (4 minutes at 240x).
 
-SS stores time-lapse as all-intra H.265 at the camera's full resolution
-(4512x2512 here: 90-240 Mbps), too much for a browser, so HA **transcodes**
-it to 1280 wide: H.265 where the browser plays it (~2 Mbps), else H.264.
+## Why it is transcoded
+
+Recordings are played as SS stored them: a camera's own stream, ~4-5 Mbps,
+only re-muxed. A time-lapse can't be, because SS writes it at a far higher
+bitrate. Measured on one NAS (SS 9.3):
+
+- **One frame per 8 s.** At the default 240x and 30 fps a task keeps a frame
+  every 240 / 30 = 8 s of real time: a day is ~10,800 frames, 6 minutes of
+  video (a little more where SS slows down around its own events).
+- **Frames are stored whole.** A 5 s cut of a 3840x2160 file was 150 frames,
+  all I pictures (no P or B frames), 67 MB, and the per-file sizes below fit
+  that for every file. There is no temporal compression: a frame costs the
+  same whether anything moved or not. (SS doesn't document its time-lapse
+  format, so *why* it writes all-intra is our reading, not SS's word; the
+  frames themselves are as measured.)
+- **Played at 30 frames a second, that averages ~80-130 Mbps.** Over the 104
+  full-day files there, the average was 82-100 Mbps for 3840x2160 and
+  99-129 Mbps for 4512x2512 (340-540 KB a frame, 3.7-5.8 GB per camera per
+  day), roughly 20-30 times the camera's own stream. The file is small for the
+  day it covers (a day of that stream is ~48 GB); it is the *bitrate* that is
+  high, because each second of video holds 4 minutes of the day and every
+  frame is intra.
+
+At that rate a time-lapse needs 10-16 MB/s on average (a daytime second is
+~30 MB, see [Known limitations](limitations.md)) from the NAS through HA to
+the viewer just to play at 1x, and a seek starts with a 4 s segment of
+50-200 MB: too much for Wi-Fi or a phone connection, and the point of a
+time-lapse is to skim it. So HA **transcodes** it to 1280 wide: H.265 where
+the browser plays it (~2 Mbps, 40-75 times smaller), else H.264.
+
+## How it is played
+
 Segments are 4 s of video, cut on the NAS (`recEvtType=3`), streamed into
 memory, transcoded and served as HLS fMP4 under the same session tokens as
 recordings; the card fetches them itself into MSE (the playlist goes to

@@ -148,6 +148,13 @@ cameras.
 Set up a time-lapse task in Surveillance Station, then add
 `type: custom:ss-timelapse-card` to a dashboard.
 
+Unlike recordings, which are played as SS stored them, a time-lapse is
+transcoded by HA. SS writes it as one all-intra 4K frame every 8 s of real
+time (at the default 240x), ~80-130 Mbps on average once played at 30 fps
+(roughly 20-30 times a camera's own stream), too much to send to a browser,
+so HA turns it into a ~2 Mbps 1280-wide stream, on an Intel GPU if it has
+one. [Why, and the numbers](docs/timelapse.md#why-it-is-transcoded).
+
 ## Documentation
 
 - [The timeline card](docs/timeline-card.md): options, controls, events,

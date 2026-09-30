@@ -4,9 +4,9 @@ Pure planning plus the ffmpeg command lines; the I/O is in ``segment.py``.
 
 A time-lapse file is a video of up to 6 minutes at TIMELAPSE_FPS covering up
 to a day of wall time, starting whenever the task rolled over (not at
-midnight). SS stores it as all-intra 4512x2512 H.265 at ~90-240 Mbps, far
-too much for a browser, so segments are transcoded (see
-``ffmpeg_transcode_args``), not stream-copied like recordings.
+midnight). SS stores it as all-intra 4512x2512 H.265 at ~80-130 Mbps on
+average (more by day), far too much for a browser, so segments are transcoded
+(see ``ffmpeg_transcode_args``), not stream-copied like recordings.
 
 A day is played as the stretches of the files that fall on it. Wall time is
 mapped to video time linearly per file: SS's own player does the same (its
