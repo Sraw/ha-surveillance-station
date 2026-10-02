@@ -10,11 +10,25 @@ recording at that moment.
 
 ## Assumed setup
 
-The docs assume a common setup: each camera offers a **main stream** at high
-resolution (4K H.265 here), which SS records, and a **sub stream** at a lower
-resolution, which Frigate watches. The numbers you'll find here (bitrates,
-sizes, decoder and GPU load) are for a 4K main stream; with a lower
-resolution they are smaller, but the reasoning is the same.
+The docs assume a common setup: each camera gives **two streams**.
+
+- The **main stream**, at full resolution (4K H.265 here), goes to SS and is
+  what gets recorded.
+- The **sub stream**, at a lower resolution, bitrate and frame rate (here
+  896x512 or 640x360, ~10 fps, 0.2-1 Mbps), goes to Frigate, which uses it
+  for detection.
+
+The numbers you'll find here (bitrates, sizes, decoder and GPU load) are for
+a 4K main stream; with a lower resolution they are smaller, but the
+reasoning is the same.
+
+**Nothing is recorded twice.** SS holds the only continuous recording.
+Frigate records nothing continuously: it keeps the sub stream's clips of its
+alerts and detections, and its snapshots. Have it keep those for **as many
+days as SS keeps recordings**; then every event SS can still play also has
+Frigate's snapshot and can be found by smart search. For 30 days of one 4K
+camera that is ~1.4 TB in SS and 0.3-3.5 GB in Frigate
+([the settings, and what was measured](docs/frigate.md#how-long-frigate-keeps-things)).
 
 ## Why this exists: SS stores, Frigate detects
 

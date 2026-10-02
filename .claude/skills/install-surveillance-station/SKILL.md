@@ -103,7 +103,10 @@ Tell the person:
 - every `[warn]` line, in their words, and whether it needs them;
 - with Frigate: a detection shows as a bookmark within seconds of Frigate's
   next review. None after a real detection means the topic prefix, the broker
-  or `record.enabled` ([docs/frigate.md](../../../docs/frigate.md)).
+  or `record.enabled` ([docs/frigate.md](../../../docs/frigate.md));
+- with Frigate: to keep its alert and detection recordings and its snapshots
+  for as many days as Surveillance Station keeps recordings
+  ([the three settings](../../../docs/frigate.md#how-long-frigate-keeps-things)).
 
 To add the card to a dashboard of their own instead, they add a card of
 `type: custom:ss-timeline-card` ([its options](../../../docs/timeline-card.md)).

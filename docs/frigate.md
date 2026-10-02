@@ -13,7 +13,9 @@ Needs, on Frigate's side (verified on 0.18; the review topic is 0.14+):
 - **Recording enabled** for the cameras (`record.enabled: true`): Frigate
   makes no review items, and publishes nothing on `<prefix>/reviews`, for a
   camera that doesn't record. SS doing the recording, Frigate's own can be
-  small: alerts and detections only, of the detect stream, a few days.
+  small: alerts and detections only, of the detect (sub) stream.
+- Those recordings, and the snapshots, **kept for as many days as SS keeps
+  recordings**: [which settings, and what it costs](#how-long-frigate-keeps-things).
 - Frigate on the MQTT broker HA's MQTT integration uses.
 - Zones and `review.*.required_zones` decide what becomes a review; this
   integration takes every review with an object of interest.
@@ -104,6 +106,54 @@ How it works:
 - Anyone who can publish to Frigate's topic on the broker can make
   bookmarks (and pick the moment whose frame is signed into the event); the
   broker is expected to require a login, as Frigate's does.
+
+## How long Frigate keeps things
+
+Set these three to the number of days Surveillance Station keeps recordings
+(30 in this example):
+
+```yaml
+record:
+  alerts:
+    retain:
+      days: 30
+  detections:
+    retain:
+      days: 30
+snapshots:
+  retain:
+    default: 30
+```
+
+Frigate deletes a review with its recording, and a tracked object with its
+snapshot. With fewer days than SS, the older events are still bookmarks that
+SS plays, but their thumbnail falls back from Frigate's snapshot (first to
+one matched by camera, time and kind, then to SS's own frame) and smart
+search no longer finds them. With more days than SS, Frigate keeps what no
+SS recording is left to play.
+
+**Nothing is recorded twice.** Continuous and motion recording
+(`record.continuous` and `record.motion`; `record.retain` before Frigate
+0.17) stay at 0 days: SS holds the only continuous recording, of the main
+stream. What Frigate keeps is the sub stream for the seconds of each alert
+and detection (5 s before and after, by default), a low-resolution preview
+of each hour that has one, and the snapshots. This integration plays none of
+Frigate's clips, but Frigate deletes a review together with its clip, so the
+clips stay for as long as the reviews must.
+
+What 30 days take, for one 4K camera:
+
+| | Keeps | 30 days |
+|---|---|---|
+| Surveillance Station | the main stream, all day (~4-5 Mbps) | ~1.4 TB (~48 GB a day) |
+| Frigate | the sub stream's alert and detection clips, previews, snapshots | 0.3-3.5 GB |
+
+Frigate's figure is for sub streams of H.264 at ~10 fps, from 640x360 at
+0.2-0.3 Mbps to 896x512 at ~1 Mbps (Frigate 0.18). Per camera, 30 days are
+0.2-2.6 GB of clips, 0.1-0.7 GB of previews and up to 0.1 GB of snapshots.
+It follows what happens in front of the camera, not the clock: a quiet
+camera is at the low end, a busy one at the high end. The same sub streams
+recorded all day would take 80-400 GB in 30 days.
 
 ## Staying up unattended
 
