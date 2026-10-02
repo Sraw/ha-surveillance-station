@@ -103,31 +103,79 @@ You can also use the card without Frigate, as a live and recorded viewer for SS.
 
 ## Installation
 
-### HACS
+Whichever way you choose, first **create a DSM account for Home Assistant**:
+a dedicated user with Surveillance Station access only, on a viewer-level SS
+privilege profile that can play back and download recordings. It must not
+use two-step verification (exempt it from a policy that enforces 2FA).
 
-[![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Sraw&repository=ha-surveillance-station&category=integration)
+### 1. Let an AI agent do it (recommended)
 
-Or in HACS → ⋮ → *Custom repositories*, add
-`https://github.com/Sraw/ha-surveillance-station` as an **Integration**. Then
-download *Surveillance Station Playback* and restart Home Assistant.
+With a coding agent (Claude Code, Codex, …) on a machine that reaches your
+Home Assistant:
 
-### Manual
+```sh
+git clone https://github.com/Sraw/ha-surveillance-station
+cd ha-surveillance-station
+```
 
-Copy `custom_components/surveillance_station` into your HA config's
-`custom_components/` and restart Home Assistant. HA installs the
-[`synology-ss-playback`](https://pypi.org/project/synology-ss-playback/)
-library by itself.
+Start the agent there and ask it to *install Surveillance Station Playback
+on my Home Assistant*. It follows the repository's
+[install skill](.claude/skills/install-surveillance-station/SKILL.md) (Claude
+Code finds it by itself; point another agent at that file): it asks what it
+needs, runs the script below, checks each step, and asks before it restarts
+Home Assistant. Have ready:
 
-## Setup
+- Home Assistant's address, and a **long-lived access token** of an
+  administrator (your profile → *Security*) saved in a file, not pasted
+  into the chat;
+- [HACS](https://hacs.xyz) in that Home Assistant, or the agent running where
+  HA's config directory is;
+- the NAS's address as Home Assistant reaches it, and the DSM account above
+  with its password in a file;
+- for Frigate (optional): HA's MQTT integration on the broker Frigate
+  publishes to, and Frigate's address as HA reaches it without a login (its
+  internal port, e.g. `http://frigate:5000`);
+- for phone notifications (optional): a phone with the HA Companion app.
 
-1. **In DSM**, create a dedicated user for HA with Surveillance Station
-   access only: a viewer-level SS privilege profile that can play back and
-   download recordings. It must not use two-step verification (exempt it
-   from a policy that enforces 2FA).
-2. **In HA**, *Settings → Devices & services → Add integration →
+### 2. Run the install script
+
+The same steps without an agent. The script needs Python 3.9+ and nothing
+else, talks to Home Assistant's API from any machine that reaches it, and
+can be run again at any time: it changes only what is missing.
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/Sraw/ha-surveillance-station/main/scripts/install.py
+export HA_TOKEN_FILE=~/.ha_token    # a long-lived access token of an HA administrator
+python3 install.py --ha-url http://homeassistant.local:8123 --check    # looks, changes nothing
+python3 install.py --ha-url http://homeassistant.local:8123 --restart \
+    --ss-host nas.local --ss-user ha-playback --dashboard
+```
+
+It installs the files through HACS (or, with `--config-dir /path/to/config`,
+copies them there), restarts Home Assistant, logs in to the NAS (it asks for
+the DSM password, or reads `--ss-password-file`) and makes a dashboard
+`/ss-playback` with the card. Add `--frigate --frigate-url http://frigate:5000`
+for Frigate detections, `--notify-device "My Phone"` for phone notifications
+and `--timelapse` for a time-lapse view; `--help` lists the rest. Tokens and
+passwords are never taken on the command line.
+
+### 3. By hand
+
+1. **The files.** With HACS:
+
+   [![Open in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Sraw&repository=ha-surveillance-station&category=integration)
+
+   or in HACS → ⋮ → *Custom repositories*, add
+   `https://github.com/Sraw/ha-surveillance-station` as an **Integration**,
+   then download *Surveillance Station Playback*. Without HACS, copy
+   `custom_components/surveillance_station` into your HA config's
+   `custom_components/`. Restart Home Assistant; it installs the
+   [`synology-ss-playback`](https://pypi.org/project/synology-ss-playback/)
+   library by itself.
+2. **The NAS.** In HA, *Settings → Devices & services → Add integration →
    Surveillance Station Playback*: the NAS host, port (HTTPS on 5001, the
-   default; 5000 for http) and that user.
-3. **Add the card** to a dashboard:
+   default; 5000 for http) and the DSM account.
+3. **The card.** Add it to a dashboard:
 
    ```yaml
    type: custom:ss-timeline-card
@@ -135,10 +183,12 @@ library by itself.
 
    It is registered automatically. See [the card's options](docs/timeline-card.md#options).
 
+## Optional parts
+
 ### Frigate notifications (optional)
 
 Needs Frigate on the MQTT broker HA uses, with recording enabled for its
-cameras.
+cameras. The agent and the script set this up too; by hand:
 
 1. In the integration's **Configure**, turn on *Bookmark Frigate detections*.
    Set the *Frigate URL* (e.g. `http://frigate:5000`) for Frigate's snapshots
@@ -173,7 +223,8 @@ one. [Why, and the numbers](docs/timelapse.md#why-it-is-transcoded).
 - [Time-lapse](docs/timelapse.md): the card, GPU/CPU transcoding
 - [Known limitations](docs/limitations.md)
 - [Security model](docs/security.md) and [resource use](docs/resource-use.md)
-- [Development](docs/development.md): layout, tests, releasing, SS API notes
+- [Development](docs/development.md): layout, tests, releasing, SS API notes;
+  [AGENTS.md](AGENTS.md) for the rules a change must keep
 
 ## Removing
 

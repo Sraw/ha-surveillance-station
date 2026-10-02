@@ -24,6 +24,8 @@
 | `…/mute.py`, `…/mute_services.py`, `…/switch.py`, `…/device.py`, `…/event.py`, `…/sensor.py` | Muting notifications (see *Frigate detections*): the rules and what they cover (`MuteRules.coverage`, which the switches show), the mute/unmute actions and the notification's buttons, the switches; the cameras' devices (by SS id; `device.py` also moves 0.22's key-named switches and rules to ids), each camera's detection event and "muted until" sensor |
 | `…/frontend/ss-mute-card.js` | `custom:ss-mute-card`, loaded by the timeline card (same version, no resource of its own): the mute switches as a hierarchy (everything, a kind, a camera, one kind on a camera), found as this integration's switches with `camera` and `locked` attributes; `tests/browser/mute-card.mjs` drives it |
 | `…/frontend/ss-common.js` | What the cards share: MSE and the MP4 init-segment parsers, SS's stream message parser, the timeline ticks, the veil, control labels, per-viewer preferences. Each card imports it with its own `?v=` version query, so a release never mixes a new card with a stale cached copy |
+| `scripts/install.py` | Installs and sets up the integration on a Home Assistant over its API (see *The installer*); `.claude/skills/install-surveillance-station/` is the same for an AI agent |
+| `AGENTS.md` | The rules a change must keep, for AI agents and people (`CLAUDE.md` imports it) |
 
 ## Deploying a checkout
 
@@ -43,6 +45,36 @@ The cards are served to be kept for a month (every URL of them carries the
 version), so a changed card deployed under the same version shows only after
 a reload that bypasses the browser's cache, or once `manifest.json`'s
 `version` and `CARD_VERSION` are bumped.
+
+## The installer
+
+`scripts/install.py` is what the README's first two ways of installing run
+(the agent's [install skill](../.claude/skills/install-surveillance-station/SKILL.md)
+wraps it): the files through HACS's WebSocket commands or a copy into the
+config directory, a restart, then the config and options flows, a dashboard
+and the notification blueprint, all over HA's REST and WebSocket API. It is
+one file with no dependencies (it carries its own small WebSocket client),
+because people download and run just that file, and it works on Python 3.9.
+
+`tests/test_install_script.py` holds it to the integration: its flags against
+the flows' fields, an explanation for every flow error, `camera_key` and the
+minimum HA version, that `--check` sends only reads, and that neither a
+flow's form (it echoes the password) nor an unforeseen error's text reaches
+its output. Those tests script HA's answers; to see it work for real, run it
+against a throwaway HA:
+
+```
+mkdir /tmp/ha-scratch    # yours, not root's: the script writes there
+docker run -d --name ha-scratch -v /tmp/ha-scratch:/config ghcr.io/home-assistant/home-assistant:stable
+# onboard it in a browser (port 8123 of the container), make a long-lived token, then:
+HA_TOKEN_FILE=token scripts/install.py --ha-url http://<container>:8123 --config-dir /tmp/ha-scratch --restart ...
+```
+
+`--config-dir` from a checkout copies the checkout whenever its files differ
+from what is there, so this tries unreleased code; add `--upgrade` once the
+integration is installed. Keep `--restart` on that run: when the version did
+not change, a later run cannot tell that HA has not loaded the copied files.
+The HACS path needs an HA with HACS, which a scratch one lacks.
 
 ## Releasing
 
